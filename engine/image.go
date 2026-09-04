@@ -60,29 +60,41 @@ type imageResult struct {
 //     若 Provider 只回 URL，则下载转 data URI，下载失败回退原始 URL。
 func generateImage(ctx context.Context, svc *mediaimg.Service, model, prompt string) ([]imageResult, error) {
 	started := time.Now()
-	trace.L(ctx).Info("image provider stage started", "stage", "provider", "model", model)
+	trace.L(ctx).Info("image provider stage started", "stage", "provider", "model", model, "prompt", prompt)
 	if svc == nil || !svc.HasProvider() {
-		trace.L(ctx).Warn("image provider stage failed", "stage", "provider", "model", model, "reason", "provider_unavailable", "elapsed_ms", time.Since(started).Milliseconds())
-		return nil, fmt.Errorf("未配置图片生成服务（model=%s）", model)
+		err := fmt.Errorf("未配置图片生成服务（model=%s）", model)
+		trace.L(ctx).Warn("image provider stage failed", "stage", "provider", "model", model, "reason", "provider_unavailable", "err", err, "elapsed_ms", time.Since(started).Milliseconds())
+		return nil, err
 	}
 
 	providerStarted := time.Now()
 	res, err := svc.Generate(ctx, "", mediaimg.Request{Model: model, Prompt: prompt})
 	if err != nil {
-		trace.L(ctx).Warn("image provider stage failed", "stage", "provider", "model", model, "reason", "generation_error", "error_type", fmt.Sprintf("%T", err), "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("image provider stage failed", "stage", "provider", "model", model, "reason", "generation_error", "err", err, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
 		return nil, err
 	}
 	trace.L(ctx).Info("image provider stage completed", "stage", "provider", "model", model, "image_count", len(res.Images), "elapsed_ms", time.Since(providerStarted).Milliseconds())
 	if len(res.Images) == 0 {
-		trace.L(ctx).Warn("image generation failed", "stage", "provider", "model", model, "reason", "empty_result", "total_ms", time.Since(started).Milliseconds())
-		return nil, fmt.Errorf("图片生成 API 未返回图片")
+		err := fmt.Errorf("图片生成 API 未返回图片")
+		trace.L(ctx).Warn("image generation failed", "stage", "provider", "model", model, "reason", "empty_result", "err", err, "total_ms", time.Since(started).Milliseconds())
+		return nil, err
 	}
 
 	materializeStarted := time.Now()
-	trace.L(ctx).Info("image materialization stage started", "stage", "materialize", "model", model, "image_count", len(res.Images))
+	imageURLs := make([]string, 0, len(res.Images))
+	for _, img := range res.Images {
+		if img.URL != "" && !strings.HasPrefix(strings.ToLower(img.URL), "data:") {
+			imageURLs = append(imageURLs, img.URL)
+		}
+	}
+	trace.L(ctx).Info("image materialization stage started", "stage", "materialize", "model", model, "image_count", len(res.Images), "image_urls", imageURLs)
 	results := make([]imageResult, 0, len(res.Images))
 	for i, img := range res.Images {
 		var dataURI string
+		imageURLForLog := img.URL
+		if strings.HasPrefix(strings.ToLower(imageURLForLog), "data:") {
+			imageURLForLog = "[omitted: base64 media]"
+		}
 		switch {
 		case img.B64JSON != "":
 			// media 默认 response_format=b64_json，OpenAI Images 返回 PNG。
@@ -91,7 +103,7 @@ func generateImage(ctx context.Context, svc *mediaimg.Service, model, prompt str
 			if d, dlErr := downloadAsDataURI(ctx, img.URL); dlErr == nil {
 				dataURI = d
 			} else {
-				trace.L(ctx).Warn("image materialization fallback", "stage", "materialize", "model", model, "image_index", i, "error_type", fmt.Sprintf("%T", dlErr))
+				trace.L(ctx).Warn("image materialization fallback", "stage", "materialize", "model", model, "image_index", i, "image_url", imageURLForLog, "err", dlErr)
 				dataURI = img.URL // 下载失败回退原始 URL
 			}
 		default:
@@ -103,10 +115,11 @@ func generateImage(ctx context.Context, svc *mediaimg.Service, model, prompt str
 		})
 	}
 	if len(results) == 0 {
-		trace.L(ctx).Warn("image materialization stage failed", "stage", "materialize", "model", model, "reason", "no_valid_image", "elapsed_ms", time.Since(materializeStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
-		return nil, fmt.Errorf("图片生成未产生有效图像")
+		err := fmt.Errorf("图片生成未产生有效图像")
+		trace.L(ctx).Warn("image materialization stage failed", "stage", "materialize", "model", model, "reason", "no_valid_image", "err", err, "elapsed_ms", time.Since(materializeStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
+		return nil, err
 	}
-	trace.L(ctx).Info("image materialization stage completed", "stage", "materialize", "model", model, "image_count", len(results), "elapsed_ms", time.Since(materializeStarted).Milliseconds())
+	trace.L(ctx).Info("image materialization stage completed", "stage", "materialize", "model", model, "image_count", len(results), "image_urls", imageURLs, "elapsed_ms", time.Since(materializeStarted).Milliseconds())
 	return results, nil
 }
 

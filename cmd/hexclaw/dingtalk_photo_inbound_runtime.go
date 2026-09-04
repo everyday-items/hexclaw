@@ -53,7 +53,7 @@ type k12InboundPhotoCoordinatorPort interface {
 
 type k12InboundPhotoImageTaskPort interface {
 	k12ImageTaskFacade
-	Confirm(context.Context, k12usecase.ConfirmImageTaskInput) (k12usecase.ImageTaskView, error)
+	Retry(context.Context, string, string, int) (k12usecase.ImageTaskView, error)
 }
 
 type k12InboundPhotoFinalArtifactReader interface {
@@ -77,6 +77,7 @@ type k12DingtalkPhotoInboundRuntimeConfig struct {
 	BaseContext       context.Context
 	Router            *agentrouter.Dispatcher
 	Check             func(context.Context, *adapter.Message) error
+	ResolveInstanceID func(string, string) (string, error)
 	Inbound           k12InboundPhotoCoordinatorPort
 	ImageTasks        k12InboundPhotoImageTaskPort
 	PracticeSets      k12InboundPhotoPracticeSetReader
@@ -95,6 +96,7 @@ type k12DingtalkPhotoInboundRuntime struct {
 	baseCtx           context.Context
 	router            *agentrouter.Dispatcher
 	check             func(context.Context, *adapter.Message) error
+	resolveInstanceID func(string, string) (string, error)
 	inbound           k12InboundPhotoCoordinatorPort
 	imageTasks        k12InboundPhotoImageTaskPort
 	practiceSets      k12InboundPhotoPracticeSetReader
@@ -132,7 +134,8 @@ func newK12DingtalkPhotoInboundRuntime(
 	}
 	runtime := &k12DingtalkPhotoInboundRuntime{
 		baseCtx: baseCtx, router: config.Router, check: config.Check,
-		inbound: config.Inbound, imageTasks: config.ImageTasks,
+		resolveInstanceID: config.ResolveInstanceID,
+		inbound:           config.Inbound, imageTasks: config.ImageTasks,
 		practiceSets: config.PracticeSets, practiceReturns: config.PracticeReturns,
 		artifacts: config.Artifacts, replyBatches: config.ReplyBatches,
 		pollInterval: pollInterval, retryInterval: retryInterval,
@@ -329,6 +332,11 @@ func (r *k12DingtalkPhotoInboundRuntime) run(agentName, receiptID string) {
 		if err != nil {
 			if !errors.Is(err, records.ErrVersionConflict) {
 				slog.Warn("K12 DingTalk inbound photo worker will retry",
+					"agent", agentName,
+					"receipt_id", receiptID,
+					"dispatch_id", bundle.Dispatch.DispatchID,
+					"image_task_id", bundle.Dispatch.ImageTaskID,
+					"delivery_batch_id", bundle.Dispatch.DeliveryBatchID,
 					"agent_ref", k12DingtalkPhotoRestartCheckpointValueDigest(agentName),
 					"receipt_ref", k12DingtalkPhotoRestartCheckpointValueDigest(receiptID),
 					"dispatch_ref", k12DingtalkPhotoRestartCheckpointValueDigest(bundle.Dispatch.DispatchID),
@@ -340,6 +348,7 @@ func (r *k12DingtalkPhotoInboundRuntime) run(agentName, receiptID string) {
 					"terminal_status", bundle.Dispatch.TerminalStatus,
 					"elapsed_ms", time.Since(attemptStartedAt).Milliseconds(),
 					"error_type", fmt.Sprintf("%T", err),
+					"error", err,
 				)
 			}
 			delay = r.retryInterval
@@ -483,6 +492,52 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceImageTask(
 			k12usecase.InboundPhotoTerminalStageImageTask, failureKind,
 		)
 		return err == nil, err
+	}
+	if view.Dispatch.Status == k12.ImageTaskStatusFailed &&
+		view.Dispatch.RetrySafe &&
+		bundle.Dispatch.RoutingDecision == k12usecase.InboundPhotoRouteNewSubmission {
+		retryStartedAt := time.Now()
+		slog.Info("K12 DingTalk inbound photo image task retry started",
+			"agent", bundle.Receipt.AgentName,
+			"receipt_id", bundle.Receipt.ReceiptID,
+			"dispatch_id", bundle.Dispatch.DispatchID,
+			"image_task_id", bundle.Dispatch.ImageTaskID,
+			"image_task_version", view.Dispatch.Version,
+			"failure_kind", view.Dispatch.FailureKind,
+		)
+		retried, retryErr := r.imageTasks.Retry(
+			ctx,
+			bundle.Receipt.AgentName,
+			bundle.Dispatch.ImageTaskID,
+			view.Dispatch.Version,
+		)
+		if retryErr != nil {
+			slog.Warn("K12 DingTalk inbound photo image task retry failed",
+				"agent", bundle.Receipt.AgentName,
+				"receipt_id", bundle.Receipt.ReceiptID,
+				"dispatch_id", bundle.Dispatch.DispatchID,
+				"image_task_id", bundle.Dispatch.ImageTaskID,
+				"image_task_version", view.Dispatch.Version,
+				"elapsed_ms", time.Since(retryStartedAt).Milliseconds(),
+				"error_type", fmt.Sprintf("%T", retryErr),
+				"error", retryErr,
+			)
+			return false, retryErr
+		}
+		gradingJobID := ""
+		if retried.Homework != nil {
+			gradingJobID = retried.Homework.GradingJobID
+		}
+		slog.Info("K12 DingTalk inbound photo image task retry completed",
+			"agent", bundle.Receipt.AgentName,
+			"receipt_id", bundle.Receipt.ReceiptID,
+			"dispatch_id", bundle.Dispatch.DispatchID,
+			"image_task_id", bundle.Dispatch.ImageTaskID,
+			"image_task_status", retried.Dispatch.Status,
+			"grading_job_id", gradingJobID,
+			"elapsed_ms", time.Since(retryStartedAt).Milliseconds(),
+		)
+		return false, nil
 	}
 	if view.HomeworkProjection != nil &&
 		view.HomeworkProjection.Stage == k12.GradingStageFailedTerminal {
@@ -789,6 +844,24 @@ func inboundPhotoFrozenTarget(bundle k12usecase.InboundPhotoBundle) k12usecase.R
 	}
 }
 
+func (r *k12DingtalkPhotoInboundRuntime) resolveInboundPhotoFrozenTarget(
+	bundle k12usecase.InboundPhotoBundle,
+) (k12usecase.ResolvedDeliveryTarget, error) {
+	target := inboundPhotoFrozenTarget(bundle)
+	if r.resolveInstanceID == nil {
+		return target, nil
+	}
+	instanceID, err := r.resolveInstanceID(target.Target.Platform, target.Target.InstanceID)
+	if err != nil {
+		return k12usecase.ResolvedDeliveryTarget{}, fmt.Errorf("resolve inbound photo instance: %w", err)
+	}
+	target.Target.InstanceID = strings.TrimSpace(instanceID)
+	if target.Target.InstanceID == "" {
+		return k12usecase.ResolvedDeliveryTarget{}, fmt.Errorf("resolve inbound photo instance: stable instance ID is required")
+	}
+	return target, nil
+}
+
 func (r *k12DingtalkPhotoInboundRuntime) sendRoutingConfirmation(
 	ctx context.Context,
 	bundle k12usecase.InboundPhotoBundle,
@@ -810,12 +883,16 @@ func (r *k12DingtalkPhotoInboundRuntime) sendRoutingConfirmation(
 			content = k12PhotoRoutingCandidateText(snapshot)
 		}
 	}
+	target, err := r.resolveInboundPhotoFrozenTarget(bundle)
+	if err != nil {
+		return err
+	}
 	startedAt := time.Now()
 	batch, _, err := r.replyBatches.PrepareAndSendMessageBatchForTargets(
 		ctx, bundle.Receipt.AgentName, k12DingtalkPhotoRoutingObjectKind,
 		bundle.Receipt.ReceiptID,
 		k12usecase.DeliveryMessage{Content: content},
-		[]k12usecase.ResolvedDeliveryTarget{inboundPhotoFrozenTarget(bundle)},
+		[]k12usecase.ResolvedDeliveryTarget{target},
 	)
 	if err != nil {
 		return err
@@ -868,7 +945,10 @@ func (r *k12DingtalkPhotoInboundRuntime) completeBoundReply(
 	ctx context.Context,
 	bundle k12usecase.InboundPhotoBundle,
 ) (bool, error) {
-	target := inboundPhotoFrozenTarget(bundle)
+	target, err := r.resolveInboundPhotoFrozenTarget(bundle)
+	if err != nil {
+		return false, err
+	}
 	batch, _, err := r.replies.Deliver(ctx, k12DingtalkPhotoReplyCommand{
 		AgentName:       bundle.Receipt.AgentName,
 		DeliveryBatchID: bundle.Dispatch.DeliveryBatchID,
@@ -960,7 +1040,10 @@ func (r *k12DingtalkPhotoInboundRuntime) advanceFinalReply(
 	if err != nil {
 		return false, err
 	}
-	target := inboundPhotoFrozenTarget(bundle)
+	target, err := r.resolveInboundPhotoFrozenTarget(bundle)
+	if err != nil {
+		return false, err
+	}
 	command := k12DingtalkPhotoReplyCommand{
 		AgentName:           bundle.Receipt.AgentName,
 		InboundReceiptID:    bundle.Receipt.ReceiptID,

@@ -368,6 +368,10 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 		}
 		req, err := http.NewRequestWithContext(ctx, method, url, rdr)
 		if err != nil {
+			slog.Info("[cron] starlark external call",
+				"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
+				"stage", "http", "status", "error", "method", method,
+				"url", url, "request_body", body, "error", err)
 			return nil, fmt.Errorf("%s: %w", b.Name(), err)
 		}
 		// 默认浏览器 User-Agent，避免站点对 Go 默认 UA 返回反爬 HTML（脚本可经 headers 覆盖）。
@@ -389,7 +393,8 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 			slog.Info("[cron] starlark external call",
 				"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
 				"stage", "http", "elapsed_ms", time.Since(started).Milliseconds(),
-				"status", "error", "method", method, "host", req.URL.Hostname())
+				"status", "error", "method", method, "url", req.URL.String(),
+				"request_headers", req.Header, "request_body", body, "error", err)
 			return nil, fmt.Errorf("%s: %w", b.Name(), err)
 		}
 		defer resp.Body.Close()
@@ -397,7 +402,10 @@ func (e *StarlarkEngine) builtinHTTP(ctx context.Context, method string) func(*s
 		slog.Info("[cron] starlark external call",
 			"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
 			"stage", "http", "elapsed_ms", time.Since(started).Milliseconds(),
-			"status", "success", "method", method, "host", req.URL.Hostname(), "http_status", resp.StatusCode)
+			"status", "success", "method", method, "url", req.URL.String(),
+			"request_headers", req.Header, "request_body", body,
+			"http_status", resp.StatusCode, "response_headers", resp.Header,
+			"response_content_length", resp.ContentLength, "response_body_bytes", len(data))
 		out := starlark.NewDict(2)
 		_ = out.SetKey(starlark.String("status"), starlark.MakeInt(resp.StatusCode))
 		_ = out.SetKey(starlark.String("body"), starlark.String(string(data)))
@@ -439,12 +447,14 @@ func (e *StarlarkEngine) builtinKBIngest(ctx context.Context) func(*starlark.Thr
 		if err != nil {
 			slog.Info("[cron] starlark external call",
 				"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
-				"stage", "kb_ingest", "elapsed_ms", time.Since(started).Milliseconds(), "status", "error")
+				"stage", "kb_ingest", "elapsed_ms", time.Since(started).Milliseconds(), "status", "error",
+				"title", title, "content", content, "knowledge_source", source, "error", err)
 			return nil, fmt.Errorf("kb_ingest: %w", err)
 		}
 		slog.Info("[cron] starlark external call",
 			"source", "cron", "job", stateJobIDFrom(ctx), "runtime", RuntimeStarlark,
-			"stage", "kb_ingest", "elapsed_ms", time.Since(started).Milliseconds(), "status", "success")
+			"stage", "kb_ingest", "elapsed_ms", time.Since(started).Milliseconds(), "status", "success",
+			"document_id", id, "title", title, "content", content, "knowledge_source", source)
 		out := starlark.NewDict(1)
 		_ = out.SetKey(starlark.String("id"), starlark.String(id))
 		return out, nil

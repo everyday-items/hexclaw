@@ -261,10 +261,13 @@ func (d *k12IMDeliverer) PrepareMessageForTargets(
 	out := make([]k12usecase.PreparedTextDelivery, 0, len(targets)*len(parts))
 	seen := make(map[channel.Target]struct{}, len(targets))
 	for _, resolved := range targets {
-		target := channel.Target{
+		target, resolveErr := d.resolveStableDeliveryTarget(channel.Target{
 			Platform:   strings.ToLower(strings.TrimSpace(resolved.Target.Platform)),
 			InstanceID: strings.TrimSpace(resolved.Target.InstanceID),
 			ChatID:     strings.TrimSpace(resolved.Target.ChatID),
+		})
+		if resolveErr != nil {
+			return nil, fmt.Errorf("freeze delivery target: %w", resolveErr)
 		}
 		if strings.TrimSpace(resolved.BindingID) == "" || target.Platform == "" || target.ChatID == "" {
 			return nil, fmt.Errorf("冻结发送目标失败：绑定或私聊目标不完整")
@@ -325,17 +328,35 @@ func channelTargetFromReceipt(receipt k12.DeliveryReceipt) channel.Target {
 	}
 }
 
-func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) bool {
-	target := channelTargetFromReceipt(receipt)
+func (d *k12IMDeliverer) resolveStableDeliveryTarget(target channel.Target) (channel.Target, error) {
 	target.Platform = strings.ToLower(strings.TrimSpace(target.Platform))
 	target.InstanceID = strings.TrimSpace(target.InstanceID)
 	target.ChatID = strings.TrimSpace(target.ChatID)
 	if target.Platform == "" || target.InstanceID == "" || target.ChatID == "" {
-		return false
+		return channel.Target{}, fmt.Errorf("delivery target is incomplete")
 	}
 	d.mu.RLock()
 	resolveInstanceID := d.resolveInstanceID
 	d.mu.RUnlock()
+	if resolveInstanceID == nil {
+		return target, nil
+	}
+	instanceID, err := resolveInstanceID(target.Platform, target.InstanceID)
+	if err != nil {
+		return channel.Target{}, err
+	}
+	target.InstanceID = strings.TrimSpace(instanceID)
+	if target.InstanceID == "" {
+		return channel.Target{}, fmt.Errorf("delivery target has no stable instance ID")
+	}
+	return target, nil
+}
+
+func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) bool {
+	target, err := d.resolveStableDeliveryTarget(channelTargetFromReceipt(receipt))
+	if err != nil {
+		return false
+	}
 	for _, rule := range d.router.ListRules() {
 		rule = normalizeDirectRule(rule)
 		if rule.AgentName != receipt.AgentName || stableBindingID(rule) != receipt.BindingID {
@@ -345,15 +366,14 @@ func (d *k12IMDeliverer) receiptBindingIsActive(receipt k12.DeliveryReceipt) boo
 			(rule.ChatID != "" && rule.ChatID != target.ChatID) {
 			return false
 		}
-		if resolveInstanceID == nil {
-			return rule.InstanceID == target.InstanceID
+		ruleTarget := channel.Target{
+			Platform: rule.Platform, InstanceID: rule.InstanceID, ChatID: target.ChatID,
 		}
-		instanceRef := rule.InstanceID
-		if instanceRef == "" {
-			instanceRef = target.InstanceID
+		if ruleTarget.InstanceID == "" {
+			ruleTarget.InstanceID = target.InstanceID
 		}
-		resolved, err := resolveInstanceID(rule.Platform, instanceRef)
-		return err == nil && strings.TrimSpace(resolved) == target.InstanceID
+		resolvedRuleTarget, resolveErr := d.resolveStableDeliveryTarget(ruleTarget)
+		return resolveErr == nil && resolvedRuleTarget == target
 	}
 	return false
 }
@@ -523,7 +543,11 @@ func (d *k12IMDeliverer) preparedCreativeWorkEnvelope(
 	if err := envelope.Validate(); err != nil {
 		return channel.Target{}, channel.PreparedEnvelope{}, err
 	}
-	return target, envelope, nil
+	stableTarget, err := d.resolveStableDeliveryTarget(target)
+	if err != nil {
+		return channel.Target{}, channel.PreparedEnvelope{}, err
+	}
+	return stableTarget, envelope, nil
 }
 
 // SendPreparedEnvelope 只用于 creative_work 的同一目标 Markdown+图片组合消息。
@@ -588,6 +612,10 @@ func (d *k12IMDeliverer) SendPrepared(ctx context.Context, receipt k12.DeliveryR
 		err := fmt.Errorf("原投递绑定已经变更，请重新从当前页面发起发送")
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
 	}
+	target, err := d.resolveStableDeliveryTarget(channelTargetFromReceipt(receipt))
+	if err != nil {
+		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
+	}
 	part, err := preparedChannelPart(receipt)
 	if err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
@@ -596,16 +624,16 @@ func (d *k12IMDeliverer) SendPrepared(ctx context.Context, receipt k12.DeliveryR
 	if err := part.Validate(); err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
 	}
-	port, err := d.channels.Get(receipt.Target.Platform)
+	port, err := d.channels.Get(target.Platform)
 	if err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: "绑定通道还没有接入"}, err
 	}
 	receiptPort, ok := port.(channel.PartReceiptPort)
 	if !ok {
-		err = fmt.Errorf("channel %q does not support delivery part receipts", receipt.Target.Platform)
+		err = fmt.Errorf("channel %q does not support delivery part receipts", target.Platform)
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryFailed, Detail: err.Error()}, err
 	}
-	ack, sendErr := receiptPort.SendPreparedPartWithReceipt(ctx, channelTargetFromReceipt(receipt), part)
+	ack, sendErr := receiptPort.SendPreparedPartWithReceipt(ctx, target, part)
 	return usecaseAckFromChannel(ack, sendErr), sendErr
 }
 
@@ -614,6 +642,10 @@ func (d *k12IMDeliverer) PrepareDeliveryPartResource(ctx context.Context, receip
 	if !d.receiptBindingIsActive(receipt) {
 		return "", fmt.Errorf("the original delivery binding is no longer active")
 	}
+	target, err := d.resolveStableDeliveryTarget(channelTargetFromReceipt(receipt))
+	if err != nil {
+		return "", err
+	}
 	part, err := preparedChannelPart(receipt)
 	if err != nil {
 		return "", err
@@ -621,15 +653,15 @@ func (d *k12IMDeliverer) PrepareDeliveryPartResource(ctx context.Context, receip
 	if part.Kind != messagecontent.PartArtifact || strings.TrimSpace(receipt.PreparedResourceID) != "" {
 		return "", fmt.Errorf("delivery media preparation requires one unprepared artifact part")
 	}
-	port, err := d.channels.Get(receipt.Target.Platform)
+	port, err := d.channels.Get(target.Platform)
 	if err != nil {
 		return "", err
 	}
 	partPort, ok := port.(channel.PartReceiptPort)
 	if !ok {
-		return "", fmt.Errorf("channel %q does not support delivery part preparation", receipt.Target.Platform)
+		return "", fmt.Errorf("channel %q does not support delivery part preparation", target.Platform)
 	}
-	resourceID, err := partPort.PrepareDeliveryPartResource(ctx, channelTargetFromReceipt(receipt), part)
+	resourceID, err := partPort.PrepareDeliveryPartResource(ctx, target, part)
 	if err != nil {
 		return "", err
 	}
@@ -641,20 +673,21 @@ func (d *k12IMDeliverer) PrepareDeliveryPartResource(ctx context.Context, receip
 }
 
 func (d *k12IMDeliverer) QueryPrepared(ctx context.Context, receipt k12.DeliveryReceipt) (k12usecase.DeliveryTransportAck, error) {
-	if strings.TrimSpace(receipt.Target.InstanceID) == "" {
+	target, err := d.resolveStableDeliveryTarget(channelTargetFromReceipt(receipt))
+	if err != nil {
 		err := fmt.Errorf("query prepared delivery requires a stable instance ID")
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryOutcomeUnknown, Detail: err.Error()}, err
 	}
-	port, err := d.channels.Get(receipt.Target.Platform)
+	port, err := d.channels.Get(target.Platform)
 	if err != nil {
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryOutcomeUnknown, Detail: "绑定通道暂时不可查询"}, err
 	}
 	receiptPort, ok := port.(channel.ReceiptPort)
 	if !ok {
-		err = fmt.Errorf("通道 %q 不支持投递结果查询", receipt.Target.Platform)
+		err = fmt.Errorf("通道 %q 不支持投递结果查询", target.Platform)
 		return k12usecase.DeliveryTransportAck{Status: k12.DeliveryOutcomeUnknown, Detail: err.Error()}, err
 	}
-	ack, queryErr := receiptPort.QueryReceipt(ctx, channelTargetFromReceipt(receipt), receipt.ExternalMessageID)
+	ack, queryErr := receiptPort.QueryReceipt(ctx, target, receipt.ExternalMessageID)
 	return usecaseAckFromChannel(ack, queryErr), queryErr
 }
 

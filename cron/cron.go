@@ -1933,24 +1933,13 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 			continue
 		}
 		delay := staggerFor(job.ID, s.staggerMax)
-		queuedAt := time.Now()
-		runtime := ""
-		if job.Spec != nil {
-			runtime = job.Spec.Runtime
-		}
-		slog.Info("[cron] job lifecycle",
-			"source", "cron", "job", job.ID, "runtime", runtime,
-			"stage", "due_to_queue", "elapsed_ms", queuedAt.Sub(job.NextRunAt).Milliseconds(), "status", "queued")
-		go func(j *Job, queuedAt time.Time, runtime string, delay time.Duration) {
+		go func(j *Job) {
 			if delay > 0 {
 				timer := time.NewTimer(delay)
 				select {
 				case <-timer.C:
 				case <-s.stopCh:
 					timer.Stop()
-					slog.Info("[cron] job lifecycle",
-						"source", "cron", "job", j.ID, "runtime", runtime,
-						"stage", "queue", "elapsed_ms", time.Since(queuedAt).Milliseconds(), "status", "canceled")
 					return
 				}
 			}
@@ -1960,17 +1949,11 @@ func (s *Scheduler) checkAndExecute(now time.Time) {
 				case s.sem <- struct{}{}:
 					defer func() { <-s.sem }()
 				case <-s.stopCh:
-					slog.Info("[cron] job lifecycle",
-						"source", "cron", "job", j.ID, "runtime", runtime,
-						"stage", "queue", "elapsed_ms", time.Since(queuedAt).Milliseconds(), "status", "canceled")
 					return
 				}
 			}
-			slog.Info("[cron] job lifecycle",
-				"source", "cron", "job", j.ID, "runtime", runtime,
-				"stage", "queue", "elapsed_ms", time.Since(queuedAt).Milliseconds(), "status", "ready")
 			s.executeJob(j)
-		}(job, queuedAt, runtime, delay)
+		}(job)
 	}
 }
 
@@ -2029,31 +2012,37 @@ func (s *Scheduler) currentJobGeneration(candidate *Job) bool {
 // row. The DB check matters when a different scheduler replica performs the
 // stable-key replacement and this process still has an old in-memory copy.
 func (s *Scheduler) jobGenerationCurrent(ctx context.Context, candidate *Job) bool {
+	current, err := s.jobGenerationCurrentResult(ctx, candidate)
+	return err == nil && current
+}
+
+func (s *Scheduler) jobGenerationCurrentResult(ctx context.Context, candidate *Job) (bool, error) {
 	if candidate == nil || !s.currentJobGeneration(candidate) {
-		return false
+		return false, nil
 	}
 	if s.db == nil {
-		return true
+		return true, nil
 	}
 	var exists int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(1) FROM cron_jobs WHERE id = ? AND meta = ?`,
 		candidate.ID, serializeJobMeta(candidate)).Scan(&exists)
 	if err != nil {
-		return false
+		return false, err
 	}
 	if exists == 1 {
-		return true
+		return true, nil
 	}
 	// Generation-less values are legacy/test-only and may intentionally have no
 	// cron_jobs row. Admitted jobs always carry a generation and fail closed.
 	if candidate.Generation == "" {
 		var anyRow int
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cron_jobs WHERE id = ?`, candidate.ID).Scan(&anyRow); err == nil {
-			return anyRow == 0
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM cron_jobs WHERE id = ?`, candidate.ID).Scan(&anyRow); err != nil {
+			return false, err
 		}
+		return anyRow == 0, nil
 	}
-	return false
+	return false, nil
 }
 
 // jobGenerationCurrentFresh gives each boundary check its own short DB budget.
@@ -2061,9 +2050,14 @@ func (s *Scheduler) jobGenerationCurrent(ctx context.Context, candidate *Job) bo
 // target must not make a still-current second target look stale merely because
 // the earlier check context expired.
 func (s *Scheduler) jobGenerationCurrentFresh(candidate *Job) bool {
+	current, err := s.jobGenerationCurrentFreshResult(candidate)
+	return err == nil && current
+}
+
+func (s *Scheduler) jobGenerationCurrentFreshResult(candidate *Job) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return s.jobGenerationCurrent(ctx, candidate)
+	return s.jobGenerationCurrentResult(ctx, candidate)
 }
 
 // fastForward 把超宽限的 misfire 任务推进到下个未来执行点（跳过积压、不补一串），
@@ -2154,10 +2148,18 @@ func (s *Scheduler) executeJob(job *Job) {
 	// 实例同时触发。claimJob 用 DB 原子领取保证一个到期刻度只跑一个副本。
 	if !s.claimJob(job) {
 		slog.Info("[cron] job lifecycle",
-			"source", "cron", "job", job.ID, "runtime", runtime,
+			"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+			"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+			"schedule", job.Schedule, "user_id", job.UserID, "platform", job.Platform, "chat_id", job.ChatID,
 			"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "not_claimed")
 		return // 另一副本已领取本到期刻度
 	}
+	slog.Info("[cron] job lifecycle",
+		"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+		"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+		"schedule", job.Schedule, "user_id", job.UserID, "platform", job.Platform, "chat_id", job.ChatID,
+		"source_prompt", job.SourcePrompt, "context_from", job.ContextFrom, "job_spec", job.Spec,
+		"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "started")
 
 	now := time.Now()
 	// Note: the persistence ctx must be created AFTER the run finishes — a job
@@ -2169,13 +2171,16 @@ func (s *Scheduler) executeJob(job *Job) {
 
 	// 防御：spec 为 nil（理论上 v2 不会发生，AddJob 已强制要求 Spec）
 	if job.Spec == nil {
-		logger.Error("[cron] 跳过执行 — Spec 为 nil", "id", job.ID)
+		specErr := errors.New("Spec 为 nil — 请重新创建任务")
+		logger.Error("[cron] 跳过执行 — Spec 为 nil", "id", job.ID, "name", job.Name, "error", specErr)
 		ec, cancel := earlyCtx()
 		defer cancel()
-		_, _ = s.persistHistoryForGeneration(ec, job, "error", "", "Spec 为 nil — 请重新创建任务", 0, now, "", "", 0, nil)
+		_, _ = s.persistHistoryForGeneration(ec, job, "error", "", specErr.Error(), 0, now, "", "", 0, nil)
 		slog.Info("[cron] job lifecycle",
-			"source", "cron", "job", job.ID, "runtime", runtime,
-			"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "error")
+			"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+			"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+			"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "error",
+			"error", specErr, "job_context", job)
 		return
 	}
 	// context_from 线性任务链：执行前把上游最近一次产物注入本任务（仅读最近一条，
@@ -2195,7 +2200,9 @@ func (s *Scheduler) executeJob(job *Job) {
 	runCtx = withStateJob(runCtx, job)
 	heartbeatCtx, stopHeartbeat := context.WithCancel(runCtx)
 	defer stopHeartbeat()
+	heartbeatStopped := make(chan struct{})
 	go func() {
+		defer close(heartbeatStopped)
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -2204,7 +2211,9 @@ func (s *Scheduler) executeJob(job *Job) {
 				return
 			case <-ticker.C:
 				slog.Info("[cron] job heartbeat",
-					"source", "cron", "job", job.ID, "runtime", runtime,
+					"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+					"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+					"schedule", job.Schedule, "user_id", job.UserID, "platform", job.Platform, "chat_id", job.ChatID,
 					"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "running")
 			}
 		}
@@ -2232,20 +2241,40 @@ func (s *Scheduler) executeJob(job *Job) {
 		}
 		engine := s.engineFor(runtime)
 		if engine == nil {
-			slog.Error("[cron] skipping run — no engine for runtime", "source", "cron", "id", job.ID, "runtime", runtime)
+			engineErr := fmt.Errorf("no script engine for runtime %s", runtime)
+			slog.Error("[cron] skipping run — no engine for runtime", "source", "cron", "id", job.ID,
+				"name", job.Name, "generation", job.Generation, "source_key", job.SourceKey,
+				"runtime", runtime, "error", engineErr, "job_context", job)
+			stopHeartbeat()
+			<-heartbeatStopped
+			slog.Info("[cron] job lifecycle",
+				"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+				"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+				"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "error",
+				"error", engineErr, "job_context", job)
 			ec, cancel := earlyCtx()
 			defer cancel()
-			_, _ = s.persistHistoryForGeneration(ec, job, "error", "", "no script engine for runtime "+runtime, 0, now, "", "", 0, nil)
+			_, _ = s.persistHistoryForGeneration(ec, job, "error", "", engineErr.Error(), 0, now, "", "", 0, nil)
 			return
 		}
 		if !engine.Available() {
 			// Explicit error instead of a silent exec failure (e.g. python3 not
 			// installed). The Starlark engine is always available, so steering new
 			// mechanical jobs to it avoids this entirely.
-			slog.Error("[cron] skipping run — runtime unavailable on this host", "source", "cron", "id", job.ID, "runtime", engine.Name())
+			engineErr := fmt.Errorf("%s runtime is not available on this host", engine.Name())
+			slog.Error("[cron] skipping run — runtime unavailable on this host", "source", "cron", "id", job.ID,
+				"name", job.Name, "generation", job.Generation, "source_key", job.SourceKey,
+				"runtime", engine.Name(), "error", engineErr, "job_context", job)
+			stopHeartbeat()
+			<-heartbeatStopped
+			slog.Info("[cron] job lifecycle",
+				"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+				"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+				"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(), "status", "error",
+				"error", engineErr, "job_context", job)
 			ec, cancel := earlyCtx()
 			defer cancel()
-			_, _ = s.persistHistoryForGeneration(ec, job, "error", "", engine.Name()+" runtime is not available on this host", 0, now, "", "", 0, nil)
+			_, _ = s.persistHistoryForGeneration(ec, job, "error", "", engineErr.Error(), 0, now, "", "", 0, nil)
 			return
 		}
 		logger.Info("[cron] 执行脚本任务", "name", job.Name, "id", job.ID, "engine", engine.Name())
@@ -2285,28 +2314,35 @@ func (s *Scheduler) executeJob(job *Job) {
 		result.Error = runErr.Error()
 	}
 	stopHeartbeat()
+	<-heartbeatStopped
 	slog.Info("[cron] job lifecycle",
-		"source", "cron", "job", job.ID, "runtime", runtime,
+		"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+		"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+		"schedule", job.Schedule, "user_id", job.UserID, "platform", job.Platform, "chat_id", job.ChatID,
 		"stage", "execute", "elapsed_ms", time.Since(executeStarted).Milliseconds(),
-		"status", result.Status, "exit", result.ExitCode)
+		"status", result.Status, "exit", result.ExitCode, "error", runErr,
+		"result_error", result.Error, "stdout", result.Stdout, "stderr", result.Stderr, "result_data", result.Data)
 
 	// Update job state (the persistence ctx is created after the run finishes,
 	// see the note at the top of this function).
 	persistStarted := time.Now()
 	persistStatus := "success"
+	var persistError error
+	var nextErr error
 	persistLogged := false
 	defer func() {
 		if !persistLogged {
 			slog.Info("[cron] job lifecycle",
-				"source", "cron", "job", job.ID, "runtime", runtime,
-				"stage", "persist", "elapsed_ms", time.Since(persistStarted).Milliseconds(), "status", persistStatus)
+				"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+				"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+				"stage", "persist", "elapsed_ms", time.Since(persistStarted).Milliseconds(), "status", persistStatus,
+				"error", persistError, "next_run_error", nextErr, "job_context", job, "result", result)
 		}
 	}()
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dbCancel()
 	now = time.Now()
 	var next time.Time
-	var nextErr error
 	if job.Type != JobTypeOnce {
 		next, nextErr = nextRunTime(job.Schedule, job.Type, now.In(jobLocation(job.TZ)))
 		if nextErr != nil {
@@ -2343,10 +2379,18 @@ func (s *Scheduler) executeJob(job *Job) {
 		if err != nil {
 			logger.Error("Cron: 更新任务状态失败", "error", err)
 			persistStatus = "error"
+			persistError = err
 			if job.Generation != "" {
 				return
 			}
-		} else if affected, rowsErr := res.RowsAffected(); rowsErr != nil || affected != 1 {
+		} else if affected, rowsErr := res.RowsAffected(); rowsErr != nil {
+			logger.Error("Cron: 读取任务状态更新结果失败", "error", rowsErr)
+			persistStatus = "error"
+			persistError = rowsErr
+			if job.Generation != "" {
+				return
+			}
+		} else if affected != 1 {
 			// Generation-bearing jobs are always persisted. A zero-row update
 			// therefore means this run was superseded or removed. Legacy/test jobs
 			// without a generation retain the historical no-row fail-open behavior.
@@ -2396,6 +2440,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	if historyErr != nil {
 		logger.Error("Cron: 写入执行历史失败", "error", historyErr)
 		persistStatus = "error"
+		persistError = historyErr
 	}
 	if !persisted {
 		if persistStatus == "success" {
@@ -2406,14 +2451,23 @@ func (s *Scheduler) executeJob(job *Job) {
 	}
 	// History/pruning may consume most of dbCtx's budget. Delivery is a new
 	// external boundary and must get a fresh generation-check deadline.
-	if !s.jobGenerationCurrentFresh(job) {
+	generationCurrent, generationErr := s.jobGenerationCurrentFreshResult(job)
+	if generationErr != nil {
+		logger.Error("Cron: 校验任务世代失败", "error", generationErr)
+		persistStatus = "error"
+		persistError = generationErr
+		return
+	}
+	if !generationCurrent {
 		persistStatus = "stale"
 		return
 	}
 	persistLogged = true
 	slog.Info("[cron] job lifecycle",
-		"source", "cron", "job", job.ID, "runtime", runtime,
-		"stage", "persist", "elapsed_ms", time.Since(persistStarted).Milliseconds(), "status", persistStatus)
+		"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+		"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+		"stage", "persist", "elapsed_ms", time.Since(persistStarted).Milliseconds(), "status", persistStatus,
+		"error", persistError, "next_run_error", nextErr, "job_context", job, "result", result)
 
 	deliveryStarted := time.Now()
 	deliveryStatus := "attempted"
@@ -2448,9 +2502,11 @@ func (s *Scheduler) executeJob(job *Job) {
 		}
 	}
 	slog.Info("[cron] job lifecycle",
-		"source", "cron", "job", job.ID, "runtime", runtime,
+		"source", "cron", "job", job.ID, "job_name", job.Name, "job_type", job.Type,
+		"generation", job.Generation, "source_key", job.SourceKey, "runtime", runtime,
+		"deliver", job.Deliver, "failure_deliver", job.FailureDeliver, "platform", job.Platform, "chat_id", job.ChatID,
 		"stage", "delivery", "elapsed_ms", time.Since(deliveryStarted).Milliseconds(),
-		"status", deliveryStatus, "total_elapsed_ms", time.Since(executeStarted).Milliseconds())
+		"status", deliveryStatus, "total_elapsed_ms", time.Since(executeStarted).Milliseconds(), "result", result)
 }
 
 // maybeFailureDeliver routes a failure summary to the job's FailureDeliver

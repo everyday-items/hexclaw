@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/hexagon-codes/hexagon/observe/trace"
 )
 
 // 子 Agent 执行路径硬化（评审 #1 重试/退避 + #2 输出注入防护 + #8 per-子超时）。
@@ -83,16 +85,43 @@ func runSubAgentWithRetry(ctx context.Context, execFn SubAgentExecFunc, spec Sub
 	}
 	var lastErr error
 	var lastRes SubAgentResult
+	maxAttempts := len(subAgentRetryBackoff) + 1
 	// 尝试次数 = 1（首发）+ len(backoff)（重试）。
 	for attempt := 0; attempt <= len(subAgentRetryBackoff); attempt++ {
+		attemptNumber := attempt + 1
+		attemptStarted := time.Now()
+		trace.L(ctx).Info("subagent attempt started", "stage", "attempt", "run_id", spec.RunID, "agent", spec.Agent, "task", spec.Task, "mode", spec.Mode, "session_id", spec.SessionID, "depth", spec.Depth, "source", spec.Source, "tool_allow", spec.ToolAllow, "tool_deny", spec.ToolDeny, "attempt", attemptNumber, "max_attempts", maxAttempts, "elapsed_ms", int64(0))
 		tryCtx, cancel := newSubAgentAttemptContext(ctx, perTry)
+		heartbeatDone := make(chan struct{})
+		heartbeatStopped := make(chan struct{})
+		go func() {
+			defer close(heartbeatStopped)
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					trace.L(ctx).Info("subagent attempt heartbeat", "stage", "attempt", "run_id", spec.RunID, "agent", spec.Agent, "attempt", attemptNumber, "max_attempts", maxAttempts, "elapsed_ms", time.Since(attemptStarted).Milliseconds())
+				case <-heartbeatDone:
+					return
+				}
+			}
+		}()
 		res, err := executeSubAgentCall(tryCtx, execFn, spec)
+		close(heartbeatDone)
+		<-heartbeatStopped
 		cancel()
 		if err == nil && strings.TrimSpace(res.Output) == "" {
 			err = errSubAgentEmptyOutput
 		}
 		if err == nil {
+			trace.L(ctx).Info("subagent attempt completed", "stage", "attempt", "run_id", spec.RunID, "agent", spec.Agent, "output", res.Output, "result_session_id", res.SessionID, "attempt", attemptNumber, "max_attempts", maxAttempts, "elapsed_ms", time.Since(attemptStarted).Milliseconds())
 			return res, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			trace.L(ctx).Warn("subagent attempt cancelled", "stage", "attempt", "run_id", spec.RunID, "agent", spec.Agent, "task", spec.Task, "output", res.Output, "result_session_id", res.SessionID, "attempt", attemptNumber, "max_attempts", maxAttempts, "error", err, "elapsed_ms", time.Since(attemptStarted).Milliseconds())
+		} else {
+			trace.L(ctx).Warn("subagent attempt failed", "stage", "attempt", "run_id", spec.RunID, "agent", spec.Agent, "task", spec.Task, "output", res.Output, "result_session_id", res.SessionID, "attempt", attemptNumber, "max_attempts", maxAttempts, "error", err, "elapsed_ms", time.Since(attemptStarted).Milliseconds())
 		}
 		lastErr, lastRes = err, res
 		if !isTransientErr(err) {
@@ -101,8 +130,10 @@ func runSubAgentWithRetry(ctx context.Context, execFn SubAgentExecFunc, spec Sub
 		if attempt == len(subAgentRetryBackoff) {
 			break // 重试用尽
 		}
+		backoff := subAgentRetryBackoff[attempt]
+		trace.L(ctx).Info("subagent retry scheduled", "stage", "retry_wait", "run_id", spec.RunID, "agent", spec.Agent, "task", spec.Task, "attempt", attemptNumber, "max_attempts", maxAttempts, "backoff_ms", backoff.Milliseconds(), "error", err, "elapsed_ms", time.Since(attemptStarted).Milliseconds())
 		select {
-		case <-time.After(subAgentRetryBackoff[attempt]):
+		case <-time.After(backoff):
 		case <-ctx.Done():
 			return lastRes, ctx.Err()
 		}

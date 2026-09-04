@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -236,17 +237,21 @@ type runtimeToolExecutor struct {
 
 func (e *runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (hruntime.ToolResult, error) {
 	started := time.Now()
-	trace.L(ctx).Info("runtime tool call started", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID)
+	argumentsForLog := call.Arguments
+	if strings.Contains(strings.ToLower(argumentsForLog), "base64") {
+		argumentsForLog = "[omitted: contains base64 media]"
+	}
+	trace.L(ctx).Info("runtime tool call started", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "arguments", argumentsForLog)
 	var args map[string]any
 	if call.Arguments != "" {
 		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
-			trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "reason", "invalid_arguments", "elapsed_ms", time.Since(started).Milliseconds())
+			trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "arguments", argumentsForLog, "reason", "invalid_arguments", "err", err, "elapsed_ms", time.Since(started).Milliseconds())
 			msg := fmt.Sprintf("Error: invalid arguments for tool %q: %s", call.Name, err.Error())
 			return hruntime.ToolResult{Content: msg, Error: err.Error()}, nil
 		}
 	}
 	if e.executor == nil {
-		trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "reason", "executor_unavailable", "elapsed_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "arguments", argumentsForLog, "reason", "executor_unavailable", "err", "tool executor not available", "elapsed_ms", time.Since(started).Milliseconds())
 		return hruntime.ToolResult{Content: "Error: tool executor not available", Error: "tool executor not available"}, nil
 	}
 
@@ -259,15 +264,43 @@ func (e *runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (h
 	e.mu.Unlock()
 	if count > maxIdenticalToolCallsFor(call.Name) {
 		trace.L(ctx).Warn("tool-loop repeat guard tripped",
-			"stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID,
-			"reason", "repeat_guard", "identical_calls", count, "elapsed_ms", time.Since(started).Milliseconds())
+			"stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "arguments", argumentsForLog,
+			"reason", "repeat_guard", "err", repeatToolCallBlockedError, "identical_calls", count, "elapsed_ms", time.Since(started).Milliseconds())
 		msg := fmt.Sprintf("You have already called %q with these exact arguments %d times and received the same result above. Do NOT call it again. Produce your final answer now using the information you already have; if it is insufficient, explain what is missing and stop.", call.Name, count-1)
 		return hruntime.ToolResult{Content: msg, Raw: repeatToolCallBlockedError, Status: hruntime.ToolStatusError}, nil
 	}
 
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatStopped := make(chan struct{})
+	var stopHeartbeatOnce sync.Once
+	finishHeartbeat := func() {
+		stopHeartbeatOnce.Do(func() {
+			stopHeartbeat()
+			select {
+			case <-heartbeatStopped:
+			case <-time.After(time.Second):
+				trace.L(ctx).Warn("runtime tool heartbeat stop timed out", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "err", "heartbeat goroutine did not stop within timeout", "timeout_ms", int64(time.Second/time.Millisecond))
+			}
+		})
+	}
+	defer finishHeartbeat()
+	go func() {
+		defer close(heartbeatStopped)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				trace.L(ctx).Info("runtime tool call heartbeat", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "elapsed_ms", time.Since(started).Milliseconds())
+			}
+		}
+	}()
 	result, err := e.executor.Execute(ctx, call.Name, args)
+	finishHeartbeat()
 	if err != nil {
-		trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "reason", "execution_error", "elapsed_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "arguments", argumentsForLog, "reason", "execution_error", "err", err, "elapsed_ms", time.Since(started).Milliseconds())
 		msg := fmt.Sprintf("Error executing tool %q: %s", call.Name, err.Error())
 		return hruntime.ToolResult{Content: msg, Raw: result, Error: err.Error()}, nil
 	}

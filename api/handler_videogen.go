@@ -126,36 +126,35 @@ func (s *Server) handleVideoGenSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestRef := req.IdempotencyKey
-	if requestRef == "" {
-		requestRef = r.Header.Get("Idempotency-Key")
+	requestID := req.IdempotencyKey
+	if requestID == "" {
+		requestID = r.Header.Get("Idempotency-Key")
 	}
-	if requestRef == "" {
-		requestRef = r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = r.Header.Get("X-Request-ID")
 	}
-	requestRef = mediaLogRef(requestRef)
 	providerName := req.Provider
 	modelName := req.Model
 	submitStarted := time.Now()
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "video", "request_ref", requestRef,
+		"media_kind", "video", "request", requestID,
 		"provider", providerName, "model", modelName,
 		"stage", "submit", "status", "started",
-		"elapsed_ms", int64(0), "result_count", 0)
+		"elapsed_ms", int64(0), "result_count", 0,
+		"http_method", r.Method, "request_url", r.URL.String(),
+		"request_headers", r.Header, "request_body", req)
 	taskID, err := s.videogenSvc.Submit(r.Context(), req.Provider, req.Request)
 	if err != nil {
 		submitStatus := "failed"
-		errorType := "provider_error"
 		if r.Context().Err() != nil {
 			submitStatus = "cancelled"
-			errorType = "context_cancelled"
 		}
 		logger.WarnContext(r.Context(), "[media] stage",
-			"media_kind", "video", "request_ref", requestRef,
+			"media_kind", "video", "request", requestID,
 			"provider", providerName, "model", modelName,
 			"stage", "submit", "status", submitStatus,
 			"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0,
-			"error_type", errorType)
+			"error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "提交失败: " + err.Error()})
 		return
 	}
@@ -164,9 +163,8 @@ func (s *Server) handleVideoGenSubmit(w http.ResponseWriter, r *http.Request) {
 			providerName = provider
 		}
 	}
-	taskRef := mediaLogRef(taskID)
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "video", "task_ref", taskRef,
+		"media_kind", "video", "task", taskID,
 		"provider", providerName, "model", modelName,
 		"stage", "submit", "status", "completed",
 		"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0)
@@ -186,7 +184,6 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 task ID"})
 		return
 	}
-	taskRef := mediaLogRef(taskID)
 	providerName := ""
 	if provider, _, ok := strings.Cut(taskID, "::"); ok {
 		providerName = provider
@@ -195,17 +192,17 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 	status, err := s.videogenSvc.Poll(r.Context(), taskID)
 	if err != nil {
 		pollStatus := "failed"
-		errorType := "provider_error"
 		if r.Context().Err() != nil {
 			pollStatus = "cancelled"
-			errorType = "context_cancelled"
 		}
 		logger.WarnContext(r.Context(), "[media] stage",
-			"media_kind", "video", "task_ref", taskRef,
+			"media_kind", "video", "task", taskID,
 			"provider", providerName, "model", "",
 			"stage", "poll", "status", pollStatus,
 			"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0,
-			"error_type", errorType)
+			"error", err, "task_status", status,
+			"http_method", r.Method, "request_url", r.URL.String(),
+			"request_headers", r.Header)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "查询失败: " + err.Error()})
 		return
 	}
@@ -219,17 +216,23 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 		}
 		if status.Status == "success" {
 			logger.InfoContext(r.Context(), "[media] stage",
-				"media_kind", "video", "task_ref", taskRef,
+				"media_kind", "video", "task", taskID,
 				"provider", providerName, "model", status.Model,
 				"stage", "poll", "status", "completed",
-				"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", pollResultCount)
+				"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", pollResultCount,
+				"upstream_request_id", status.RequestID, "task_status", status,
+				"http_method", r.Method, "request_url", r.URL.String(),
+				"request_headers", r.Header)
 		} else {
 			logger.WarnContext(r.Context(), "[media] stage",
-				"media_kind", "video", "task_ref", taskRef,
+				"media_kind", "video", "task", taskID,
 				"provider", providerName, "model", status.Model,
 				"stage", "poll", "status", "failed",
 				"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0,
-				"error_type", "provider_error")
+				"error", status.Error, "upstream_request_id", status.RequestID,
+				"task_status", status,
+				"http_method", r.Method, "request_url", r.URL.String(),
+				"request_headers", r.Header)
 		}
 	}
 
@@ -238,10 +241,35 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 	if status.Done && status.Status == "success" && s.genStore != nil {
 		persistStarted := time.Now()
 		logger.InfoContext(r.Context(), "[media] stage",
-			"media_kind", "video", "task_ref", taskRef,
+			"media_kind", "video", "task", taskID,
 			"provider", providerName, "model", status.Model,
 			"stage", "persist", "status", "started",
-			"elapsed_ms", int64(0), "result_count", 0)
+			"elapsed_ms", int64(0), "result_count", 0,
+			"video_url", status.VideoURL, "video_file_path", status.VideoFilePath,
+			"video_mime_type", "video/mp4", "cover_url", status.CoverURL,
+			"cover_file_path", status.CoverFilePath, "cover_mime_type", "image/jpeg")
+		persistHeartbeatDone := make(chan struct{})
+		var persistHeartbeatWG sync.WaitGroup
+		persistHeartbeatWG.Add(1)
+		go func() {
+			defer persistHeartbeatWG.Done()
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					logger.InfoContext(r.Context(), "[media] stage",
+						"media_kind", "video", "task", taskID,
+						"provider", providerName, "model", status.Model,
+						"stage", "persist", "status", "heartbeat",
+						"elapsed_ms", time.Since(persistStarted).Milliseconds(), "result_count", 0)
+				case <-persistHeartbeatDone:
+					return
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}()
 		var flightErr error
 		if cached, hit := videoDownloadLookup(taskID); hit {
 			status.VideoFilePath = cached.VideoFilePath
@@ -265,7 +293,15 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 				}
 				if status.CoverURL != "" {
 					saved, dlErr := s.genStore.SaveFromURL(r.Context(), status.CoverURL, "jpg")
-					if dlErr == nil {
+					if dlErr != nil {
+						logger.WarnContext(r.Context(), "[media] detail",
+							"media_kind", "video", "task", taskID,
+							"provider", providerName, "model", status.Model,
+							"event", "cover_persist_failed",
+							"elapsed_ms", time.Since(persistStarted).Milliseconds(),
+							"cover_url", status.CoverURL, "cover_mime_type", "image/jpeg",
+							"error", dlErr)
+					} else {
 						rec.CoverFilePath = saved
 					}
 				}
@@ -300,24 +336,28 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 		if persistFailed {
 			persistStatus = "failed"
 		}
+		close(persistHeartbeatDone)
+		persistHeartbeatWG.Wait()
 		elapsedMS := time.Since(persistStarted).Milliseconds()
 		if persistFailed {
-			errorType := "persist_incomplete"
-			if flightErr != nil {
-				errorType = "store_error"
-			}
 			logger.WarnContext(r.Context(), "[media] stage",
-				"media_kind", "video", "task_ref", taskRef,
+				"media_kind", "video", "task", taskID,
 				"provider", providerName, "model", status.Model,
 				"stage", "persist", "status", persistStatus,
 				"elapsed_ms", elapsedMS, "result_count", resultCount,
-				"error_type", errorType)
+				"error", flightErr, "status_error", status.Error,
+				"video_url", status.VideoURL, "video_file_path", status.VideoFilePath,
+				"video_mime_type", "video/mp4", "cover_url", status.CoverURL,
+				"cover_file_path", status.CoverFilePath, "cover_mime_type", "image/jpeg")
 		} else {
 			logger.InfoContext(r.Context(), "[media] stage",
-				"media_kind", "video", "task_ref", taskRef,
+				"media_kind", "video", "task", taskID,
 				"provider", providerName, "model", status.Model,
 				"stage", "persist", "status", persistStatus,
-				"elapsed_ms", elapsedMS, "result_count", resultCount)
+				"elapsed_ms", elapsedMS, "result_count", resultCount,
+				"video_url", status.VideoURL, "video_file_path", status.VideoFilePath,
+				"video_mime_type", "video/mp4", "cover_url", status.CoverURL,
+				"cover_file_path", status.CoverFilePath, "cover_mime_type", "image/jpeg")
 		}
 	}
 

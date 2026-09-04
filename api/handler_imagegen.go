@@ -1,9 +1,7 @@
 package api
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -71,22 +69,23 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	requestRef := req.IdempotencyKey
-	if requestRef == "" {
-		requestRef = r.Header.Get("Idempotency-Key")
+	requestID := req.IdempotencyKey
+	if requestID == "" {
+		requestID = r.Header.Get("Idempotency-Key")
 	}
-	if requestRef == "" {
-		requestRef = r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = r.Header.Get("X-Request-ID")
 	}
-	requestRef = mediaLogRef(requestRef)
 	providerName := req.Provider
 	modelName := req.Model
 	providerStarted := time.Now()
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "image", "request_ref", requestRef,
+		"media_kind", "image", "request", requestID,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "started",
-		"elapsed_ms", int64(0), "result_count", 0)
+		"elapsed_ms", int64(0), "result_count", 0,
+		"http_method", r.Method, "request_url", r.URL.String(),
+		"request_headers", r.Header, "request_body", req)
 	providerHeartbeatDone := make(chan struct{})
 	var providerHeartbeatWG sync.WaitGroup
 	providerHeartbeatWG.Add(1)
@@ -98,7 +97,7 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 			select {
 			case <-ticker.C:
 				logger.InfoContext(r.Context(), "[media] stage",
-					"media_kind", "image", "request_ref", requestRef,
+					"media_kind", "image", "request", requestID,
 					"provider", providerName, "model", modelName,
 					"stage", "provider_wait", "status", "heartbeat",
 					"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
@@ -114,21 +113,22 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 	providerHeartbeatWG.Wait()
 	if err != nil {
 		waitStatus := "failed"
-		errorType := "provider_error"
 		if r.Context().Err() != nil {
 			waitStatus = "cancelled"
-			errorType = "context_cancelled"
 		}
 		logger.WarnContext(r.Context(), "[media] stage",
-			"media_kind", "image", "request_ref", requestRef,
+			"media_kind", "image", "request", requestID,
 			"provider", providerName, "model", modelName,
 			"stage", "provider_wait", "status", waitStatus,
 			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0,
-			"error_type", errorType)
+			"error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "生成失败: " + err.Error()})
 		return
 	}
 	resultCount := 0
+	upstreamRequestID := ""
+	var billed *bool
+	var created, usageMS int64
 	if result != nil {
 		if result.Provider != "" {
 			providerName = result.Provider
@@ -136,16 +136,23 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 		if result.Model != "" {
 			modelName = result.Model
 		}
-		if requestRef == "" && result.RequestID != "" {
-			requestRef = mediaLogRef(result.RequestID)
+		upstreamRequestID = result.RequestID
+		billed = result.Billed
+		created = result.Created
+		usageMS = result.UsageMs
+		if requestID == "" && result.RequestID != "" {
+			requestID = result.RequestID
 		}
 		resultCount = len(result.Images)
 	}
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "image", "request_ref", requestRef,
+		"media_kind", "image", "request", requestID,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "completed",
-		"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", resultCount)
+		"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", resultCount,
+		"upstream_request_id", upstreamRequestID, "created", created,
+		"billed", billed, "provider_usage_ms", usageMS,
+		"images", mediaImageLogResults(result, req.Size))
 
 	// 持久化：把 b64 / URL 落盘到 {DataDir}/generated，回填 file_path 字段。
 	// 前端优先用 file_path 拼出 /api/v1/files/generated/{path}，避免 base64 撑爆 SQLite，
@@ -153,10 +160,12 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 	if s.genStore != nil {
 		persistStarted := time.Now()
 		logger.InfoContext(r.Context(), "[media] stage",
-			"media_kind", "image", "request_ref", requestRef,
+			"media_kind", "image", "request", requestID,
 			"provider", providerName, "model", modelName,
 			"stage", "persist", "status", "started",
-			"elapsed_ms", int64(0), "result_count", 0)
+			"elapsed_ms", int64(0), "result_count", 0,
+			"target_mime_type", "image/png", "size", req.Size,
+			"images", mediaImageLogResults(result, req.Size))
 		persistHeartbeatDone := make(chan struct{})
 		var persistHeartbeatWG sync.WaitGroup
 		persistHeartbeatWG.Add(1)
@@ -168,7 +177,7 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 				select {
 				case <-ticker.C:
 					logger.InfoContext(r.Context(), "[media] stage",
-						"media_kind", "image", "request_ref", requestRef,
+						"media_kind", "image", "request", requestID,
 						"provider", providerName, "model", modelName,
 						"stage", "persist", "status", "heartbeat",
 						"elapsed_ms", time.Since(persistStarted).Milliseconds(), "result_count", 0)
@@ -180,36 +189,34 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 			}
 		}()
 		persistedCount := 0
-		persistFailed := false
-		persistErrorType := ""
+		persistedBytes := 0
+		var persistErr error
 		for i := range result.Images {
 			img := &result.Images[i]
 			if img.B64JSON != "" {
 				data, decErr := base64.StdEncoding.DecodeString(img.B64JSON)
 				if decErr != nil {
-					persistFailed = true
-					if persistErrorType == "" {
-						persistErrorType = "decode_error"
+					if persistErr == nil {
+						persistErr = decErr
 					}
 					continue
 				}
 				saved, saveErr := s.genStore.SaveBytes(data, "png")
 				if saveErr != nil {
-					persistFailed = true
-					if persistErrorType == "" {
-						persistErrorType = "store_error"
+					if persistErr == nil {
+						persistErr = saveErr
 					}
 					continue
 				}
 				img.FilePath = saved
 				img.B64JSON = "" // 落盘后清空 b64，避免响应体两份大数据
 				persistedCount++
+				persistedBytes += len(data)
 			} else if img.URL != "" {
 				saved, saveErr := s.genStore.SaveFromURL(r.Context(), img.URL, "png")
 				if saveErr != nil {
-					persistFailed = true
-					if persistErrorType == "" {
-						persistErrorType = "store_error"
+					if persistErr == nil {
+						persistErr = saveErr
 					}
 					continue
 				}
@@ -220,33 +227,48 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 		close(persistHeartbeatDone)
 		persistHeartbeatWG.Wait()
 		persistStatus := "completed"
-		if persistFailed {
+		if persistErr != nil {
 			persistStatus = "failed"
 		}
 		elapsedMS := time.Since(persistStarted).Milliseconds()
-		if persistFailed {
+		if persistErr != nil {
 			logger.WarnContext(r.Context(), "[media] stage",
-				"media_kind", "image", "request_ref", requestRef,
+				"media_kind", "image", "request", requestID,
 				"provider", providerName, "model", modelName,
 				"stage", "persist", "status", persistStatus,
 				"elapsed_ms", elapsedMS, "result_count", persistedCount,
-				"error_type", persistErrorType)
+				"error", persistErr, "persisted_bytes", persistedBytes,
+				"target_mime_type", "image/png", "size", req.Size,
+				"images", mediaImageLogResults(result, req.Size))
 		} else {
 			logger.InfoContext(r.Context(), "[media] stage",
-				"media_kind", "image", "request_ref", requestRef,
+				"media_kind", "image", "request", requestID,
 				"provider", providerName, "model", modelName,
 				"stage", "persist", "status", persistStatus,
-				"elapsed_ms", elapsedMS, "result_count", persistedCount)
+				"elapsed_ms", elapsedMS, "result_count", persistedCount,
+				"persisted_bytes", persistedBytes,
+				"target_mime_type", "image/png", "size", req.Size,
+				"images", mediaImageLogResults(result, req.Size))
 		}
 	}
 
 	writeJSON(w, http.StatusOK, result)
 }
 
-func mediaLogRef(value string) string {
-	if value == "" {
-		return ""
+func mediaImageLogResults(result *imagegen.Result, size string) []map[string]any {
+	if result == nil {
+		return nil
 	}
-	digest := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(digest[:8])
+	images := make([]map[string]any, 0, len(result.Images))
+	for i, img := range result.Images {
+		images = append(images, map[string]any{
+			"index":          i,
+			"url":            img.URL,
+			"file_path":      img.FilePath,
+			"revised_prompt": img.RevisedPrompt,
+			"size":           size,
+			"base64_bytes":   len(img.B64JSON),
+		})
+	}
+	return images
 }

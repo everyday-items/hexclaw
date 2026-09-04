@@ -872,13 +872,78 @@ func (s *Server) handleRunWorkflow(w http.ResponseWriter, r *http.Request) {
 }
 
 // executeWorkflow 异步执行工作流
-func (s *Server) executeWorkflow(ctx context.Context, wf *WorkflowData, run *WorkflowRun, req RunWorkflowRequest) {
+func (s *Server) executeWorkflow(ctx context.Context, wf *WorkflowData, run *WorkflowRun, req RunWorkflowRequest, resumed ...map[string]string) {
+	startedAt := time.Now()
+	logger.Info("[workflow] run started",
+		"run_id", run.ID,
+		"workflow_id", wf.ID,
+		"workflow_name", wf.Name,
+		"user", req.UserID,
+		"platform", req.Platform,
+		"input", req.Input,
+		"stage", "execute",
+		"elapsed_ms", int64(0),
+	)
+	heartbeatStop := make(chan struct{})
+	heartbeatStopped := make(chan struct{})
+	go func() {
+		defer close(heartbeatStopped)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatStop:
+				return
+			case <-ticker.C:
+				logger.Info("[workflow] run heartbeat",
+					"run_id", run.ID,
+					"workflow_id", wf.ID,
+					"workflow_name", wf.Name,
+					"user", req.UserID,
+					"platform", req.Platform,
+					"input", req.Input,
+					"stage", "execute",
+					"elapsed_ms", time.Since(startedAt).Milliseconds(),
+				)
+			}
+		}
+	}()
+
 	exec := newWorkflowExecutor(s, wf, req)
+	if len(resumed) > 0 {
+		exec = exec.withResumed(resumed[0])
+	}
 	finished := exec.execute(ctx, run)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.runs[run.ID] = finished
 	s.workflowStore.persistRuns() // Ph5：终态（含各节点输出）落盘，支撑失败后续接重放
 	s.workflowStore.mu.Unlock()
+	close(heartbeatStop)
+	<-heartbeatStopped
+
+	terminalStatus := "failed"
+	if finished.Status == "completed" {
+		terminalStatus = "completed"
+	} else if ctx.Err() != nil {
+		terminalStatus = "cancelled"
+	}
+	logFields := []any{
+		"run_id", run.ID,
+		"workflow_id", wf.ID,
+		"workflow_name", wf.Name,
+		"user", req.UserID,
+		"platform", req.Platform,
+		"input", req.Input,
+		"stage", "execute",
+		"status", terminalStatus,
+		"error", finished.Error,
+		"elapsed_ms", time.Since(startedAt).Milliseconds(),
+	}
+	if terminalStatus == "completed" {
+		logger.Info("[workflow] run completed", logFields...)
+	} else {
+		logger.Warn("[workflow] run "+terminalStatus, logFields...)
+	}
 }
 
 // handleResumeWorkflowRun 续接一次失败/中断的运行（Ph5，对齐 OpenClaw 续接语义）：复用上次
@@ -926,11 +991,7 @@ func (s *Server) handleResumeWorkflowRun(w http.ResponseWriter, r *http.Request)
 	wfCtx, wfCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	go func() {
 		defer wfCancel()
-		finished := newWorkflowExecutor(s, wf, req).withResumed(resumed).execute(wfCtx, run)
-		s.workflowStore.mu.Lock()
-		s.workflowStore.runs[run.ID] = finished
-		s.workflowStore.persistRuns()
-		s.workflowStore.mu.Unlock()
+		s.executeWorkflow(wfCtx, wf, run, req, resumed)
 	}()
 
 	snapshot := *run
@@ -977,7 +1038,11 @@ func (s *Server) RunWorkflowByID(id, userID string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("工作流不存在: %s", id)
 	}
-	logger.Info("[workflow] agent 触发运行", "workflow_id", id, "name", wf.Name, "user", userID)
+	logger.Info("[workflow] agent trigger accepted",
+		"workflow_id", id,
+		"workflow_name", wf.Name,
+		"user", userID,
+	)
 	run := s.newWorkflowRun(wf, "", nil)
 	s.workflowStore.mu.Lock()
 	s.workflowStore.addRun(run)

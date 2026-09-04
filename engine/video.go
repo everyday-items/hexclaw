@@ -50,41 +50,51 @@ const videoTaskPollInterval = 10 * time.Second
 // 封面图下载失败时 coverDataURI 为空。
 func generateVideo(ctx context.Context, svc *mediavid.Service, model, prompt string) (videoURL, coverDataURI string, err error) {
 	started := time.Now()
-	trace.L(ctx).Info("video provider stage started", "stage", "provider", "model", model)
+	trace.L(ctx).Info("video provider stage started", "stage", "provider", "model", model, "prompt", prompt)
 	if svc == nil || !svc.HasProvider() {
-		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "provider_unavailable", "elapsed_ms", time.Since(started).Milliseconds())
-		return "", "", fmt.Errorf("未配置视频生成服务（model=%s）", model)
+		err := fmt.Errorf("未配置视频生成服务（model=%s）", model)
+		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "provider_unavailable", "err", err, "elapsed_ms", time.Since(started).Milliseconds())
+		return "", "", err
 	}
 
 	providerStarted := time.Now()
 	st, err := svc.SubmitAndWait(ctx, "", mediavid.Request{Model: model, Prompt: prompt}, videoTaskPollInterval)
 	if err != nil {
-		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "generation_error", "error_type", fmt.Sprintf("%T", err), "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "generation_error", "err", err, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
 		return "", "", fmt.Errorf("视频生成失败: %w", err)
+	}
+	videoURLForLog := st.VideoURL
+	if strings.HasPrefix(strings.ToLower(videoURLForLog), "data:") {
+		videoURLForLog = "[omitted: base64 media]"
+	}
+	coverURLForLog := st.CoverURL
+	if strings.HasPrefix(strings.ToLower(coverURLForLog), "data:") {
+		coverURLForLog = "[omitted: base64 media]"
 	}
 	if st.Status == "failed" || st.Error != "" {
 		errMsg := st.Error
 		if errMsg == "" {
 			errMsg = "未知错误"
 		}
-		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "provider_failed", "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "provider_failed", "status", st.Status, "video_url", videoURLForLog, "cover_url", coverURLForLog, "err", errMsg, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
 		return "", "", fmt.Errorf("视频生成失败: %s", errMsg)
 	}
 	if st.VideoURL == "" {
-		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "missing_video", "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
-		return "", "", fmt.Errorf("视频任务已完成但未返回视频地址")
+		err := fmt.Errorf("视频任务已完成但未返回视频地址")
+		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "missing_video", "status", st.Status, "cover_url", coverURLForLog, "err", err, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
+		return "", "", err
 	}
-	trace.L(ctx).Info("video provider stage completed", "stage", "provider", "model", model, "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds())
+	trace.L(ctx).Info("video provider stage completed", "stage", "provider", "model", model, "status", st.Status, "video_url", videoURLForLog, "cover_url", coverURLForLog, "elapsed_ms", time.Since(providerStarted).Milliseconds())
 
 	// 下载封面图为 data URI（失败不阻塞）
 	if st.CoverURL != "" {
 		coverStarted := time.Now()
-		trace.L(ctx).Info("video cover materialization started", "stage", "cover_materialize", "model", model)
+		trace.L(ctx).Info("video cover materialization started", "stage", "cover_materialize", "model", model, "cover_url", coverURLForLog)
 		if uri, dlErr := downloadAsDataURI(ctx, st.CoverURL); dlErr == nil {
 			coverDataURI = uri
-			trace.L(ctx).Info("video cover materialization completed", "stage", "cover_materialize", "model", model, "elapsed_ms", time.Since(coverStarted).Milliseconds())
+			trace.L(ctx).Info("video cover materialization completed", "stage", "cover_materialize", "model", model, "cover_url", coverURLForLog, "elapsed_ms", time.Since(coverStarted).Milliseconds())
 		} else {
-			trace.L(ctx).Warn("video cover materialization failed", "stage", "cover_materialize", "model", model, "error_type", fmt.Sprintf("%T", dlErr), "elapsed_ms", time.Since(coverStarted).Milliseconds())
+			trace.L(ctx).Warn("video cover materialization failed", "stage", "cover_materialize", "model", model, "cover_url", coverURLForLog, "err", dlErr, "elapsed_ms", time.Since(coverStarted).Milliseconds())
 		}
 	}
 	return st.VideoURL, coverDataURI, nil

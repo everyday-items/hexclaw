@@ -3036,7 +3036,8 @@ Set source only when the material explicitly names a work, title, or another rel
 		k12DingtalkPhotos = newK12DingtalkPhotoInboundRuntime(
 			k12DingtalkPhotoInboundRuntimeConfig{
 				BaseContext: ctx, Router: agentRouter, Check: gw.Check,
-				Inbound: k12InboundPhotos, ImageTasks: k12ImageTasks,
+				ResolveInstanceID: instanceMgr.ResolveRunningInstanceID,
+				Inbound:           k12InboundPhotos, ImageTasks: k12ImageTasks,
 				PracticeSets: practiceReturns, PracticeReturns: practiceReturns,
 				Artifacts: k12Runtime.Records, ReplyBatches: &k12Runtime.Deps,
 			},

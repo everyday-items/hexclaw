@@ -10,6 +10,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -124,11 +125,49 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	start := time.Now()
 	logger.Info("[warmup] 本地默认模型预热开始（把 system prompt+工具模板 prefill 进 KV 缓存）",
 		"provider", selection.providerName, "model", selection.modelName,
-		"tools", len(req.Tools), "num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req))
+		"stage", "provider_prefill", "status", "started", "elapsed_ms", int64(0),
+		"input", msg.Content, "prompt_messages", req.Messages,
+		"tools", len(req.Tools), "tool_definitions", req.Tools,
+		"num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req))
+	heartbeatStop := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	var heartbeatStopOnce sync.Once
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				logger.Info("[warmup] 本地默认模型预热进行中",
+					"provider", selection.providerName, "model", selection.modelName,
+					"stage", "provider_prefill", "elapsed_ms", time.Since(start).Milliseconds())
+			case <-heartbeatStop:
+				return
+			}
+		}
+	}()
+	stopHeartbeat := func() {
+		heartbeatStopOnce.Do(func() { close(heartbeatStop) })
+		<-heartbeatDone
+	}
+	defer stopHeartbeat()
+	logTerminal := func(runErr error) {
+		status := "failed"
+		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			status = "cancelled"
+		}
+		logger.Warn("[warmup] 本地模型预热未完成（不影响功能，首条消息将走冷路径）",
+			"provider", selection.providerName, "model", selection.modelName,
+			"stage", "provider_prefill", "status", status,
+			"elapsed_ms", time.Since(start).Milliseconds(), "error", runErr)
+	}
 	// 必须走流式：非流式 Complete 的响应头超时 120s < 纯 CPU 大 prompt prefill（实测 344s），
 	// 预热自己就会超时（首版踩坑取证 sidecar2.log）。流式响应头即刻返回，prefill 期间连接保活。
 	stream, cerr := selection.provider.Stream(ctx, req)
 	if cerr != nil {
+		stopHeartbeat()
+		logTerminal(cerr)
 		return true, cerr
 	}
 	defer stream.Close()
@@ -138,14 +177,18 @@ func (e *ReActEngine) WarmupLocalDefaultModel(ctx context.Context) (warmed bool,
 	select {
 	case serr, ok := <-stream.Errors():
 		if ok && serr != nil {
+			stopHeartbeat()
+			logTerminal(serr)
 			return true, serr
 		}
 	default:
 	}
+	stopHeartbeat()
 	logger.Info("[warmup] 本地默认模型预热完成（system prompt+工具模板已入 KV 缓存）",
 		"provider", selection.providerName, "model", selection.modelName,
+		"stage", "provider_prefill", "status", "completed",
 		"num_ctx", reqNumCtxField(req), "prompt_bytes", promptBytesField(req),
-		"elapsed", time.Since(start).Round(time.Second).String())
+		"elapsed", time.Since(start).Round(time.Second).String(), "elapsed_ms", time.Since(start).Milliseconds())
 	return true, nil
 }
 
@@ -179,7 +222,8 @@ func (e *ReActEngine) StartLocalWarmup(ctx context.Context, timeout ...time.Dura
 		defer func() {
 			if r := recover(); r != nil {
 				runErr = fmt.Errorf("warmup panic: %v", r)
-				logger.Warn("[warmup] 预热 goroutine panic（已吞，不影响功能）", "panic", r)
+				logger.Warn("[warmup] 本地模型预热失败（不影响功能，首条消息将走冷路径）",
+					"status", "failed", "error", runErr)
 			}
 			if runErr == nil && runCtx.Err() != nil {
 				runErr = runCtx.Err()
@@ -194,8 +238,9 @@ func (e *ReActEngine) StartLocalWarmup(ctx context.Context, timeout ...time.Dura
 		warmed, err := e.WarmupLocalDefaultModel(runCtx)
 		runErr = err
 		switch {
-		case err != nil:
-			logger.Warn("[warmup] 本地模型预热失败（不影响功能，首条消息将走冷路径）", "error", err)
+		case err != nil && !warmed:
+			logger.Warn("[warmup] 本地模型预热失败（不影响功能，首条消息将走冷路径）",
+				"status", "failed", "error", err)
 		case !warmed:
 			logger.Info("[warmup] 默认路由非本地模型，跳过预热")
 		}

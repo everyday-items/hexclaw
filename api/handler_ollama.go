@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
 	goruntime "runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/config"
@@ -607,13 +609,82 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	startedAt := time.Now()
+	pullURL := s.ollamaEndpoint("/api/pull")
+	requestURL := r.URL.String()
+	var completedBytes atomic.Int64
+	var totalBytes atomic.Int64
+	var latestStatus atomic.Value
+	latestStatus.Store("requesting")
+	terminalStatus := "failed"
+	terminalError := fmt.Errorf("Ollama pull ended without a successful terminal status")
+	heartbeatStop := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	slog.Info("[ollama-pull] start",
+		"stage", "pull",
+		"model", req.Model,
+		"http_method", r.Method,
+		"request_url", requestURL,
+		"pull_url", pullURL,
+		"remote_addr", r.RemoteAddr,
+		"user_agent", r.UserAgent(),
+		"content_length", r.ContentLength,
+		"elapsed_ms", int64(0))
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				slog.Info("[ollama-pull] heartbeat",
+					"stage", "pull",
+					"model", req.Model,
+					"pull_url", pullURL,
+					"latest_status", latestStatus.Load(),
+					"elapsed_ms", time.Since(startedAt).Milliseconds(),
+					"completed_bytes", completedBytes.Load(),
+					"total_bytes", totalBytes.Load())
+			case <-heartbeatStop:
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(heartbeatStop)
+		<-heartbeatDone
+		args := []any{
+			"stage", "pull",
+			"model", req.Model,
+			"status", terminalStatus,
+			"request_url", requestURL,
+			"pull_url", pullURL,
+			"latest_status", latestStatus.Load(),
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"completed_bytes", completedBytes.Load(),
+			"total_bytes", totalBytes.Load(),
+		}
+		if terminalStatus == "failed" || terminalStatus == "cancelled" {
+			args = append(args, "error", terminalError)
+			slog.Warn("[ollama-pull] terminal", args...)
+			return
+		}
+		slog.Info("[ollama-pull] terminal", args...)
+	}()
+
 	// 调用 Ollama pull API (POST /api/pull, 流式 JSON)
 	// 使用独立 context（不绑定前端 SSE 连接）：前端断开只停止推送进度，不中断 Ollama 下载。
 	// 超时设 4 小时（大模型如 DeepSeek 70B 在慢速网络可能需要数小时）。
 	pullCtx, pullCancel := context.WithTimeout(s.ollamaLifecycleContext(), 4*time.Hour)
 	defer pullCancel()
 	pullBody, _ := json.Marshal(map[string]any{"model": req.Model, "stream": true})
-	pullReq, _ := http.NewRequestWithContext(pullCtx, "POST", s.ollamaEndpoint("/api/pull"), bytes.NewReader(pullBody))
+	slog.Info("[ollama-pull] request",
+		"stage", "pull",
+		"model", req.Model,
+		"http_method", http.MethodPost,
+		"pull_url", pullURL,
+		"request_body", string(pullBody))
+	pullReq, _ := http.NewRequestWithContext(pullCtx, "POST", pullURL, bytes.NewReader(pullBody))
 	pullReq.Header.Set("Content-Type", "application/json")
 
 	// 流式下载不设全局 Timeout（它会在 body 读取阶段触发超时）。
@@ -621,14 +692,30 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 	client := s.ollamaHTTPClient(0, 30*time.Second)
 	pullResp, err := client.Do(pullReq)
 	if err != nil {
+		terminalError = err
+		if pullCtx.Err() == context.Canceled {
+			terminalStatus = "cancelled"
+			terminalError = pullCtx.Err()
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("Ollama 连接失败: %v", err)})
 		return
 	}
 	defer pullResp.Body.Close()
+	slog.Info("[ollama-pull] response",
+		"stage", "pull",
+		"model", req.Model,
+		"pull_url", pullURL,
+		"response_url", pullResp.Request.URL.String(),
+		"http_status", pullResp.Status,
+		"status_code", pullResp.StatusCode,
+		"content_type", pullResp.Header.Get("Content-Type"),
+		"content_length", pullResp.ContentLength,
+		"elapsed_ms", time.Since(startedAt).Milliseconds())
 
 	// SSE 流式推送进度：复用 toolkit/net/sse.Writer（与 api/server.go 一致）。
 	// NewWriter 负责设置 text/event-stream 等响应头，WriteData 产出 "data: <line>\n\n" 并立即 Flush。
 	if _, ok := w.(http.Flusher); !ok {
+		terminalError = fmt.Errorf("streaming not supported")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
 		return
 	}
@@ -644,23 +731,67 @@ func (s *Server) handleOllamaPull(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		var event struct {
-			Status string `json:"status"`
+			Status    string `json:"status"`
+			Digest    string `json:"digest"`
+			Completed int64  `json:"completed"`
+			Total     int64  `json:"total"`
+			Error     string `json:"error"`
 		}
-		if json.Unmarshal([]byte(line), &event) == nil && event.Status != "" {
-			// Ollama's final status is authoritative. Do not activate a model
-			// merely because a malformed/non-conforming upstream emitted an
-			// earlier success event followed by a later failure.
-			pullSucceeded = event.Status == "success"
+		if eventErr := json.Unmarshal([]byte(line), &event); eventErr == nil {
+			if event.Completed > 0 {
+				completedBytes.Store(event.Completed)
+			}
+			if event.Total > 0 {
+				totalBytes.Store(event.Total)
+			}
+			if event.Status != "" {
+				latestStatus.Store(event.Status)
+				// Ollama's final status is authoritative. Do not activate a model
+				// merely because a malformed/non-conforming upstream emitted an
+				// earlier success event followed by a later failure.
+				pullSucceeded = event.Status == "success"
+			}
+			slog.Info("[ollama-pull] upstream event",
+				"stage", "pull",
+				"model", req.Model,
+				"pull_url", pullURL,
+				"status_text", event.Status,
+				"digest", event.Digest,
+				"completed_bytes", event.Completed,
+				"total_bytes", event.Total,
+				"upstream_error", event.Error,
+				"elapsed_ms", time.Since(startedAt).Milliseconds())
+		} else {
+			slog.Warn("[ollama-pull] upstream event parse failed",
+				"stage", "pull",
+				"model", req.Model,
+				"pull_url", pullURL,
+				"event_body", line,
+				"error", eventErr,
+				"elapsed_ms", time.Since(startedAt).Milliseconds())
 		}
 		_ = writer.WriteData(line)
 	}
 	if err := scanner.Err(); err != nil {
+		terminalError = err
+		if pullCtx.Err() == context.Canceled {
+			terminalStatus = "cancelled"
+			terminalError = pullCtx.Err()
+		}
 		// 用 json.Marshal 生成错误负载，确保 error 文案被正确 JSON 转义。
 		errPayload, _ := json.Marshal(map[string]string{"status": "error", "error": err.Error()})
 		_ = writer.WriteData(string(errPayload))
 		return
 	}
+	if !pullSucceeded && pullCtx.Err() == context.Canceled {
+		terminalStatus = "cancelled"
+		terminalError = pullCtx.Err()
+	}
 	if pullSucceeded && s.onOllamaModelInstalled != nil {
 		s.onOllamaModelInstalled(pullCtx, req.Model)
+	}
+	if pullSucceeded {
+		terminalStatus = "completed"
+		terminalError = nil
 	}
 }

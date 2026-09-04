@@ -62,7 +62,7 @@ type ingestPageCheckpointRepository interface {
 type workerIngestPageProgress struct {
 	repository  ingestPageCheckpointRepository
 	invocations OCRPageInvocationProgress
-	documentID  string
+	source      PersistedIngestDocument
 	lease       func() JobLease
 	now         func() time.Time
 }
@@ -74,8 +74,23 @@ func (p workerIngestPageProgress) SetPageTotal(ctx context.Context, digest strin
 	}
 	logger.Info("[knowledge] job stage changed",
 		"job_id", lease.JobID,
-		"document_id", p.documentID,
+		"owner_id", lease.OwnerID,
+		"corpus_uid", lease.CorpusUID,
+		"document_id", p.source.DocumentID,
+		"document_generation", p.source.ContentGeneration,
+		"corpus_alias", p.source.CorpusAlias,
+		"filename", p.source.Filename,
+		"storage_path", p.source.StoragePath,
+		"media_type", p.source.MediaType,
+		"size_bytes", p.source.SizeBytes,
+		"sha256", p.source.SHA256,
+		"agent_id", p.source.AgentID,
+		"learner_id", p.source.LearnerID,
+		"subject", p.source.Subject,
+		"grade", p.source.Grade,
+		"vision_route", p.source.VisionRoute,
 		"stage", JobStageOCR,
+		"page_digest", digest,
 		"pages_total", total,
 	)
 	return nil
@@ -253,17 +268,38 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	job, claimed, err := w.repository.ClaimNextJobForCorpus(
 		ctx, w.config.OwnerID, w.config.CorpusID, w.config.WorkerID, now, w.config.LeaseDuration,
 	)
-	if err != nil || !claimed {
+	if err != nil {
+		logger.Error("[knowledge] job claim failed",
+			"owner_id", w.config.OwnerID,
+			"corpus_id", w.config.CorpusID,
+			"worker_id", w.config.WorkerID,
+			"error", err,
+		)
+		return false, err
+	}
+	if !claimed {
 		return false, err
 	}
 	startedAt := time.Now()
 	logger.Info("[knowledge] job claimed",
 		"job_id", job.JobID,
+		"parent_job_id", job.ParentJobID,
 		"job_kind", job.Kind,
+		"owner_id", job.OwnerID,
+		"corpus_uid", job.CorpusUID,
+		"corpus_id", w.config.CorpusID,
 		"document_id", job.DocumentID,
+		"document_generation", job.DocumentGeneration,
 		"revision_id", job.TargetRevisionID,
 		"stage", job.Stage,
 		"attempt", job.Attempt,
+		"next_attempt_at", job.NextAttemptAt,
+		"worker_id", job.LeaseOwner,
+		"lease_epoch", job.LeaseEpoch,
+		"lease_expires_at", job.LeaseExpiresAt,
+		"heartbeat_at", job.HeartbeatAt,
+		"created_at", job.CreatedAt,
+		"updated_at", job.UpdatedAt,
 	)
 	jobCtx, cancelJob := context.WithCancel(ctx)
 	defer cancelJob()
@@ -274,14 +310,34 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	lease := job.Lease()
 	err = w.executeClaimed(jobCtx, job, &lease)
 	if err == nil {
-		terminal := job
-		terminal.State = KnowledgeJobSucceeded
+		var terminal KnowledgeJob
+		terminalRead := false
+		var terminalReadErr error
 		if jobReader, ok := w.repository.(interface {
 			GetJob(context.Context, string, string) (KnowledgeJob, error)
 		}); ok {
-			if persisted, readErr := jobReader.GetJob(ctx, job.OwnerID, job.JobID); readErr == nil {
+			readCtx, cancelRead := context.WithTimeout(ctx, time.Second)
+			persisted, readErr := jobReader.GetJob(readCtx, job.OwnerID, job.JobID)
+			cancelRead()
+			terminalReadErr = readErr
+			if readErr == nil {
 				terminal = persisted
+				terminalRead = true
 			}
+		}
+		if !terminalRead {
+			logger.Info("[knowledge] job completed",
+				"job_id", job.JobID,
+				"parent_job_id", job.ParentJobID,
+				"owner_id", job.OwnerID,
+				"corpus_uid", job.CorpusUID,
+				"document_id", job.DocumentID,
+				"document_generation", job.DocumentGeneration,
+				"revision_id", job.TargetRevisionID,
+				"elapsed_ms", time.Since(startedAt).Milliseconds(),
+				"terminal_read_error", terminalReadErr,
+			)
+			return true, nil
 		}
 		var pagesDone, pagesTotal, chunksDone, chunksTotal any
 		if terminal.PagesDone != nil {
@@ -298,8 +354,12 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		logger.Info("[knowledge] job completed",
 			"job_id", terminal.JobID,
+			"parent_job_id", terminal.ParentJobID,
 			"job_kind", terminal.Kind,
+			"owner_id", terminal.OwnerID,
+			"corpus_uid", terminal.CorpusUID,
 			"document_id", terminal.DocumentID,
+			"document_generation", terminal.DocumentGeneration,
 			"revision_id", terminal.TargetRevisionID,
 			"state", terminal.State,
 			"stage", terminal.Stage,
@@ -308,18 +368,29 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 			"pages_total", pagesTotal,
 			"chunks_done", chunksDone,
 			"chunks_total", chunksTotal,
+			"attempt", terminal.Attempt,
+			"next_attempt_at", terminal.NextAttemptAt,
+			"last_error", terminal.LastError,
+			"failure", terminal.Failure,
+			"created_at", terminal.CreatedAt,
+			"updated_at", terminal.UpdatedAt,
 		)
 		return true, nil
 	}
 	if errors.Is(err, ErrJobFenced) {
 		logger.Warn("[knowledge] job lease fenced",
 			"job_id", job.JobID,
+			"parent_job_id", job.ParentJobID,
 			"job_kind", job.Kind,
+			"owner_id", job.OwnerID,
+			"corpus_uid", job.CorpusUID,
 			"document_id", job.DocumentID,
+			"document_generation", job.DocumentGeneration,
 			"revision_id", job.TargetRevisionID,
 			"stage", job.Stage,
 			"attempt", job.Attempt,
 			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"error", err,
 		)
 		return true, err
 	}
@@ -340,6 +411,17 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 			failed, transitionErr = w.repository.FailJob(transitionCtx, lease, failureTime, message)
 		}
 		if transitionErr != nil {
+			logger.Error("[knowledge] job failure transition failed",
+				"job_id", job.JobID,
+				"parent_job_id", job.ParentJobID,
+				"owner_id", job.OwnerID,
+				"corpus_uid", job.CorpusUID,
+				"document_id", job.DocumentID,
+				"document_generation", job.DocumentGeneration,
+				"revision_id", job.TargetRevisionID,
+				"job_error", err,
+				"transition_error", transitionErr,
+			)
 			if errors.Is(transitionErr, ErrJobFenced) {
 				return true, ErrJobFenced
 			}
@@ -351,14 +433,21 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		logger.Warn("[knowledge] job failed",
 			"job_id", failed.JobID,
+			"parent_job_id", failed.ParentJobID,
 			"job_kind", failed.Kind,
+			"owner_id", failed.OwnerID,
+			"corpus_uid", failed.CorpusUID,
 			"document_id", failed.DocumentID,
+			"document_generation", failed.DocumentGeneration,
 			"revision_id", failed.TargetRevisionID,
 			"state", failed.State,
 			"stage", failed.Stage,
 			"attempt", failed.Attempt,
 			"failure_code", failureCode,
+			"last_error", failed.LastError,
+			"failure", failed.Failure,
 			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"error", err,
 		)
 		return true, err
 	}
@@ -368,6 +457,17 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 		message,
 	)
 	if transitionErr != nil {
+		logger.Error("[knowledge] job retry transition failed",
+			"job_id", job.JobID,
+			"parent_job_id", job.ParentJobID,
+			"owner_id", job.OwnerID,
+			"corpus_uid", job.CorpusUID,
+			"document_id", job.DocumentID,
+			"document_generation", job.DocumentGeneration,
+			"revision_id", job.TargetRevisionID,
+			"job_error", err,
+			"transition_error", transitionErr,
+		)
 		if errors.Is(transitionErr, ErrJobFenced) {
 			return true, ErrJobFenced
 		}
@@ -375,13 +475,20 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	logger.Warn("[knowledge] job retry scheduled",
 		"job_id", retried.JobID,
+		"parent_job_id", retried.ParentJobID,
 		"job_kind", retried.Kind,
+		"owner_id", retried.OwnerID,
+		"corpus_uid", retried.CorpusUID,
 		"document_id", retried.DocumentID,
+		"document_generation", retried.DocumentGeneration,
 		"revision_id", retried.TargetRevisionID,
 		"state", retried.State,
 		"stage", retried.Stage,
 		"attempt", retried.Attempt,
+		"next_attempt_at", retried.NextAttemptAt,
+		"last_error", retried.LastError,
 		"elapsed_ms", time.Since(startedAt).Milliseconds(),
+		"error", err,
 	)
 	return true, err
 }
@@ -420,9 +527,27 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 	done, total := initial.EmbeddedChunks, initial.ExpectedChunks
 	logger.Info("[knowledge] job stage changed",
 		"job_id", job.JobID,
+		"parent_job_id", job.ParentJobID,
 		"job_kind", job.Kind,
+		"owner_id", job.OwnerID,
+		"corpus_uid", plan.CorpusUID,
+		"corpus_alias", plan.CorpusAlias,
 		"document_id", job.DocumentID,
+		"document_generation", job.DocumentGeneration,
 		"revision_id", plan.RevisionID,
+		"previous_active_revision_id", plan.PreviousActiveRevisionID,
+		"policy_version", plan.PolicyVersion,
+		"base_content_version", plan.BaseContentVersion,
+		"content_version", plan.ContentVersion,
+		"embedding_snapshot_id", plan.Snapshot.SnapshotID,
+		"embedding_profile_id", plan.Snapshot.Profile.ProfileID,
+		"embedding_provider_id", plan.Snapshot.Profile.ProviderID,
+		"embedding_provider_name", plan.Snapshot.Profile.ProviderName,
+		"embedding_model", plan.Snapshot.Profile.ModelName,
+		"embedding_location", plan.Snapshot.Profile.Location,
+		"embedding_dimension", plan.Snapshot.Profile.Dimension,
+		"profile_config_hash", plan.Snapshot.ProfileConfigHash,
+		"chunk_config_hash", plan.Snapshot.ChunkConfigHash,
 		"stage", JobStageEmbedding,
 		"chunks_done", done,
 		"chunks_total", total,
@@ -431,7 +556,7 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 	activeBatchID := ""
 	heartbeatStartedAt := time.Now()
 	lastProgressLogAt := heartbeatStartedAt
-	heartbeatStop := make(chan struct{})
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	heartbeatStopped := make(chan struct{})
 	go func() {
 		defer close(heartbeatStopped)
@@ -439,9 +564,7 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
-				return
-			case <-heartbeatStop:
+			case <-heartbeatCtx.Done():
 				return
 			case <-ticker.C:
 				jobReader, ok := w.repository.(interface {
@@ -450,8 +573,20 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 				if !ok {
 					continue
 				}
-				persisted, readErr := jobReader.GetJob(ctx, job.OwnerID, job.JobID)
+				readCtx, cancelRead := context.WithTimeout(heartbeatCtx, time.Second)
+				persisted, readErr := jobReader.GetJob(readCtx, job.OwnerID, job.JobID)
+				cancelRead()
 				if readErr != nil {
+					logger.Warn("[knowledge] job heartbeat read failed",
+						"job_id", job.JobID,
+						"parent_job_id", job.ParentJobID,
+						"owner_id", job.OwnerID,
+						"corpus_uid", plan.CorpusUID,
+						"document_id", job.DocumentID,
+						"document_generation", job.DocumentGeneration,
+						"revision_id", plan.RevisionID,
+						"error", readErr,
+					)
 					continue
 				}
 				logNow := time.Now()
@@ -472,10 +607,18 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 				}
 				logger.Info("[knowledge] job heartbeat",
 					"job_id", persisted.JobID,
+					"parent_job_id", persisted.ParentJobID,
 					"job_kind", persisted.Kind,
+					"owner_id", persisted.OwnerID,
+					"corpus_uid", plan.CorpusUID,
+					"corpus_alias", plan.CorpusAlias,
 					"document_id", persisted.DocumentID,
+					"document_generation", persisted.DocumentGeneration,
 					"revision_id", persisted.TargetRevisionID,
 					"batch_id", batchID,
+					"embedding_profile_id", plan.Snapshot.Profile.ProfileID,
+					"embedding_provider_id", plan.Snapshot.Profile.ProviderID,
+					"embedding_model", plan.Snapshot.Profile.ModelName,
 					"stage", persisted.Stage,
 					"elapsed_ms", time.Since(heartbeatStartedAt).Milliseconds(),
 					"chunks_done", chunksDone,
@@ -485,7 +628,7 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		}
 	}()
 	defer func() {
-		close(heartbeatStop)
+		cancelHeartbeat()
 		<-heartbeatStopped
 	}()
 	var cursor *RevisionChunkCursor
@@ -587,10 +730,26 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		if logBatch {
 			logger.Info("[knowledge] embedding batch committed",
 				"job_id", job.JobID,
+				"parent_job_id", job.ParentJobID,
 				"job_kind", job.Kind,
+				"owner_id", job.OwnerID,
+				"corpus_uid", plan.CorpusUID,
+				"corpus_alias", plan.CorpusAlias,
 				"document_id", job.DocumentID,
+				"document_generation", job.DocumentGeneration,
 				"revision_id", plan.RevisionID,
 				"batch_id", manifest.BatchID,
+				"batch_state", manifest.State,
+				"batch_attempts", manifest.Attempts,
+				"batch_lease_epoch", manifest.LeaseEpoch,
+				"client_request_key", manifest.ClientRequestKey,
+				"provider_request_id", manifest.ProviderRequestID,
+				"profile_config_hash", manifest.ProfileConfigHash,
+				"chunk_ids_digest", manifest.ChunkIDsDigest,
+				"payload_digest", manifest.PayloadDigest,
+				"batch_chunks", manifest.Chunks,
+				"embedding_provider_id", plan.Snapshot.Profile.ProviderID,
+				"embedding_model", plan.Snapshot.Profile.ModelName,
 				"stage", JobStageEmbedding,
 				"elapsed_ms", time.Since(heartbeatStartedAt).Milliseconds(),
 				"chunks_done", done,
@@ -632,9 +791,19 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 	}
 	logger.Info("[knowledge] job stage changed",
 		"job_id", job.JobID,
+		"parent_job_id", job.ParentJobID,
 		"job_kind", job.Kind,
+		"owner_id", job.OwnerID,
+		"corpus_uid", plan.CorpusUID,
+		"corpus_alias", plan.CorpusAlias,
 		"document_id", job.DocumentID,
+		"document_generation", job.DocumentGeneration,
 		"revision_id", plan.RevisionID,
+		"previous_active_revision_id", plan.PreviousActiveRevisionID,
+		"policy_version", plan.PolicyVersion,
+		"content_version", plan.ContentVersion,
+		"chunk_set_digest", summary.ChunkSetDigest,
+		"indexed_through_version", summary.IndexedThroughVersion,
 		"stage", JobStagePublishing,
 		"chunks_done", summary.EmbeddedChunks,
 		"chunks_total", summary.ExpectedChunks,
@@ -742,8 +911,24 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 	}
 	logger.Info("[knowledge] job stage changed",
 		"job_id", job.JobID,
+		"parent_job_id", job.ParentJobID,
 		"job_kind", job.Kind,
+		"owner_id", source.OwnerID,
+		"corpus_uid", source.CorpusUID,
+		"corpus_alias", source.CorpusAlias,
 		"document_id", job.DocumentID,
+		"document_generation", source.ContentGeneration,
+		"filename", source.Filename,
+		"extension", source.Extension,
+		"storage_path", source.StoragePath,
+		"media_type", source.MediaType,
+		"size_bytes", source.SizeBytes,
+		"sha256", source.SHA256,
+		"agent_id", source.AgentID,
+		"learner_id", source.LearnerID,
+		"subject", source.Subject,
+		"grade", source.Grade,
+		"vision_route", source.VisionRoute,
 		"stage", JobStageExtracting,
 	)
 
@@ -759,8 +944,21 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 	}
 	logger.Info("[knowledge] job stage changed",
 		"job_id", job.JobID,
+		"parent_job_id", job.ParentJobID,
 		"job_kind", job.Kind,
+		"owner_id", source.OwnerID,
+		"corpus_uid", source.CorpusUID,
+		"corpus_alias", source.CorpusAlias,
 		"document_id", job.DocumentID,
+		"document_generation", source.ContentGeneration,
+		"filename", source.Filename,
+		"storage_path", source.StoragePath,
+		"media_type", source.MediaType,
+		"sha256", source.SHA256,
+		"agent_id", source.AgentID,
+		"learner_id", source.LearnerID,
+		"subject", source.Subject,
+		"grade", source.Grade,
 		"stage", JobStageChunking,
 		"pages_done", pages,
 		"pages_total", pages,
@@ -795,9 +993,7 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 	heartbeatDone := make(chan error, 1)
 	go func() {
 		leaseTicker := time.NewTicker(interval)
-		logTicker := time.NewTicker(30 * time.Second)
 		defer leaseTicker.Stop()
-		defer logTicker.Stop()
 		for {
 			select {
 			case <-prepareCtx.Done():
@@ -824,6 +1020,19 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 				state.Lock()
 				state.lease = renewed
 				state.Unlock()
+			}
+		}
+	}()
+	logCtx, cancelLog := context.WithCancel(prepareCtx)
+	logDone := make(chan struct{})
+	go func() {
+		defer close(logDone)
+		logTicker := time.NewTicker(30 * time.Second)
+		defer logTicker.Stop()
+		for {
+			select {
+			case <-logCtx.Done():
+				return
 			case <-logTicker.C:
 				state.Lock()
 				current := state.lease
@@ -834,8 +1043,20 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 				if !ok {
 					continue
 				}
-				persisted, readErr := jobReader.GetJob(prepareCtx, current.OwnerID, current.JobID)
+				readCtx, cancelRead := context.WithTimeout(logCtx, time.Second)
+				persisted, readErr := jobReader.GetJob(readCtx, current.OwnerID, current.JobID)
+				cancelRead()
 				if readErr != nil {
+					logger.Warn("[knowledge] job heartbeat read failed",
+						"job_id", current.JobID,
+						"owner_id", current.OwnerID,
+						"corpus_uid", source.CorpusUID,
+						"document_id", source.DocumentID,
+						"document_generation", source.ContentGeneration,
+						"filename", source.Filename,
+						"storage_path", source.StoragePath,
+						"error", readErr,
+					)
 					continue
 				}
 				var pagesDone, pagesTotal, chunksDone, chunksTotal any
@@ -853,8 +1074,24 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 				}
 				logger.Info("[knowledge] job heartbeat",
 					"job_id", persisted.JobID,
+					"parent_job_id", persisted.ParentJobID,
 					"job_kind", persisted.Kind,
+					"owner_id", persisted.OwnerID,
+					"corpus_uid", source.CorpusUID,
+					"corpus_alias", source.CorpusAlias,
 					"document_id", persisted.DocumentID,
+					"document_generation", source.ContentGeneration,
+					"filename", source.Filename,
+					"extension", source.Extension,
+					"storage_path", source.StoragePath,
+					"media_type", source.MediaType,
+					"size_bytes", source.SizeBytes,
+					"sha256", source.SHA256,
+					"agent_id", source.AgentID,
+					"learner_id", source.LearnerID,
+					"subject", source.Subject,
+					"grade", source.Grade,
+					"vision_route", source.VisionRoute,
 					"revision_id", persisted.TargetRevisionID,
 					"stage", persisted.Stage,
 					"elapsed_ms", time.Since(heartbeatStartedAt).Milliseconds(),
@@ -875,7 +1112,7 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 		} else {
 			progress := workerIngestPageProgress{
 				repository: pageRepository,
-				documentID: source.DocumentID,
+				source:     source,
 				invocations: func() OCRPageInvocationProgress {
 					value, _ := w.repository.(OCRPageInvocationProgress)
 					return value
@@ -892,7 +1129,9 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 	} else {
 		prepared, prepareErr = w.ingestProcessor.Prepare(prepareCtx, source)
 	}
+	cancelLog()
 	cancelPrepare()
+	<-logDone
 	heartbeatErr := <-heartbeatDone
 	state.Lock()
 	*lease = state.lease

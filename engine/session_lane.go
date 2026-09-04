@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"time"
 
@@ -77,11 +76,6 @@ type noopLaneLease struct{}
 func (noopLaneLease) FencingToken() string          { return "" }
 func (noopLaneLease) Release(context.Context) error { return nil }
 
-func logIdentityRef(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return fmt.Sprintf("%x", sum[:8])
-}
-
 func (e *ReActEngine) acquireSessionLane(ctx context.Context, sessionID, requestID string) (func(), error) {
 	e.mu.RLock()
 	lane := e.sessionLane
@@ -92,20 +86,18 @@ func (e *ReActEngine) acquireSessionLane(ctx context.Context, sessionID, request
 		return nil, nil
 	}
 	waitStarted := time.Now()
-	sessionRef := logIdentityRef(sessionID)
-	requestRef := logIdentityRef(requestID)
-	trace.L(ctx).Info("session lane wait started", "stage", "session_wait", "session_ref", sessionRef, "request_ref", requestRef)
+	trace.L(ctx).Info("session lane wait started", "stage", "session_wait", "session_id", sessionID, "request_id", requestID)
 
 	if lane != nil {
 		lease, err := lane.Acquire(ctx, LaneKey{SessionID: sessionID, RequestID: requestID})
 		if err != nil {
-			trace.L(ctx).Warn("session lane wait failed", "stage", "session_wait", "session_ref", sessionRef, "request_ref", requestRef, "reason", "acquire_error", "error_type", fmt.Sprintf("%T", err), "elapsed_ms", time.Since(waitStarted).Milliseconds())
+			trace.L(ctx).Warn("session lane wait failed", "stage", "session_wait", "session_id", sessionID, "request_id", requestID, "reason", "acquire_error", "err", err, "elapsed_ms", time.Since(waitStarted).Milliseconds())
 			return nil, err
 		}
-		trace.L(ctx).Info("session lane wait completed", "stage", "session_wait", "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(waitStarted).Milliseconds())
+		trace.L(ctx).Info("session lane wait completed", "stage", "session_wait", "session_id", sessionID, "request_id", requestID, "elapsed_ms", time.Since(waitStarted).Milliseconds())
 		return func() { _ = lease.Release(context.Background()) }, nil
 	}
 	unlock := lock.Acquire(sessionID)
-	trace.L(ctx).Info("session lane wait completed", "stage", "session_wait", "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(waitStarted).Milliseconds())
+	trace.L(ctx).Info("session lane wait completed", "stage", "session_wait", "session_id", sessionID, "request_id", requestID, "elapsed_ms", time.Since(waitStarted).Milliseconds())
 	return unlock, nil
 }
