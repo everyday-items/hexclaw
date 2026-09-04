@@ -976,6 +976,30 @@ func (e *ReActEngine) matchSkillFastPath(msg *adapter.Message) (skill.Skill, boo
 //  6. 保存助手回复
 //  7. 返回回复
 func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (reply *adapter.Reply, processErr error) {
+	var lifecycleCtx context.Context
+	var lifecycleStarted time.Time
+	var lifecycleDone chan struct{}
+	var lifecycleStopped chan struct{}
+	var lifecycleSessionRef string
+	var lifecycleRequestRef string
+	defer func() {
+		if lifecycleDone == nil {
+			return
+		}
+		close(lifecycleDone)
+		<-lifecycleStopped
+		if processErr != nil || reply == nil {
+			reason := "empty_reply"
+			errorType := ""
+			if processErr != nil {
+				reason = "process_error"
+				errorType = fmt.Sprintf("%T", processErr)
+			}
+			trace.L(lifecycleCtx).Warn("agent process lifecycle failed", "stage", "process", "session_ref", lifecycleSessionRef, "request_ref", lifecycleRequestRef, "reason", reason, "error_type", errorType, "total_ms", time.Since(lifecycleStarted).Milliseconds())
+			return
+		}
+		trace.L(lifecycleCtx).Info("agent process lifecycle completed", "stage", "process", "session_ref", lifecycleSessionRef, "request_ref", lifecycleRequestRef, "total_ms", time.Since(lifecycleStarted).Milliseconds())
+	}()
 	defer func() {
 		if processErr != nil || reply == nil {
 			return
@@ -1043,6 +1067,26 @@ func (e *ReActEngine) Process(ctx context.Context, msg *adapter.Message) (reply 
 	if trace.L(ctx) == slog.Default() {
 		ctx = trace.WithLogger(ctx, trace.NewRequest(msg.UserID, msg.SessionID))
 	}
+	lifecycleCtx = ctx
+	lifecycleStarted = time.Now()
+	lifecycleDone = make(chan struct{})
+	lifecycleStopped = make(chan struct{})
+	lifecycleSessionRef = logIdentityRef(msg.SessionID)
+	lifecycleRequestRef = logIdentityRef(messageRequestID(msg))
+	trace.L(lifecycleCtx).Info("agent process lifecycle started", "stage", "process", "session_ref", lifecycleSessionRef, "request_ref", lifecycleRequestRef)
+	go func() {
+		defer close(lifecycleStopped)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				trace.L(lifecycleCtx).Info("agent process lifecycle heartbeat", "stage", "process", "session_ref", lifecycleSessionRef, "request_ref", lifecycleRequestRef, "elapsed_ms", time.Since(lifecycleStarted).Milliseconds())
+			case <-lifecycleDone:
+				return
+			}
+		}
+	}()
 
 	// 1. 获取或创建会话
 	sess, err := e.sessions.GetOrCreate(ctx, msg)
@@ -1216,7 +1260,24 @@ func (e *ReActEngine) completeWithTools(
 	modelName string,
 	explicitProvider bool,
 	cacheInput string,
-) (*adapter.Reply, error) {
+) (reply *adapter.Reply, runErr error) {
+	runStarted := time.Now()
+	sessionRef := logIdentityRef(sessionID)
+	requestRef := logIdentityRef(messageRequestID(msg))
+	trace.L(ctx).Info("agent run stage started", "stage", "run", "provider", providerName, "model", modelName, "session_ref", sessionRef, "request_ref", requestRef)
+	defer func() {
+		if runErr != nil || reply == nil {
+			reason := "empty_reply"
+			errorType := ""
+			if runErr != nil {
+				reason = "run_error"
+				errorType = fmt.Sprintf("%T", runErr)
+			}
+			trace.L(ctx).Warn("agent run stage failed", "stage", "run", "provider", providerName, "model", modelName, "session_ref", sessionRef, "request_ref", requestRef, "reason", reason, "error_type", errorType, "elapsed_ms", time.Since(runStarted).Milliseconds())
+			return
+		}
+		trace.L(ctx).Info("agent run stage completed", "stage", "run", "provider", providerName, "model", modelName, "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(runStarted).Milliseconds())
+	}()
 	// Budget 控制: 有 BudgetConfig 时创建 per-request budget，否则硬限 5 轮
 	const hardMaxTurns = 50 // Budget 模式下的绝对安全上限
 	var budget *BudgetController
@@ -2112,12 +2173,43 @@ func (e *ReActEngine) processStream(
 			// in this file).
 			bgCtx, bgCancel := context.WithTimeout(trace.Detach(ctx), 5*time.Minute)
 			defer bgCancel()
+			lifecycleStarted := time.Now()
+			sessionRef := logIdentityRef(sess.ID)
+			requestRef := logIdentityRef(messageRequestID(msg))
+			lifecycleStatus := "failed"
+			var lifecycleStage atomic.Value
+			lifecycleStage.Store("generate")
+			heartbeatDone := make(chan struct{})
+			heartbeatStopped := make(chan struct{})
+			trace.L(bgCtx).Info("image generation lifecycle started", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef)
+			go func() {
+				defer close(heartbeatStopped)
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						trace.L(bgCtx).Info("image generation lifecycle heartbeat", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(lifecycleStarted).Milliseconds())
+					case <-heartbeatDone:
+						return
+					}
+				}
+			}()
+			defer func() {
+				close(heartbeatDone)
+				<-heartbeatStopped
+				if lifecycleStatus == "completed" {
+					trace.L(bgCtx).Info("image generation lifecycle completed", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "total_ms", time.Since(lifecycleStarted).Milliseconds())
+					return
+				}
+				trace.L(bgCtx).Warn("image generation lifecycle failed", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "total_ms", time.Since(lifecycleStarted).Milliseconds())
+			}()
 			results, imgErr := generateImage(bgCtx, e.imageSvc, selection.modelName, msg.Content)
 			if imgErr != nil {
 				// M9a: if the client is gone the error chunk below is dropped,
 				// so log AND persist the failure into session history.
 				trace.L(bgCtx).Warn("image generation failed",
-					"err", imgErr, "model", selection.modelName, "session", sess.ID)
+					"error_type", fmt.Sprintf("%T", imgErr), "model", selection.modelName, "session_ref", sessionRef)
 				if _, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID,
 					fmt.Sprintf("图片生成失败：%v", imgErr), "", messageRequestID(msg)); sErr != nil {
 					trace.L(bgCtx).Error("failed to persist image-generation failure reply",
@@ -2126,6 +2218,7 @@ func (e *ReActEngine) processStream(
 				ch <- &adapter.ReplyChunk{Error: fmt.Errorf("图片生成失败: %w", imgErr), Done: true}
 				return
 			}
+			lifecycleStage.Store("persist")
 			content := formatImageMarkdown(results)
 			assistantMessageID := ""
 			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID, content, "", messageRequestID(msg)); err != nil {
@@ -2142,6 +2235,8 @@ func (e *ReActEngine) processStream(
 				metadata["revised_prompt"] = results[0].RevisedPrompt
 			}
 			ch <- &adapter.ReplyChunk{Content: content, Done: true, Metadata: metadata}
+			lifecycleStage.Store("complete")
+			lifecycleStatus = "completed"
 		}()
 		return ch, nil
 	}
@@ -2171,12 +2266,43 @@ func (e *ReActEngine) processStream(
 			// client disconnects (BUG-20260611).
 			bgCtx, bgCancel := context.WithTimeout(trace.Detach(ctx), 10*time.Minute)
 			defer bgCancel()
+			lifecycleStarted := time.Now()
+			sessionRef := logIdentityRef(sess.ID)
+			requestRef := logIdentityRef(messageRequestID(msg))
+			lifecycleStatus := "failed"
+			var lifecycleStage atomic.Value
+			lifecycleStage.Store("generate")
+			heartbeatDone := make(chan struct{})
+			heartbeatStopped := make(chan struct{})
+			trace.L(bgCtx).Info("video generation lifecycle started", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef)
+			go func() {
+				defer close(heartbeatStopped)
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						trace.L(bgCtx).Info("video generation lifecycle heartbeat", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(lifecycleStarted).Milliseconds())
+					case <-heartbeatDone:
+						return
+					}
+				}
+			}()
+			defer func() {
+				close(heartbeatDone)
+				<-heartbeatStopped
+				if lifecycleStatus == "completed" {
+					trace.L(bgCtx).Info("video generation lifecycle completed", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "total_ms", time.Since(lifecycleStarted).Milliseconds())
+					return
+				}
+				trace.L(bgCtx).Warn("video generation lifecycle failed", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "total_ms", time.Since(lifecycleStarted).Milliseconds())
+			}()
 			videoURL, coverDataURI, vidErr := generateVideo(bgCtx, e.videoSvc, selection.modelName, msg.Content)
 			if vidErr != nil {
 				// M9a: log AND persist the failure so it stays visible in
 				// session history even when the client already disconnected.
 				trace.L(bgCtx).Warn("video generation failed",
-					"err", vidErr, "model", selection.modelName, "session", sess.ID)
+					"error_type", fmt.Sprintf("%T", vidErr), "model", selection.modelName, "session_ref", sessionRef)
 				if _, sErr := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID,
 					fmt.Sprintf("视频生成失败：%v", vidErr), "", messageRequestID(msg)); sErr != nil {
 					trace.L(bgCtx).Error("failed to persist video-generation failure reply",
@@ -2185,6 +2311,7 @@ func (e *ReActEngine) processStream(
 				ch <- &adapter.ReplyChunk{Error: fmt.Errorf("视频生成失败: %w", vidErr), Done: true}
 				return
 			}
+			lifecycleStage.Store("persist")
 			content := formatVideoMarkdown(videoURL, coverDataURI)
 			assistantMessageID := ""
 			if record, err := e.sessions.SaveAssistantMessageWithMetaAndRequestID(bgCtx, sess.ID, content, "", messageRequestID(msg)); err != nil {
@@ -2199,6 +2326,8 @@ func (e *ReActEngine) processStream(
 				"video_url": videoURL,
 			}, assistantMessageID)
 			ch <- &adapter.ReplyChunk{Content: content, Done: true, Metadata: metadata}
+			lifecycleStage.Store("complete")
+			lifecycleStatus = "completed"
 		}()
 		return ch, nil
 	}
@@ -2285,9 +2414,16 @@ func (e *ReActEngine) processStreamRuntime(
 ) (<-chan *adapter.ReplyChunk, error) {
 	ch := make(chan *adapter.ReplyChunk, 16)
 	started := make(chan error, 1)
+	requestID := messageRequestID(msg)
+	sessionRef := logIdentityRef(sessionID)
+	requestRef := logIdentityRef(requestID)
+	streamStarted := time.Now()
 	sink := &replyChunkRuntimeSink{
-		ch:      ch,
-		started: started,
+		ch:            ch,
+		started:       started,
+		streamStarted: streamStarted,
+		sessionRef:    sessionRef,
+		requestRef:    requestRef,
 		route: adapter.FrozenReasoningRoute{
 			Provider: selection.providerName,
 			Model:    selection.modelName,
@@ -2295,6 +2431,39 @@ func (e *ReActEngine) processStreamRuntime(
 	}
 	go func() {
 		defer close(ch)
+		logCtx := ctx
+		lifecycleStatus := "failed"
+		var lifecycleStage atomic.Value
+		lifecycleStage.Store("prepare")
+		heartbeatDone := make(chan struct{})
+		heartbeatStopped := make(chan struct{})
+		trace.L(logCtx).Info("agent stream lifecycle started", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef)
+		go func() {
+			defer close(heartbeatStopped)
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					trace.L(logCtx).Info("agent stream lifecycle heartbeat", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(streamStarted).Milliseconds())
+				case <-heartbeatDone:
+					return
+				}
+			}
+		}()
+		defer func() {
+			close(heartbeatDone)
+			<-heartbeatStopped
+			if lifecycleStatus == "completed" {
+				trace.L(logCtx).Info("agent stream lifecycle completed", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "total_ms", time.Since(streamStarted).Milliseconds())
+				return
+			}
+			status := lifecycleStatus
+			if ctx.Err() != nil {
+				status = "canceled"
+			}
+			trace.L(logCtx).Warn("agent stream lifecycle failed", "stage", lifecycleStage.Load(), "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "status", status, "total_ms", time.Since(streamStarted).Milliseconds())
+		}()
 		if sessionUnlock != nil {
 			defer sessionUnlock()
 		}
@@ -2414,6 +2583,9 @@ func (e *ReActEngine) processStreamRuntime(
 		streamCtx = skill.WithRoutedAgent(streamCtx, strings.TrimSpace(msg.Metadata["routed_agent"]))
 		ollama.InjectTrustedReasoningDisclosureEvidence(&req, selection.providerName, selection.modelName)
 		sink.bindReasoningEvidenceObserver(&req)
+		lifecycleStage.Store("provider")
+		providerStageStarted := time.Now()
+		trace.L(ctx).Info("agent stream provider stage started", "stage", "provider", "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef)
 		result, err := runner.Stream(streamCtx, hruntime.Request{
 			ID:           messageRequestID(msg),
 			Messages:     req.Messages,
@@ -2486,6 +2658,7 @@ func (e *ReActEngine) processStreamRuntime(
 		// 追加轮次上限提示，用户可继续追问。其余错误仍按硬失败处理。
 		maxTurnsHit := result != nil && result.StopReason == hruntime.StopReasonMaxTurns
 		if err != nil && !maxTurnsHit {
+			trace.L(ctx).Warn("agent stream provider stage failed", "stage", "provider", "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "reason", "provider_error", "error_type", fmt.Sprintf("%T", err), "elapsed_ms", time.Since(providerStageStarted).Milliseconds())
 			// BUG-20260711-B：不把原始 500 / cmake / llama-server 堆栈甩给用户——原始 err 只
 			// 进日志，往客户端只发翻译后的友好中文。
 			trace.L(ctx).Warn("runtime stream 失败", appendModelErrorLogFields([]any{"provider", selection.providerName, "model", selection.modelName, "num_ctx", reqNumCtxField(req), "attachments", len(msg.Attachments), "egress", egressSummaryField(ctx), "session", sessionID}, err)...)
@@ -2500,10 +2673,12 @@ func (e *ReActEngine) processStreamRuntime(
 				"content_len", len(result.Content), "session", sessionID)
 		}
 		if result == nil {
+			trace.L(ctx).Warn("agent stream provider stage failed", "stage", "provider", "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "reason", "empty_result", "elapsed_ms", time.Since(providerStageStarted).Milliseconds())
 			sink.notifyStarted(fmt.Errorf("runtime stream 未返回结果"))
 			ch <- &adapter.ReplyChunk{Error: fmt.Errorf("runtime stream 未返回结果"), Done: true}
 			return
 		}
+		trace.L(ctx).Info("agent stream provider stage completed", "stage", "provider", "provider", selection.providerName, "model", selection.modelName, "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(providerStageStarted).Milliseconds())
 		if ctx.Err() != nil {
 			return
 		}
@@ -2535,10 +2710,14 @@ func (e *ReActEngine) processStreamRuntime(
 		if visibleContent := sink.visibleContent.String(); visibleContent != "" {
 			result.Content = visibleContent
 		}
+		lifecycleStage.Store("finalize")
+		finalizeStarted := time.Now()
+		trace.L(ctx).Info("agent stream finalize stage started", "stage", "finalize", "session_ref", sessionRef, "request_ref", requestRef)
 		finalContent, streamTail, metadata, usage, toolCalls := e.finalizeRuntimeStreamResult(ctx, sessionID, msg, provider, req, result, providerName, modelName, cacheInput, maxTurnsHit, sink.thinkingDuration())
 		if ctx.Err() != nil {
 			return
 		}
+		trace.L(ctx).Info("agent stream finalize stage completed", "stage", "finalize", "session_ref", sessionRef, "request_ref", requestRef, "elapsed_ms", time.Since(finalizeStarted).Milliseconds())
 		if finalContent != "" && !sink.sentContent {
 			ch <- &adapter.ReplyChunk{Content: finalContent}
 		} else if streamTail != "" {
@@ -2557,6 +2736,8 @@ func (e *ReActEngine) processStreamRuntime(
 			KnowledgeHits: kbHits,
 			MemoryHits:    memHits,
 		}
+		lifecycleStage.Store("complete")
+		lifecycleStatus = "completed"
 	}()
 	if selection.explicitProvider {
 		if err := <-started; err != nil {
@@ -2572,6 +2753,10 @@ type replyChunkRuntimeSink struct {
 	visibleContent strings.Builder
 	started        chan<- error
 	startOnce      sync.Once
+	firstEventOnce sync.Once
+	streamStarted  time.Time
+	sessionRef     string
+	requestRef     string
 	// reasoning 计时（BUG-20260703 B3）：runtime 流式路径的思考时长在此采样，
 	// finalize 时经 thinkingDuration() 透出+落库。与 legacy 流式路径同语义：
 	// 首个 reasoning 增量起表，其后首个 content 增量停表。
@@ -2621,6 +2806,9 @@ func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) 
 			kind,
 			event.Sequence,
 		)
+		s.firstEventOnce.Do(func() {
+			trace.L(ctx).Info("agent stream first event", "stage", "provider", "event_type", event.Type, "tool", event.ToolCall.Name, "tool_call_id", event.ToolCall.ID, "session_ref", s.sessionRef, "request_ref", s.requestRef, "elapsed_ms", time.Since(s.streamStarted).Milliseconds())
+		})
 		s.notifyStarted(nil)
 		select {
 		case s.ch <- &adapter.ReplyChunk{RuntimeEvent: runtimeEvent}:
@@ -2638,6 +2826,9 @@ func (s *replyChunkRuntimeSink) Emit(ctx context.Context, event hruntime.Event) 
 	if event.Chunk.Content == "" && event.Chunk.Reasoning == "" {
 		return nil
 	}
+	s.firstEventOnce.Do(func() {
+		trace.L(ctx).Info("agent stream first event", "stage", "provider", "event_type", event.Type, "session_ref", s.sessionRef, "request_ref", s.requestRef, "elapsed_ms", time.Since(s.streamStarted).Milliseconds())
+	})
 	if event.Chunk.Reasoning != "" && s.reasoningStart.IsZero() {
 		s.reasoningStart = time.Now()
 	}
