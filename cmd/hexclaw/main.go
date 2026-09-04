@@ -3303,7 +3303,7 @@ Set source only when the material explicitly names a work, title, or another rel
 		go func() {
 			defer close(semanticWorkerDone)
 			runKnowledgeSemanticIndexWorker(embeddingLifecycleCtx, kbSemanticRuntime.Worker, 500*time.Millisecond, func(workerErr error) {
-				logger.Warn("[knowledge] 语义索引任务执行失败", "error", workerErr)
+				logger.Warn("[knowledge] worker iteration failed", "error_type", fmt.Sprintf("%T", workerErr))
 			})
 		}()
 	}

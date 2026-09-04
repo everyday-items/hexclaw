@@ -15,6 +15,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/localinfer"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 var (
@@ -61,12 +62,23 @@ type ingestPageCheckpointRepository interface {
 type workerIngestPageProgress struct {
 	repository  ingestPageCheckpointRepository
 	invocations OCRPageInvocationProgress
+	documentID  string
 	lease       func() JobLease
 	now         func() time.Time
 }
 
 func (p workerIngestPageProgress) SetPageTotal(ctx context.Context, digest string, total int64) error {
-	return p.repository.SetIngestPageTotal(ctx, p.lease(), p.now(), digest, total)
+	lease := p.lease()
+	if err := p.repository.SetIngestPageTotal(ctx, lease, p.now(), digest, total); err != nil {
+		return err
+	}
+	logger.Info("[knowledge] job stage changed",
+		"job_id", lease.JobID,
+		"document_id", p.documentID,
+		"stage", JobStageOCR,
+		"pages_total", total,
+	)
+	return nil
 }
 
 func (p workerIngestPageProgress) LoadCompletedPages(
@@ -244,6 +256,15 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil || !claimed {
 		return false, err
 	}
+	startedAt := time.Now()
+	logger.Info("[knowledge] job claimed",
+		"job_id", job.JobID,
+		"job_kind", job.Kind,
+		"document_id", job.DocumentID,
+		"revision_id", job.TargetRevisionID,
+		"stage", job.Stage,
+		"attempt", job.Attempt,
+	)
 	jobCtx, cancelJob := context.WithCancel(ctx)
 	defer cancelJob()
 	if registrar, ok := w.repository.(runningJobCancelRegistrar); ok {
@@ -253,9 +274,53 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	lease := job.Lease()
 	err = w.executeClaimed(jobCtx, job, &lease)
 	if err == nil {
+		terminal := job
+		terminal.State = KnowledgeJobSucceeded
+		if jobReader, ok := w.repository.(interface {
+			GetJob(context.Context, string, string) (KnowledgeJob, error)
+		}); ok {
+			if persisted, readErr := jobReader.GetJob(ctx, job.OwnerID, job.JobID); readErr == nil {
+				terminal = persisted
+			}
+		}
+		var pagesDone, pagesTotal, chunksDone, chunksTotal any
+		if terminal.PagesDone != nil {
+			pagesDone = *terminal.PagesDone
+		}
+		if terminal.PagesTotal != nil {
+			pagesTotal = *terminal.PagesTotal
+		}
+		if terminal.ChunksDone != nil {
+			chunksDone = *terminal.ChunksDone
+		}
+		if terminal.ChunksTotal != nil {
+			chunksTotal = *terminal.ChunksTotal
+		}
+		logger.Info("[knowledge] job completed",
+			"job_id", terminal.JobID,
+			"job_kind", terminal.Kind,
+			"document_id", terminal.DocumentID,
+			"revision_id", terminal.TargetRevisionID,
+			"state", terminal.State,
+			"stage", terminal.Stage,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"pages_done", pagesDone,
+			"pages_total", pagesTotal,
+			"chunks_done", chunksDone,
+			"chunks_total", chunksTotal,
+		)
 		return true, nil
 	}
 	if errors.Is(err, ErrJobFenced) {
+		logger.Warn("[knowledge] job lease fenced",
+			"job_id", job.JobID,
+			"job_kind", job.Kind,
+			"document_id", job.DocumentID,
+			"revision_id", job.TargetRevisionID,
+			"stage", job.Stage,
+			"attempt", job.Attempt,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+		)
 		return true, err
 	}
 	failureTime := w.now()
@@ -263,15 +328,16 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 	transitionCtx, cancelTransition := semanticWorkerTransitionContext(ctx)
 	defer cancelTransition()
 	if isPermanentSemanticWorkerError(err) || job.Attempt >= w.config.MaxAttempts {
+		var failed KnowledgeJob
 		var transitionErr error
 		if structuredRepository, ok := w.repository.(interface {
 			FailJobWithFailure(context.Context, JobLease, time.Time, KnowledgeJobFailure) (KnowledgeJob, error)
 		}); ok && errors.Is(err, ErrVisionModelRequired) {
-			_, transitionErr = structuredRepository.FailJobWithFailure(
+			failed, transitionErr = structuredRepository.FailJobWithFailure(
 				transitionCtx, lease, failureTime, KnowledgeJobFailureFromError(err),
 			)
 		} else {
-			_, transitionErr = w.repository.FailJob(transitionCtx, lease, failureTime, message)
+			failed, transitionErr = w.repository.FailJob(transitionCtx, lease, failureTime, message)
 		}
 		if transitionErr != nil {
 			if errors.Is(transitionErr, ErrJobFenced) {
@@ -279,18 +345,44 @@ func (w *SemanticIndexWorker) RunOnce(ctx context.Context) (bool, error) {
 			}
 			return true, errors.Join(err, transitionErr)
 		}
+		failureCode := "job_failed"
+		if failed.Failure != nil && failed.Failure.Code != "" {
+			failureCode = failed.Failure.Code
+		}
+		logger.Warn("[knowledge] job failed",
+			"job_id", failed.JobID,
+			"job_kind", failed.Kind,
+			"document_id", failed.DocumentID,
+			"revision_id", failed.TargetRevisionID,
+			"state", failed.State,
+			"stage", failed.Stage,
+			"attempt", failed.Attempt,
+			"failure_code", failureCode,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(),
+		)
 		return true, err
 	}
-	if _, transitionErr := w.repository.RetryJob(
+	retried, transitionErr := w.repository.RetryJob(
 		transitionCtx, lease, failureTime,
 		failureTime.Add(cappedSemanticRetryDelay(w.config.RetryDelay, w.config.MaxRetryDelay, job.Attempt)),
 		message,
-	); transitionErr != nil {
+	)
+	if transitionErr != nil {
 		if errors.Is(transitionErr, ErrJobFenced) {
 			return true, ErrJobFenced
 		}
 		return true, errors.Join(err, transitionErr)
 	}
+	logger.Warn("[knowledge] job retry scheduled",
+		"job_id", retried.JobID,
+		"job_kind", retried.Kind,
+		"document_id", retried.DocumentID,
+		"revision_id", retried.TargetRevisionID,
+		"state", retried.State,
+		"stage", retried.Stage,
+		"attempt", retried.Attempt,
+		"elapsed_ms", time.Since(startedAt).Milliseconds(),
+	)
 	return true, err
 }
 
@@ -326,6 +418,76 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		return err
 	}
 	done, total := initial.EmbeddedChunks, initial.ExpectedChunks
+	logger.Info("[knowledge] job stage changed",
+		"job_id", job.JobID,
+		"job_kind", job.Kind,
+		"document_id", job.DocumentID,
+		"revision_id", plan.RevisionID,
+		"stage", JobStageEmbedding,
+		"chunks_done", done,
+		"chunks_total", total,
+	)
+	var progressLogMu sync.Mutex
+	activeBatchID := ""
+	heartbeatStartedAt := time.Now()
+	lastProgressLogAt := heartbeatStartedAt
+	heartbeatStop := make(chan struct{})
+	heartbeatStopped := make(chan struct{})
+	go func() {
+		defer close(heartbeatStopped)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeatStop:
+				return
+			case <-ticker.C:
+				jobReader, ok := w.repository.(interface {
+					GetJob(context.Context, string, string) (KnowledgeJob, error)
+				})
+				if !ok {
+					continue
+				}
+				persisted, readErr := jobReader.GetJob(ctx, job.OwnerID, job.JobID)
+				if readErr != nil {
+					continue
+				}
+				logNow := time.Now()
+				progressLogMu.Lock()
+				if logNow.Sub(lastProgressLogAt) < 30*time.Second {
+					progressLogMu.Unlock()
+					continue
+				}
+				batchID := activeBatchID
+				lastProgressLogAt = logNow
+				progressLogMu.Unlock()
+				var chunksDone, chunksTotal any
+				if persisted.ChunksDone != nil {
+					chunksDone = *persisted.ChunksDone
+				}
+				if persisted.ChunksTotal != nil {
+					chunksTotal = *persisted.ChunksTotal
+				}
+				logger.Info("[knowledge] job heartbeat",
+					"job_id", persisted.JobID,
+					"job_kind", persisted.Kind,
+					"document_id", persisted.DocumentID,
+					"revision_id", persisted.TargetRevisionID,
+					"batch_id", batchID,
+					"stage", persisted.Stage,
+					"elapsed_ms", time.Since(heartbeatStartedAt).Milliseconds(),
+					"chunks_done", chunksDone,
+					"chunks_total", chunksTotal,
+				)
+			}
+		}
+	}()
+	defer func() {
+		close(heartbeatStop)
+		<-heartbeatStopped
+	}()
 	var cursor *RevisionChunkCursor
 	batchSize := w.config.BatchSize
 	executionProfile, profileScoped := EmbeddingExecutionProfileForModel(plan.Snapshot.Profile.ModelName)
@@ -374,6 +536,9 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		// may resume or canonicalize an existing batch identity after restart.
 		// The provider transport forwards this key as Idempotency-Key; providers
 		// that ignore it remain at-least-once.
+		progressLogMu.Lock()
+		activeBatchID = manifest.BatchID
+		progressLogMu.Unlock()
 		vectors, providerBegan, err := w.invokeEmbeddingBatch(
 			ctx, lease, manifest, executor, texts, embeddingTimeout,
 			plan.Snapshot.Profile.Location == ProviderLocationLocal,
@@ -412,6 +577,26 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		}); err != nil {
 			return err
 		}
+		logNow := time.Now()
+		progressLogMu.Lock()
+		logBatch := done == total || logNow.Sub(lastProgressLogAt) >= 30*time.Second
+		if logBatch {
+			lastProgressLogAt = logNow
+		}
+		progressLogMu.Unlock()
+		if logBatch {
+			logger.Info("[knowledge] embedding batch committed",
+				"job_id", job.JobID,
+				"job_kind", job.Kind,
+				"document_id", job.DocumentID,
+				"revision_id", plan.RevisionID,
+				"batch_id", manifest.BatchID,
+				"stage", JobStageEmbedding,
+				"elapsed_ms", time.Since(heartbeatStartedAt).Milliseconds(),
+				"chunks_done", done,
+				"chunks_total", total,
+			)
+		}
 		last := inputs[len(inputs)-1].Cursor
 		cursor = &last
 	}
@@ -445,6 +630,15 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 	}); err != nil {
 		return err
 	}
+	logger.Info("[knowledge] job stage changed",
+		"job_id", job.JobID,
+		"job_kind", job.Kind,
+		"document_id", job.DocumentID,
+		"revision_id", plan.RevisionID,
+		"stage", JobStagePublishing,
+		"chunks_done", summary.EmbeddedChunks,
+		"chunks_total", summary.ExpectedChunks,
+	)
 	return w.repository.PublishRevisionCAS(ctx, PublishRevisionCommand{
 		Lease: *lease, Now: w.now(), OwnerID: w.config.OwnerID, CorpusID: w.config.CorpusID,
 		RevisionID: plan.RevisionID, ExpectedPolicyVersion: plan.PolicyVersion,
@@ -546,6 +740,12 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 	if err := repository.SaveJobProgress(ctx, *lease, w.now(), JobProgressUpdate{Stage: JobStageExtracting}); err != nil {
 		return err
 	}
+	logger.Info("[knowledge] job stage changed",
+		"job_id", job.JobID,
+		"job_kind", job.Kind,
+		"document_id", job.DocumentID,
+		"stage", JobStageExtracting,
+	)
 
 	prepared, err := w.prepareIngestWithHeartbeat(ctx, lease, source)
 	if err != nil {
@@ -557,6 +757,14 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 	}); err != nil {
 		return err
 	}
+	logger.Info("[knowledge] job stage changed",
+		"job_id", job.JobID,
+		"job_kind", job.Kind,
+		"document_id", job.DocumentID,
+		"stage", JobStageChunking,
+		"pages_done", pages,
+		"pages_total", pages,
+	)
 	if err := w.renewLease(ctx, lease); err != nil {
 		return err
 	}
@@ -583,16 +791,19 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 		lease JobLease
 	}
 	state := &leaseState{lease: *lease}
+	heartbeatStartedAt := time.Now()
 	heartbeatDone := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		leaseTicker := time.NewTicker(interval)
+		logTicker := time.NewTicker(30 * time.Second)
+		defer leaseTicker.Stop()
+		defer logTicker.Stop()
 		for {
 			select {
 			case <-prepareCtx.Done():
 				heartbeatDone <- nil
 				return
-			case <-ticker.C:
+			case <-leaseTicker.C:
 				state.Lock()
 				current := state.lease
 				state.Unlock()
@@ -613,6 +824,45 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 				state.Lock()
 				state.lease = renewed
 				state.Unlock()
+			case <-logTicker.C:
+				state.Lock()
+				current := state.lease
+				state.Unlock()
+				jobReader, ok := w.repository.(interface {
+					GetJob(context.Context, string, string) (KnowledgeJob, error)
+				})
+				if !ok {
+					continue
+				}
+				persisted, readErr := jobReader.GetJob(prepareCtx, current.OwnerID, current.JobID)
+				if readErr != nil {
+					continue
+				}
+				var pagesDone, pagesTotal, chunksDone, chunksTotal any
+				if persisted.PagesDone != nil {
+					pagesDone = *persisted.PagesDone
+				}
+				if persisted.PagesTotal != nil {
+					pagesTotal = *persisted.PagesTotal
+				}
+				if persisted.ChunksDone != nil {
+					chunksDone = *persisted.ChunksDone
+				}
+				if persisted.ChunksTotal != nil {
+					chunksTotal = *persisted.ChunksTotal
+				}
+				logger.Info("[knowledge] job heartbeat",
+					"job_id", persisted.JobID,
+					"job_kind", persisted.Kind,
+					"document_id", persisted.DocumentID,
+					"revision_id", persisted.TargetRevisionID,
+					"stage", persisted.Stage,
+					"elapsed_ms", time.Since(heartbeatStartedAt).Milliseconds(),
+					"pages_done", pagesDone,
+					"pages_total", pagesTotal,
+					"chunks_done", chunksDone,
+					"chunks_total", chunksTotal,
+				)
 			}
 		}
 	}()
@@ -625,6 +875,7 @@ func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(
 		} else {
 			progress := workerIngestPageProgress{
 				repository: pageRepository,
+				documentID: source.DocumentID,
 				invocations: func() OCRPageInvocationProgress {
 					value, _ := w.repository.(OCRPageInvocationProgress)
 					return value
