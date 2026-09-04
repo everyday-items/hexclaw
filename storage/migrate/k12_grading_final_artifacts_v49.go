@@ -35,11 +35,10 @@ CREATE TABLE IF NOT EXISTS k12_grading_final_artifacts (
     FOREIGN KEY(agent_name,job_id)
         REFERENCES k12_grading_jobs(agent_name,record_id) ON DELETE CASCADE,
     CHECK(published_count + skipped_count = total_count),
-    CHECK(
-        (coverage_status = 'complete' AND
-            published_count = total_count AND skipped_count = 0 AND
-            length(trim(summary_invocation_id)) > 0)
-        OR
+	CHECK(
+		(coverage_status = 'complete' AND
+			published_count = total_count AND skipped_count = 0)
+		OR
         (coverage_status = 'with_skips' AND skipped_count > 0 AND
             length(trim(summary_invocation_id)) = 0)
     )

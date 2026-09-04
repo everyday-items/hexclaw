@@ -472,7 +472,7 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 			// 存在时才停下来等家长确认。旧 GradingJob 入口保持原显式确认语义。
 			if automaticPhotoConfirmationSource(v.Fields.SourceKind) &&
 				v.Fields.ConfirmationState == k12.GradingConfirmationPending &&
-				!recognizedQuestionsRequireGuardianConfirmation(run.questions) {
+				!recognizedQuestionsRequireGuardianConfirmation(run.questions, run.req.TaskIntent) {
 				if v, err = o.autoFreezeClearRecognition(ctx, run, v); err != nil {
 					return v, err
 				}
@@ -501,9 +501,37 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 	}
 }
 
-func recognizedQuestionsRequireGuardianConfirmation(questions []RecognizedQuestion) bool {
+func recognizedQuestionsRequireGuardianConfirmation(
+	questions []RecognizedQuestion,
+	taskIntent PhotoTaskIntent,
+) bool {
 	for _, question := range questions {
-		if NormalizeRecognizedQuestion(question).ConfirmationRequired {
+		if recognizedQuestionRequiresGuardianConfirmation(question, taskIntent) {
+			return true
+		}
+	}
+	return false
+}
+
+func recognizedQuestionRequiresGuardianConfirmation(
+	question RecognizedQuestion,
+	taskIntent PhotoTaskIntent,
+) bool {
+	question = NormalizeRecognizedQuestion(question)
+	if !question.ConfirmationRequired {
+		return false
+	}
+	if taskIntent != PhotoTaskBlankWorksheet ||
+		question.AnswerState != AnswerStateUnclear ||
+		photoHasExplicitUnclearAnswerEvidence([]RecognizedQuestion{question}) {
+		return true
+	}
+	// 空白卷没有独立答案证据时，纯擦痕和字迹信号不构成已作答事实；
+	// 题干低置信仍需确认，避免把误识运算符直接交给确定性求解器。
+	for _, reason := range question.ConfirmationReasons {
+		switch reason {
+		case OCRRiskErasure, OCRRiskUnclearHandwriting:
+		default:
 			return true
 		}
 	}
@@ -610,7 +638,7 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 	if awaitingItemSource {
 		for _, q := range candidate.questions {
 			q = NormalizeRecognizedQuestion(q)
-			if q.ConfirmationRequired {
+			if recognizedQuestionRequiresGuardianConfirmation(q, candidate.req.TaskIntent) {
 				continue
 			}
 			if _, itemErr := o.assessDurablePhotoItem(

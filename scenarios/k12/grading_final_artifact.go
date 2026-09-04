@@ -194,8 +194,7 @@ func (a GradingFinalArtifact) Validate() error {
 	}
 	switch a.CoverageStatus {
 	case GradingFinalArtifactCoverageComplete:
-		if a.PublishedCount != a.TotalCount || a.SkippedCount != 0 ||
-			strings.TrimSpace(a.SummaryInvocationID) == "" {
+		if a.PublishedCount != a.TotalCount || a.SkippedCount != 0 {
 			return ErrGradingFinalArtifactInvariant
 		}
 	case GradingFinalArtifactCoverageWithSkips:

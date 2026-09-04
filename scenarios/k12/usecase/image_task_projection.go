@@ -92,10 +92,15 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 		jobID,
 		questions,
 		job.Record.Status == k12.GradingStageCompleted,
-		len(groundingReceipts) > 0,
 	)
 	if err != nil {
 		return ImageTaskHomeworkProjection{}, err
+	}
+	for _, receipt := range problemGroundingReceipts {
+		groundingReceipts = appendUniqueGroundingEvidenceReceipts(
+			groundingReceipts,
+			[]GroundingEvidenceReceipt{receipt.GroundingEvidenceReceipt},
+		)
 	}
 	completedAt := int64(0)
 	if job.Record.Status == k12.GradingStageCompleted {

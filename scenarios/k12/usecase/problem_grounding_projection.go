@@ -111,7 +111,6 @@ func (o *GradingOrchestrator) projectProblemGroundingReceipts(
 	agentName, jobID string,
 	questions []RecognizedQuestion,
 	completed bool,
-	aggregateGrounded bool,
 ) ([]ProblemGroundingReceipt, error) {
 	if o == nil || o.deps.Records == nil {
 		return nil, fmt.Errorf("usecase: problem grounding store is unavailable")
@@ -236,9 +235,6 @@ func (o *GradingOrchestrator) projectProblemGroundingReceipts(
 	}
 	if groundedOperations > 0 && directOperations > 0 {
 		return nil, fmt.Errorf("usecase: grading problem grounding is only partially durable")
-	}
-	if completed && aggregateGrounded != (groundedOperations > 0) {
-		return nil, fmt.Errorf("usecase: problem and aggregate grounding projections disagree")
 	}
 	return cloneProblemGroundingReceipts(out), nil
 }

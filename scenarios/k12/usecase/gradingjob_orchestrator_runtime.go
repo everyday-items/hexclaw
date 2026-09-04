@@ -1059,6 +1059,8 @@ func applyGradingCorrections(run *gradingRun, in ConfirmPhotoGradingInput) (map[
 			canonicalQuestion := firstNonEmpty(c.CanonicalMarkdown, c.Question)
 			if strings.TrimSpace(canonicalQuestion) != "" && canonicalQuestion != q.CanonicalMarkdown {
 				q.CanonicalMarkdown = canonicalQuestion
+				// 题干修正后，识图阶段基于旧题干派生的知识点不再可信。
+				q.KnowledgePoints = nil
 				canonicalChanged = true
 			}
 			canonicalAnswer := firstNonEmpty(c.AnswerCanonicalMarkdown, c.StudentAnswer)
@@ -1109,7 +1111,8 @@ func applyAndValidateGradingConfirmation(run *gradingRun, in ConfirmPhotoGrading
 			(q.AnswerState == AnswerStatePresent && !CanonicalMarkdownValid(q.AnswerCanonicalMarkdown)) {
 			return fmt.Errorf("%w: problem %s canonical Markdown/LaTeX 无法解析，请先逐题修正", ErrInvalidInput, q.ProblemID)
 		}
-		if q.ConfirmationRequired && !confirmed[q.ProblemID] {
+		if recognizedQuestionRequiresGuardianConfirmation(q, run.req.TaskIntent) &&
+			!confirmed[q.ProblemID] {
 			return fmt.Errorf("%w: problem %s 需逐题确认（%s）", ErrInvalidInput, q.ProblemID, joinOCRRiskReasons(q.ConfirmationReasons))
 		}
 		q.ConfirmedVersion++
@@ -1144,7 +1147,8 @@ func applyProgressiveGradingConfirmation(run *gradingRun, in ConfirmPhotoGrading
 				ErrInvalidInput, q.ProblemID,
 			)
 		}
-		if q.ConfirmationRequired && !confirmed[q.ProblemID] {
+		if recognizedQuestionRequiresGuardianConfirmation(q, run.req.TaskIntent) &&
+			!confirmed[q.ProblemID] {
 			awaitingSource = true
 		}
 		q.ConfirmedVersion++
@@ -1178,6 +1182,7 @@ type gradingRunFile struct {
 	Grade             string               `json:"grade,omitempty"`
 	SourceSession     string               `json:"source_session,omitempty"`
 	SourcePageAssetID string               `json:"source_page_asset_id,omitempty"`
+	TaskIntent        PhotoTaskIntent      `json:"task_intent,omitempty"`
 	Questions         []RecognizedQuestion `json:"questions,omitempty"`
 	Anchored          []RecognizedQuestion `json:"anchored,omitempty"`
 	AnchorFailed      bool                 `json:"anchor_failed,omitempty"`
@@ -1242,7 +1247,8 @@ func (o *GradingOrchestrator) persistRun(jobID string, run *gradingRun) error {
 	meta := gradingRunFile{
 		AgentName: run.agentName, TextOnly: run.textOnly, Subject: run.req.Subject, Grade: run.req.Grade,
 		SourceSession: run.req.SourceSession, SourcePageAssetID: run.req.SourcePageAssetID,
-		Questions: run.questions, Anchored: run.anchored, AnchorFailed: run.anchorFailed,
+		TaskIntent: run.req.TaskIntent,
+		Questions:  run.questions, Anchored: run.anchored, AnchorFailed: run.anchorFailed,
 		RenderFailure: run.renderFailure, Result: run.result,
 	}
 	raw, err := json.Marshal(meta)
@@ -1274,6 +1280,23 @@ func (o *GradingOrchestrator) ensureRun(ctx context.Context, jobID string) (*gra
 	v, err := o.deps.GetGradingJob(ctx, meta.AgentName, jobID)
 	if err != nil {
 		return nil, err
+	}
+	taskIntent := meta.TaskIntent
+	if taskIntent == "" && v.Fields.SourceKind == "image_task" {
+		dispatchID := gradingSourceKeyFromIdempotencyKey(v.Fields)
+		dispatch, dispatchErr := o.deps.Records.GetImageTaskDispatch(
+			ctx,
+			meta.AgentName,
+			dispatchID,
+		)
+		if dispatchErr != nil {
+			return nil, fmt.Errorf(
+				"usecase: restore grading task intent from image task %s: %w",
+				dispatchID,
+				dispatchErr,
+			)
+		}
+		taskIntent = photoTaskIntentFromDispatch(dispatch.TaskIntent)
 	}
 	var image []byte
 	questions := meta.Questions
@@ -1310,7 +1333,8 @@ func (o *GradingOrchestrator) ensureRun(ctx context.Context, jobID string) (*gra
 		agentName: meta.AgentName, textOnly: meta.TextOnly,
 		req: PhotoGradeRequest{
 			AgentName: meta.AgentName, Subject: meta.Subject, Grade: meta.Grade,
-			SourceSession: meta.SourceSession, SourcePageAssetID: meta.SourcePageAssetID, Image: image,
+			SourceSession: meta.SourceSession, SourcePageAssetID: meta.SourcePageAssetID,
+			TaskIntent: taskIntent, Image: image,
 		},
 		questions: questions, anchored: meta.Anchored, anchorFailed: meta.AnchorFailed,
 		renderFailure: meta.RenderFailure, result: meta.Result,

@@ -679,6 +679,15 @@ func executeGradingItemOperationWithKind[T any](
 		return zero, "", err
 	}
 	requestDigest := modelInvocationResultDigest(request)
+	var expectedGrounding *gradingProviderGrounding
+	if grounding, ok := gradingProviderGroundingFromContext(ctx); ok {
+		expectedGrounding = &grounding
+		requestDigest = modelInvocationDigest(
+			[]byte("k12-grading-grounded-request-v1"),
+			[]byte(requestDigest),
+			[]byte(grounding.identityDigest),
+		)
+	}
 	jobOperationAttempt := job.Fields.AttemptCount + 1
 	currentAttempt := jobOperationAttempt
 	invocations, err := o.deps.Records.ListGradingItemInvocations(ctx, qAgent(job, q), job.Record.RecordID)
@@ -718,8 +727,18 @@ func executeGradingItemOperationWithKind[T any](
 				return zero, latest.InvocationID, fmt.Errorf("%w: invocation=%s result digest mismatch",
 					ErrModelInvocationRequiresReconciliation, latest.InvocationID)
 			}
+			storedResult := latest.ResultJSON
+			if expectedGrounding != nil {
+				var decodeErr error
+				storedResult, _, _, decodeErr = decodeGroundedPhysicalPayload(
+					latest.ResultJSON, expectedGrounding,
+				)
+				if decodeErr != nil {
+					return zero, latest.InvocationID, decodeErr
+				}
+			}
 			var result T
-			if err := json.Unmarshal([]byte(latest.ResultJSON), &result); err != nil {
+			if err := json.Unmarshal([]byte(storedResult), &result); err != nil {
 				return zero, latest.InvocationID, fmt.Errorf("%w: invocation=%s result decode: %v",
 					ErrModelInvocationRequiresReconciliation, latest.InvocationID, err)
 			}
@@ -842,9 +861,20 @@ func executeGradingItemOperationWithKind[T any](
 		cancelCommit()
 		return zero, invocation.InvocationID, fmt.Errorf("%w: result encode: %v", ErrModelInvocationRequiresReconciliation, err)
 	}
+	storedResult := string(raw)
+	if expectedGrounding != nil {
+		storedResult, err = encodeGroundedPhysicalPayload(storedResult, *expectedGrounding)
+		if err != nil {
+			commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
+			_, _ = o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(
+				commitCtx, job.Record.AgentName, invocation.InvocationID, "local", "grounding_envelope_encode_failed")
+			cancelCommit()
+			return zero, invocation.InvocationID, errors.Join(ErrModelInvocationRequiresReconciliation, err)
+		}
+	}
 	commitCtx, cancelCommit := gradingDurableCommitContext(ctx)
 	if _, err := o.deps.Records.MarkGradingItemInvocationSucceeded(commitCtx,
-		job.Record.AgentName, invocation.InvocationID, modelInvocationDigest(raw), string(raw)); err != nil {
+		job.Record.AgentName, invocation.InvocationID, modelInvocationDigest([]byte(storedResult)), storedResult); err != nil {
 		cancelCommit()
 		unknownCtx, cancelUnknown := gradingDurableCommitContext(ctx)
 		_, unknownErr := o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(

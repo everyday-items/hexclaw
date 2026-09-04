@@ -8,7 +8,7 @@ import (
 )
 
 // K12GeneralGuidanceFinalArtifactV80 允许没有可信教材知识点的 text webhook
-// 固化题目级普通指导，同时保持完整辅导要点与跳题产物的既有约束。
+// 固化题目级普通指导，同时保持完整批改与跳题产物的数量约束。
 var K12GeneralGuidanceFinalArtifactV80 = Migration{
 	Version:     80,
 	Description: "K12 text webhook non-textbook general guidance final artifact",
@@ -43,11 +43,10 @@ CREATE TABLE k12_grading_final_artifacts_v80 (
     FOREIGN KEY(agent_name,job_id)
         REFERENCES k12_grading_jobs(agent_name,record_id) ON DELETE CASCADE,
     CHECK(published_count + skipped_count = total_count),
-    CHECK(
-        (coverage_status = 'complete' AND
-            published_count = total_count AND skipped_count = 0 AND
-            length(trim(summary_invocation_id)) > 0)
-        OR
+	CHECK(
+		(coverage_status = 'complete' AND
+			published_count = total_count AND skipped_count = 0)
+		OR
         (coverage_status = 'with_skips' AND skipped_count > 0 AND
             length(trim(summary_invocation_id)) = 0)
         OR

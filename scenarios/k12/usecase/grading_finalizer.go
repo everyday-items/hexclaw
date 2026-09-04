@@ -166,24 +166,13 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 	}
 
 	coverage := k12.GradingFinalArtifactCoverageComplete
-	summaryInvocationID := ""
-	var tips *TutoringTips
 	if skippedCount > 0 {
 		coverage = k12.GradingFinalArtifactCoverageWithSkips
 	} else if strings.TrimSpace(job.Fields.SourceKind) == "webhook" &&
 		!gradingFinalEntriesHaveTrustedConceptFacts(entries) {
 		coverage = k12.GradingFinalArtifactCoverageGeneralGuidance
-	} else {
-		generated, invocationID, summaryErr := o.buildFinalTutoringTips(
-			ctx, job, structureVersion, orderedJSON,
-		)
-		if summaryErr != nil {
-			return k12.GradingFinalArtifact{}, summaryErr
-		}
-		tips = &generated
-		summaryInvocationID = invocationID
 	}
-	canonicalMarkdown := renderCanonicalGradingFinal(entries, tips)
+	canonicalMarkdown := renderCanonicalGradingFinal(entries, nil)
 	if coverage == k12.GradingFinalArtifactCoverageGeneralGuidance {
 		canonicalMarkdown += "\n\n## 说明\n\n" +
 			"本次没有可核验的课本依据，以上批改与家长讲法为通用参考。"
@@ -198,7 +187,7 @@ func (o *GradingOrchestrator) finalizeGradingPage(
 		SkippedCount:              skippedCount,
 		OrderedCurrentDigestsJSON: string(orderedJSON),
 		CanonicalMarkdown:         canonicalMarkdown,
-		SummaryInvocationID:       summaryInvocationID,
+		SummaryInvocationID:       "",
 	}
 	if err := o.freezeGradingFinalAnnotatedAsset(ctx, run, job, &artifact); err != nil {
 		return k12.GradingFinalArtifact{}, err
