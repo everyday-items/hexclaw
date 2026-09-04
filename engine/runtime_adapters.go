@@ -259,8 +259,8 @@ func (e *runtimeToolExecutor) Execute(ctx context.Context, call llm.ToolCall) (h
 	e.mu.Unlock()
 	if count > maxIdenticalToolCallsFor(call.Name) {
 		trace.L(ctx).Warn("tool-loop repeat guard tripped",
-			"tool", call.Name, "tool_call_id", call.ID, "identical_calls", count)
-		trace.L(ctx).Warn("runtime tool call failed", "stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID, "reason", "repeat_guard", "elapsed_ms", time.Since(started).Milliseconds())
+			"stage", "tool_execute", "tool", call.Name, "tool_call_id", call.ID,
+			"reason", "repeat_guard", "identical_calls", count, "elapsed_ms", time.Since(started).Milliseconds())
 		msg := fmt.Sprintf("You have already called %q with these exact arguments %d times and received the same result above. Do NOT call it again. Produce your final answer now using the information you already have; if it is insufficient, explain what is missing and stop.", call.Name, count-1)
 		return hruntime.ToolResult{Content: msg, Raw: repeatToolCallBlockedError, Status: hruntime.ToolStatusError}, nil
 	}

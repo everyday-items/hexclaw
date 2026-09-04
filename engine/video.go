@@ -62,19 +62,19 @@ func generateVideo(ctx context.Context, svc *mediavid.Service, model, prompt str
 		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "generation_error", "error_type", fmt.Sprintf("%T", err), "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
 		return "", "", fmt.Errorf("视频生成失败: %w", err)
 	}
-	trace.L(ctx).Info("video provider stage completed", "stage", "provider", "model", model, "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds())
 	if st.Status == "failed" || st.Error != "" {
 		errMsg := st.Error
 		if errMsg == "" {
 			errMsg = "未知错误"
 		}
-		trace.L(ctx).Warn("video generation failed", "stage", "provider", "model", model, "reason", "provider_failed", "total_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "provider_failed", "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
 		return "", "", fmt.Errorf("视频生成失败: %s", errMsg)
 	}
 	if st.VideoURL == "" {
-		trace.L(ctx).Warn("video generation failed", "stage", "provider", "model", model, "reason", "missing_video", "total_ms", time.Since(started).Milliseconds())
+		trace.L(ctx).Warn("video provider stage failed", "stage", "provider", "model", model, "reason", "missing_video", "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds(), "total_ms", time.Since(started).Milliseconds())
 		return "", "", fmt.Errorf("视频任务已完成但未返回视频地址")
 	}
+	trace.L(ctx).Info("video provider stage completed", "stage", "provider", "model", model, "status", st.Status, "elapsed_ms", time.Since(providerStarted).Milliseconds())
 
 	// 下载封面图为 data URI（失败不阻塞）
 	if st.CoverURL != "" {
@@ -87,7 +87,6 @@ func generateVideo(ctx context.Context, svc *mediavid.Service, model, prompt str
 			trace.L(ctx).Warn("video cover materialization failed", "stage", "cover_materialize", "model", model, "error_type", fmt.Sprintf("%T", dlErr), "elapsed_ms", time.Since(coverStarted).Milliseconds())
 		}
 	}
-	trace.L(ctx).Info("video generation completed", "stage", "complete", "model", model, "has_cover", coverDataURI != "", "total_ms", time.Since(started).Milliseconds())
 	return st.VideoURL, coverDataURI, nil
 }
 

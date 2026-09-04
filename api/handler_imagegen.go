@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -76,11 +78,12 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 	if requestRef == "" {
 		requestRef = r.Header.Get("X-Request-ID")
 	}
+	requestRef = mediaLogRef(requestRef)
 	providerName := req.Provider
 	modelName := req.Model
 	providerStarted := time.Now()
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "image", "request", requestRef,
+		"media_kind", "image", "request_ref", requestRef,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "started",
 		"elapsed_ms", int64(0), "result_count", 0)
@@ -95,7 +98,7 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 			select {
 			case <-ticker.C:
 				logger.InfoContext(r.Context(), "[media] stage",
-					"media_kind", "image", "request", requestRef,
+					"media_kind", "image", "request_ref", requestRef,
 					"provider", providerName, "model", modelName,
 					"stage", "provider_wait", "status", "heartbeat",
 					"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
@@ -111,14 +114,17 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 	providerHeartbeatWG.Wait()
 	if err != nil {
 		waitStatus := "failed"
+		errorType := "provider_error"
 		if r.Context().Err() != nil {
 			waitStatus = "cancelled"
+			errorType = "context_cancelled"
 		}
 		logger.WarnContext(r.Context(), "[media] stage",
-			"media_kind", "image", "request", requestRef,
+			"media_kind", "image", "request_ref", requestRef,
 			"provider", providerName, "model", modelName,
 			"stage", "provider_wait", "status", waitStatus,
-			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0,
+			"error_type", errorType)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "生成失败: " + err.Error()})
 		return
 	}
@@ -131,12 +137,12 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 			modelName = result.Model
 		}
 		if requestRef == "" && result.RequestID != "" {
-			requestRef = result.RequestID
+			requestRef = mediaLogRef(result.RequestID)
 		}
 		resultCount = len(result.Images)
 	}
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "image", "request", requestRef,
+		"media_kind", "image", "request_ref", requestRef,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "completed",
 		"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", resultCount)
@@ -144,57 +150,55 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 	// 持久化：把 b64 / URL 落盘到 {DataDir}/generated，回填 file_path 字段。
 	// 前端优先用 file_path 拼出 /api/v1/files/generated/{path}，避免 base64 撑爆 SQLite，
 	// 也避免 Provider URL 过期后旧消息打不开。
-	if s.genStore != nil && result != nil {
-		materializeStarted := time.Now()
+	if s.genStore != nil {
+		persistStarted := time.Now()
 		logger.InfoContext(r.Context(), "[media] stage",
-			"media_kind", "image", "request", requestRef,
-			"provider", providerName, "model", modelName,
-			"stage", "materialize", "status", "started",
-			"elapsed_ms", int64(0), "result_count", 0)
-		logger.InfoContext(r.Context(), "[media] stage",
-			"media_kind", "image", "request", requestRef,
+			"media_kind", "image", "request_ref", requestRef,
 			"provider", providerName, "model", modelName,
 			"stage", "persist", "status", "started",
 			"elapsed_ms", int64(0), "result_count", 0)
-		materializeHeartbeatDone := make(chan struct{})
-		var materializeHeartbeatWG sync.WaitGroup
-		materializeHeartbeatWG.Add(1)
+		persistHeartbeatDone := make(chan struct{})
+		var persistHeartbeatWG sync.WaitGroup
+		persistHeartbeatWG.Add(1)
 		go func() {
-			defer materializeHeartbeatWG.Done()
+			defer persistHeartbeatWG.Done()
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
 					logger.InfoContext(r.Context(), "[media] stage",
-						"media_kind", "image", "request", requestRef,
+						"media_kind", "image", "request_ref", requestRef,
 						"provider", providerName, "model", modelName,
-						"stage", "materialize", "status", "heartbeat",
-						"elapsed_ms", time.Since(materializeStarted).Milliseconds(), "result_count", 0)
-				case <-materializeHeartbeatDone:
+						"stage", "persist", "status", "heartbeat",
+						"elapsed_ms", time.Since(persistStarted).Milliseconds(), "result_count", 0)
+				case <-persistHeartbeatDone:
 					return
 				case <-r.Context().Done():
 					return
 				}
 			}
 		}()
-		materializedCount := 0
 		persistedCount := 0
-		materializeFailed := false
 		persistFailed := false
+		persistErrorType := ""
 		for i := range result.Images {
 			img := &result.Images[i]
 			if img.B64JSON != "" {
 				data, decErr := base64.StdEncoding.DecodeString(img.B64JSON)
 				if decErr != nil {
-					materializeFailed = true
 					persistFailed = true
+					if persistErrorType == "" {
+						persistErrorType = "decode_error"
+					}
 					continue
 				}
-				materializedCount++
 				saved, saveErr := s.genStore.SaveBytes(data, "png")
 				if saveErr != nil {
 					persistFailed = true
+					if persistErrorType == "" {
+						persistErrorType = "store_error"
+					}
 					continue
 				}
 				img.FilePath = saved
@@ -203,45 +207,46 @@ func (s *Server) handleImageGenGenerate(w http.ResponseWriter, r *http.Request) 
 			} else if img.URL != "" {
 				saved, saveErr := s.genStore.SaveFromURL(r.Context(), img.URL, "png")
 				if saveErr != nil {
-					materializeFailed = true
 					persistFailed = true
+					if persistErrorType == "" {
+						persistErrorType = "store_error"
+					}
 					continue
 				}
 				img.FilePath = saved
-				materializedCount++
 				persistedCount++
 			}
 		}
-		close(materializeHeartbeatDone)
-		materializeHeartbeatWG.Wait()
-		materializeStatus := "completed"
-		if materializeFailed {
-			materializeStatus = "failed"
-		}
+		close(persistHeartbeatDone)
+		persistHeartbeatWG.Wait()
 		persistStatus := "completed"
 		if persistFailed {
 			persistStatus = "failed"
 		}
-		elapsedMS := time.Since(materializeStarted).Milliseconds()
-		logMaterialize := logger.InfoContext
-		if materializeFailed {
-			logMaterialize = logger.WarnContext
-		}
-		logMaterialize(r.Context(), "[media] stage",
-			"media_kind", "image", "request", requestRef,
-			"provider", providerName, "model", modelName,
-			"stage", "materialize", "status", materializeStatus,
-			"elapsed_ms", elapsedMS, "result_count", materializedCount)
-		logPersist := logger.InfoContext
+		elapsedMS := time.Since(persistStarted).Milliseconds()
 		if persistFailed {
-			logPersist = logger.WarnContext
+			logger.WarnContext(r.Context(), "[media] stage",
+				"media_kind", "image", "request_ref", requestRef,
+				"provider", providerName, "model", modelName,
+				"stage", "persist", "status", persistStatus,
+				"elapsed_ms", elapsedMS, "result_count", persistedCount,
+				"error_type", persistErrorType)
+		} else {
+			logger.InfoContext(r.Context(), "[media] stage",
+				"media_kind", "image", "request_ref", requestRef,
+				"provider", providerName, "model", modelName,
+				"stage", "persist", "status", persistStatus,
+				"elapsed_ms", elapsedMS, "result_count", persistedCount)
 		}
-		logPersist(r.Context(), "[media] stage",
-			"media_kind", "image", "request", requestRef,
-			"provider", providerName, "model", modelName,
-			"stage", "persist", "status", persistStatus,
-			"elapsed_ms", elapsedMS, "result_count", persistedCount)
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+func mediaLogRef(value string) string {
+	if value == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:8])
 }

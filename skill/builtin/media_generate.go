@@ -11,7 +11,9 @@ package builtin
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -130,7 +132,7 @@ func (s *MediaGenerateSkill) genImage(ctx context.Context, args map[string]any, 
 	if s.img == nil || !s.img.HasProvider() {
 		return nil, fmt.Errorf("image generation is not configured (enable an imagegen Provider)")
 	}
-	requestRef := skill.SystemDispatchTaskRef(ctx)
+	requestRef := mediaGenerateLogRef(skill.SystemDispatchTaskRef(ctx))
 	providerName := firstStringArg(args, "provider")
 	modelName := firstStringArg(args, "model")
 	req := imagegen.Request{
@@ -143,7 +145,7 @@ func (s *MediaGenerateSkill) genImage(ctx context.Context, args map[string]any, 
 	}
 	providerStarted := time.Now()
 	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "image", "request", requestRef,
+		"media_kind", "image", "request_ref", requestRef,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "started",
 		"elapsed_ms", int64(0), "result_count", 0)
@@ -158,7 +160,7 @@ func (s *MediaGenerateSkill) genImage(ctx context.Context, args map[string]any, 
 			select {
 			case <-ticker.C:
 				logger.InfoContext(ctx, "[media] stage",
-					"media_kind", "image", "request", requestRef,
+					"media_kind", "image", "request_ref", requestRef,
 					"provider", providerName, "model", modelName,
 					"stage", "provider_wait", "status", "heartbeat",
 					"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
@@ -174,14 +176,17 @@ func (s *MediaGenerateSkill) genImage(ctx context.Context, args map[string]any, 
 	providerHeartbeatWG.Wait()
 	if err != nil {
 		waitStatus := "failed"
+		errorType := "provider_error"
 		if ctx.Err() != nil {
 			waitStatus = "cancelled"
+			errorType = "context_cancelled"
 		}
 		logger.WarnContext(ctx, "[media] stage",
-			"media_kind", "image", "request", requestRef,
+			"media_kind", "image", "request_ref", requestRef,
 			"provider", providerName, "model", modelName,
 			"stage", "provider_wait", "status", waitStatus,
-			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0,
+			"error_type", errorType)
 		return nil, fmt.Errorf("image generation failed: %w", err)
 	}
 	resultCount := 0
@@ -193,80 +198,67 @@ func (s *MediaGenerateSkill) genImage(ctx context.Context, args map[string]any, 
 			modelName = res.Model
 		}
 		if requestRef == "" && res.RequestID != "" {
-			requestRef = res.RequestID
+			requestRef = mediaGenerateLogRef(res.RequestID)
 		}
 		resultCount = len(res.Images)
 	}
 	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "image", "request", requestRef,
+		"media_kind", "image", "request_ref", requestRef,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "completed",
 		"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", resultCount)
 
 	if s.store != nil && res != nil {
-		materializeStarted := time.Now()
+		persistStarted := time.Now()
 		logger.InfoContext(ctx, "[media] stage",
-			"media_kind", "image", "request", requestRef,
-			"provider", providerName, "model", modelName,
-			"stage", "materialize", "status", "started",
-			"elapsed_ms", int64(0), "result_count", 0)
-		logger.InfoContext(ctx, "[media] stage",
-			"media_kind", "image", "request", requestRef,
+			"media_kind", "image", "request_ref", requestRef,
 			"provider", providerName, "model", modelName,
 			"stage", "persist", "status", "started",
 			"elapsed_ms", int64(0), "result_count", 0)
-		materializeHeartbeatDone := make(chan struct{})
-		var materializeHeartbeatWG sync.WaitGroup
-		materializeHeartbeatWG.Add(1)
+		persistHeartbeatDone := make(chan struct{})
+		var persistHeartbeatWG sync.WaitGroup
+		persistHeartbeatWG.Add(1)
 		go func() {
-			defer materializeHeartbeatWG.Done()
+			defer persistHeartbeatWG.Done()
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
 					logger.InfoContext(ctx, "[media] stage",
-						"media_kind", "image", "request", requestRef,
+						"media_kind", "image", "request_ref", requestRef,
 						"provider", providerName, "model", modelName,
-						"stage", "materialize", "status", "heartbeat",
-						"elapsed_ms", time.Since(materializeStarted).Milliseconds(), "result_count", 0)
-				case <-materializeHeartbeatDone:
+						"stage", "persist", "status", "heartbeat",
+						"elapsed_ms", time.Since(persistStarted).Milliseconds(), "result_count", 0)
+				case <-persistHeartbeatDone:
 					return
 				case <-ctx.Done():
 					return
 				}
 			}
 		}()
-		materializedCount, persistedCount, materializeFailed, persistFailed := persistImages(ctx, s.store, res)
-		close(materializeHeartbeatDone)
-		materializeHeartbeatWG.Wait()
-		materializeStatus := "completed"
-		if materializeFailed {
-			materializeStatus = "failed"
-		}
+		persistedCount, persistFailed, persistErrorType := persistImages(ctx, s.store, res)
+		close(persistHeartbeatDone)
+		persistHeartbeatWG.Wait()
 		persistStatus := "completed"
 		if persistFailed {
 			persistStatus = "failed"
 		}
-		elapsedMS := time.Since(materializeStarted).Milliseconds()
-		logMaterialize := logger.InfoContext
-		if materializeFailed {
-			logMaterialize = logger.WarnContext
-		}
-		logMaterialize(ctx, "[media] stage",
-			"media_kind", "image", "request", requestRef,
-			"provider", providerName, "model", modelName,
-			"stage", "materialize", "status", materializeStatus,
-			"elapsed_ms", elapsedMS, "result_count", materializedCount)
-		logPersist := logger.InfoContext
+		elapsedMS := time.Since(persistStarted).Milliseconds()
 		if persistFailed {
-			logPersist = logger.WarnContext
+			logger.WarnContext(ctx, "[media] stage",
+				"media_kind", "image", "request_ref", requestRef,
+				"provider", providerName, "model", modelName,
+				"stage", "persist", "status", persistStatus,
+				"elapsed_ms", elapsedMS, "result_count", persistedCount,
+				"error_type", persistErrorType)
+		} else {
+			logger.InfoContext(ctx, "[media] stage",
+				"media_kind", "image", "request_ref", requestRef,
+				"provider", providerName, "model", modelName,
+				"stage", "persist", "status", persistStatus,
+				"elapsed_ms", elapsedMS, "result_count", persistedCount)
 		}
-		logPersist(ctx, "[media] stage",
-			"media_kind", "image", "request", requestRef,
-			"provider", providerName, "model", modelName,
-			"stage", "persist", "status", persistStatus,
-			"elapsed_ms", elapsedMS, "result_count", persistedCount)
 	}
 	paths := collectImagePaths(res) // FilePath 优先，空则回落 URL
 	return &skill.Result{
@@ -280,7 +272,7 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 	if s.vid == nil || !s.vid.HasProvider() {
 		return nil, fmt.Errorf("video generation is not configured")
 	}
-	requestRef := skill.SystemDispatchTaskRef(ctx)
+	requestRef := mediaGenerateLogRef(skill.SystemDispatchTaskRef(ctx))
 	providerName := firstStringArg(args, "provider")
 	modelName := firstStringArg(args, "model")
 	req := videogen.Request{
@@ -291,21 +283,24 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 	}
 	submitStarted := time.Now()
 	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "video", "request", requestRef,
+		"media_kind", "video", "request_ref", requestRef,
 		"provider", providerName, "model", modelName,
 		"stage", "submit", "status", "started",
 		"elapsed_ms", int64(0), "result_count", 0)
 	taskID, err := s.vid.Submit(ctx, providerName, req)
 	if err != nil {
 		submitStatus := "failed"
+		errorType := "provider_error"
 		if ctx.Err() != nil {
 			submitStatus = "cancelled"
+			errorType = "context_cancelled"
 		}
 		logger.WarnContext(ctx, "[media] stage",
-			"media_kind", "video", "request", requestRef,
+			"media_kind", "video", "request_ref", requestRef,
 			"provider", providerName, "model", modelName,
 			"stage", "submit", "status", submitStatus,
-			"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0,
+			"error_type", errorType)
 		return nil, fmt.Errorf("video submit failed: %w", err)
 	}
 	if providerName == "" {
@@ -313,15 +308,16 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 			providerName = provider
 		}
 	}
+	taskRef := mediaGenerateLogRef(taskID)
 	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "video", "task", taskID,
+		"media_kind", "video", "task_ref", taskRef,
 		"provider", providerName, "model", modelName,
 		"stage", "submit", "status", "completed",
-		"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 1)
+		"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0)
 
 	providerStarted := time.Now()
 	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "video", "task", taskID,
+		"media_kind", "video", "task_ref", taskRef,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "started",
 		"elapsed_ms", int64(0), "result_count", 0)
@@ -336,7 +332,7 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 			select {
 			case <-ticker.C:
 				logger.InfoContext(ctx, "[media] stage",
-					"media_kind", "video", "task", taskID,
+					"media_kind", "video", "task_ref", taskRef,
 					"provider", providerName, "model", modelName,
 					"stage", "provider_wait", "status", "heartbeat",
 					"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
@@ -347,19 +343,22 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 			}
 		}
 	}()
-	st, err := s.pollUntilDone(ctx, taskID, providerName, modelName) // 阻塞到 Done / ctx 截止（明确 timeout，不挂死）
+	st, err := s.pollUntilDone(ctx, taskID) // 阻塞到 Done / ctx 截止（明确 timeout，不挂死）
 	close(providerHeartbeatDone)
 	providerHeartbeatWG.Wait()
 	if err != nil {
 		waitStatus := "failed"
+		errorType := "provider_error"
 		if ctx.Err() != nil {
 			waitStatus = "cancelled"
+			errorType = "context_cancelled"
 		}
 		logger.WarnContext(ctx, "[media] stage",
-			"media_kind", "video", "task", taskID,
+			"media_kind", "video", "task_ref", taskRef,
 			"provider", providerName, "model", modelName,
 			"stage", "provider_wait", "status", waitStatus,
-			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0,
+			"error_type", errorType)
 		return nil, err
 	}
 	if st.Provider != "" {
@@ -370,10 +369,11 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 	}
 	if st.Status != "success" {
 		logger.WarnContext(ctx, "[media] stage",
-			"media_kind", "video", "task", taskID,
+			"media_kind", "video", "task_ref", taskRef,
 			"provider", providerName, "model", modelName,
 			"stage", "provider_wait", "status", "failed",
-			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", 0,
+			"error_type", "provider_error")
 		return nil, fmt.Errorf("video generation failed: %s", st.Error)
 	}
 	providerResultCount := 0
@@ -381,40 +381,35 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 		providerResultCount = 1
 	}
 	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "video", "task", taskID,
+		"media_kind", "video", "task_ref", taskRef,
 		"provider", providerName, "model", modelName,
 		"stage", "provider_wait", "status", "completed",
 		"elapsed_ms", time.Since(providerStarted).Milliseconds(), "result_count", providerResultCount)
 
 	path := st.VideoURL
 	if s.store != nil && st.VideoURL != "" {
-		materializeStarted := time.Now()
+		persistStarted := time.Now()
 		logger.InfoContext(ctx, "[media] stage",
-			"media_kind", "video", "task", taskID,
-			"provider", providerName, "model", modelName,
-			"stage", "materialize", "status", "started",
-			"elapsed_ms", int64(0), "result_count", 0)
-		logger.InfoContext(ctx, "[media] stage",
-			"media_kind", "video", "task", taskID,
+			"media_kind", "video", "task_ref", taskRef,
 			"provider", providerName, "model", modelName,
 			"stage", "persist", "status", "started",
 			"elapsed_ms", int64(0), "result_count", 0)
-		materializeHeartbeatDone := make(chan struct{})
-		var materializeHeartbeatWG sync.WaitGroup
-		materializeHeartbeatWG.Add(1)
+		persistHeartbeatDone := make(chan struct{})
+		var persistHeartbeatWG sync.WaitGroup
+		persistHeartbeatWG.Add(1)
 		go func() {
-			defer materializeHeartbeatWG.Done()
+			defer persistHeartbeatWG.Done()
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
 					logger.InfoContext(ctx, "[media] stage",
-						"media_kind", "video", "task", taskID,
+						"media_kind", "video", "task_ref", taskRef,
 						"provider", providerName, "model", modelName,
-						"stage", "materialize", "status", "heartbeat",
-						"elapsed_ms", time.Since(materializeStarted).Milliseconds(), "result_count", 0)
-				case <-materializeHeartbeatDone:
+						"stage", "persist", "status", "heartbeat",
+						"elapsed_ms", time.Since(persistStarted).Milliseconds(), "result_count", 0)
+				case <-persistHeartbeatDone:
 					return
 				case <-ctx.Done():
 					return
@@ -422,8 +417,8 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 			}
 		}()
 		p, persistErr := s.store.SaveFromURL(ctx, st.VideoURL, "mp4")
-		close(materializeHeartbeatDone)
-		materializeHeartbeatWG.Wait()
+		close(persistHeartbeatDone)
+		persistHeartbeatWG.Wait()
 		resultCount := 0
 		stageStatus := "failed"
 		if persistErr == nil {
@@ -431,21 +426,21 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 			resultCount = 1
 			stageStatus = "completed"
 		}
-		elapsedMS := time.Since(materializeStarted).Milliseconds()
-		logStage := logger.InfoContext
+		elapsedMS := time.Since(persistStarted).Milliseconds()
 		if persistErr != nil {
-			logStage = logger.WarnContext
+			logger.WarnContext(ctx, "[media] stage",
+				"media_kind", "video", "task_ref", taskRef,
+				"provider", providerName, "model", modelName,
+				"stage", "persist", "status", stageStatus,
+				"elapsed_ms", elapsedMS, "result_count", resultCount,
+				"error_type", "store_error")
+		} else {
+			logger.InfoContext(ctx, "[media] stage",
+				"media_kind", "video", "task_ref", taskRef,
+				"provider", providerName, "model", modelName,
+				"stage", "persist", "status", stageStatus,
+				"elapsed_ms", elapsedMS, "result_count", resultCount)
 		}
-		logStage(ctx, "[media] stage",
-			"media_kind", "video", "task", taskID,
-			"provider", providerName, "model", modelName,
-			"stage", "materialize", "status", stageStatus,
-			"elapsed_ms", elapsedMS, "result_count", resultCount)
-		logStage(ctx, "[media] stage",
-			"media_kind", "video", "task", taskID,
-			"provider", providerName, "model", modelName,
-			"stage", "persist", "status", stageStatus,
-			"elapsed_ms", elapsedMS, "result_count", resultCount)
 	}
 	return &skill.Result{
 		Content:  "Generated video: " + path,
@@ -456,66 +451,23 @@ func (s *MediaGenerateSkill) genVideo(ctx context.Context, args map[string]any, 
 
 // pollUntilDone 尊重 ctx 截止（= cron runBudget），绝不无限等。
 // ctx 超时/取消 → 返回明确 timeout 错误，不挂死。
-func (s *MediaGenerateSkill) pollUntilDone(ctx context.Context, taskID, providerName, modelName string) (videogen.TaskStatus, error) {
+func (s *MediaGenerateSkill) pollUntilDone(ctx context.Context, taskID string) (videogen.TaskStatus, error) {
 	interval := videoPollInterval
 	if s.testFastPoll {
 		interval = time.Millisecond
 	}
-	pollStarted := time.Now()
-	logger.InfoContext(ctx, "[media] stage",
-		"media_kind", "video", "task", taskID,
-		"provider", providerName, "model", modelName,
-		"stage", "poll", "status", "started",
-		"elapsed_ms", int64(0), "result_count", 0)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			logger.WarnContext(ctx, "[media] stage",
-				"media_kind", "video", "task", taskID,
-				"provider", providerName, "model", modelName,
-				"stage", "poll", "status", "cancelled",
-				"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0)
 			return videogen.TaskStatus{}, fmt.Errorf("video generation timed out: %w", ctx.Err())
 		case <-t.C:
 			st, err := s.vid.Poll(ctx, taskID)
 			if err != nil {
-				pollStatus := "failed"
-				if ctx.Err() != nil {
-					pollStatus = "cancelled"
-				}
-				logger.WarnContext(ctx, "[media] stage",
-					"media_kind", "video", "task", taskID,
-					"provider", providerName, "model", modelName,
-					"stage", "poll", "status", pollStatus,
-					"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0)
 				return st, err
 			}
-			if st.Provider != "" {
-				providerName = st.Provider
-			}
-			if st.Model != "" {
-				modelName = st.Model
-			}
 			if st.Done {
-				resultCount := 0
-				if st.Status == "success" && (st.VideoURL != "" || st.VideoFilePath != "") {
-					resultCount = 1
-				}
-				if st.Status == "success" {
-					logger.InfoContext(ctx, "[media] stage",
-						"media_kind", "video", "task", taskID,
-						"provider", providerName, "model", modelName,
-						"stage", "poll", "status", "completed",
-						"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", resultCount)
-				} else {
-					logger.WarnContext(ctx, "[media] stage",
-						"media_kind", "video", "task", taskID,
-						"provider", providerName, "model", modelName,
-						"stage", "poll", "status", "failed",
-						"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0)
-				}
 				return st, nil
 			}
 		}
@@ -525,7 +477,7 @@ func (s *MediaGenerateSkill) pollUntilDone(ctx context.Context, taskID, provider
 // persistImages 把生成结果中的每张图落盘并回填 FilePath。
 //
 // b64 走 SaveBytes（落盘后清空 B64JSON，避免再撑爆下游）；url 走 SaveFromURL。
-func persistImages(ctx context.Context, store blobStore, res *imagegen.Result) (materializedCount, persistedCount int, materializeFailed, persistFailed bool) {
+func persistImages(ctx context.Context, store blobStore, res *imagegen.Result) (persistedCount int, persistFailed bool, errorType string) {
 	if store == nil || res == nil {
 		return
 	}
@@ -535,30 +487,43 @@ func persistImages(ctx context.Context, store blobStore, res *imagegen.Result) (
 		case img.B64JSON != "":
 			data, decodeErr := base64.StdEncoding.DecodeString(img.B64JSON)
 			if decodeErr != nil {
-				materializeFailed = true
 				persistFailed = true
+				if errorType == "" {
+					errorType = "decode_error"
+				}
 				continue
 			}
-			materializedCount++
 			if p, saveErr := store.SaveBytes(data, "png"); saveErr == nil {
 				img.FilePath = p
 				img.B64JSON = ""
 				persistedCount++
 			} else {
 				persistFailed = true
+				if errorType == "" {
+					errorType = "store_error"
+				}
 			}
 		case img.URL != "":
 			if p, saveErr := store.SaveFromURL(ctx, img.URL, "png"); saveErr == nil {
 				img.FilePath = p
-				materializedCount++
 				persistedCount++
 			} else {
-				materializeFailed = true
 				persistFailed = true
+				if errorType == "" {
+					errorType = "store_error"
+				}
 			}
 		}
 	}
 	return
+}
+
+func mediaGenerateLogRef(value string) string {
+	if value == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:8])
 }
 
 // collectImagePaths 收集每张图的引用：FilePath 优先（落盘稳定路径），空则回落 URL。

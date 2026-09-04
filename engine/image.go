@@ -107,7 +107,6 @@ func generateImage(ctx context.Context, svc *mediaimg.Service, model, prompt str
 		return nil, fmt.Errorf("图片生成未产生有效图像")
 	}
 	trace.L(ctx).Info("image materialization stage completed", "stage", "materialize", "model", model, "image_count", len(results), "elapsed_ms", time.Since(materializeStarted).Milliseconds())
-	trace.L(ctx).Info("image generation completed", "stage", "complete", "model", model, "image_count", len(results), "total_ms", time.Since(started).Milliseconds())
 	return results, nil
 }
 

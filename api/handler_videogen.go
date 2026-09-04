@@ -133,25 +133,29 @@ func (s *Server) handleVideoGenSubmit(w http.ResponseWriter, r *http.Request) {
 	if requestRef == "" {
 		requestRef = r.Header.Get("X-Request-ID")
 	}
+	requestRef = mediaLogRef(requestRef)
 	providerName := req.Provider
 	modelName := req.Model
 	submitStarted := time.Now()
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "video", "request", requestRef,
+		"media_kind", "video", "request_ref", requestRef,
 		"provider", providerName, "model", modelName,
 		"stage", "submit", "status", "started",
 		"elapsed_ms", int64(0), "result_count", 0)
 	taskID, err := s.videogenSvc.Submit(r.Context(), req.Provider, req.Request)
 	if err != nil {
 		submitStatus := "failed"
+		errorType := "provider_error"
 		if r.Context().Err() != nil {
 			submitStatus = "cancelled"
+			errorType = "context_cancelled"
 		}
 		logger.WarnContext(r.Context(), "[media] stage",
-			"media_kind", "video", "request", requestRef,
+			"media_kind", "video", "request_ref", requestRef,
 			"provider", providerName, "model", modelName,
 			"stage", "submit", "status", submitStatus,
-			"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0,
+			"error_type", errorType)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "提交失败: " + err.Error()})
 		return
 	}
@@ -160,11 +164,12 @@ func (s *Server) handleVideoGenSubmit(w http.ResponseWriter, r *http.Request) {
 			providerName = provider
 		}
 	}
+	taskRef := mediaLogRef(taskID)
 	logger.InfoContext(r.Context(), "[media] stage",
-		"media_kind", "video", "task", taskID,
+		"media_kind", "video", "task_ref", taskRef,
 		"provider", providerName, "model", modelName,
 		"stage", "submit", "status", "completed",
-		"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 1)
+		"elapsed_ms", time.Since(submitStarted).Milliseconds(), "result_count", 0)
 	writeJSON(w, http.StatusOK, map[string]string{"task_id": taskID})
 }
 
@@ -181,6 +186,7 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 task ID"})
 		return
 	}
+	taskRef := mediaLogRef(taskID)
 	providerName := ""
 	if provider, _, ok := strings.Cut(taskID, "::"); ok {
 		providerName = provider
@@ -189,47 +195,50 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 	status, err := s.videogenSvc.Poll(r.Context(), taskID)
 	if err != nil {
 		pollStatus := "failed"
+		errorType := "provider_error"
 		if r.Context().Err() != nil {
 			pollStatus = "cancelled"
+			errorType = "context_cancelled"
 		}
 		logger.WarnContext(r.Context(), "[media] stage",
-			"media_kind", "video", "task", taskID,
+			"media_kind", "video", "task_ref", taskRef,
 			"provider", providerName, "model", "",
 			"stage", "poll", "status", pollStatus,
-			"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0)
+			"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0,
+			"error_type", errorType)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "查询失败: " + err.Error()})
 		return
 	}
 	if status.Provider != "" {
 		providerName = status.Provider
 	}
-	pollResultCount := 0
-	if status.Done && status.Status == "success" && (status.VideoURL != "" || status.VideoFilePath != "") {
-		pollResultCount = 1
+	if status.Done {
+		pollResultCount := 0
+		if status.Status == "success" && (status.VideoURL != "" || status.VideoFilePath != "") {
+			pollResultCount = 1
+		}
+		if status.Status == "success" {
+			logger.InfoContext(r.Context(), "[media] stage",
+				"media_kind", "video", "task_ref", taskRef,
+				"provider", providerName, "model", status.Model,
+				"stage", "poll", "status", "completed",
+				"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", pollResultCount)
+		} else {
+			logger.WarnContext(r.Context(), "[media] stage",
+				"media_kind", "video", "task_ref", taskRef,
+				"provider", providerName, "model", status.Model,
+				"stage", "poll", "status", "failed",
+				"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", 0,
+				"error_type", "provider_error")
+		}
 	}
-	pollStatus := "completed"
-	logPoll := logger.InfoContext
-	if status.Done && status.Status != "success" {
-		pollStatus = "failed"
-		logPoll = logger.WarnContext
-	}
-	logPoll(r.Context(), "[media] stage",
-		"media_kind", "video", "task", taskID,
-		"provider", providerName, "model", status.Model,
-		"stage", "poll", "status", pollStatus,
-		"elapsed_ms", time.Since(pollStarted).Milliseconds(), "result_count", pollResultCount)
 
 	// 任务成功 → 立即下载视频/封面到本地，避免 Provider URL 24h 过期。
 	// 幂等：cache 命中直接返回；未命中走 singleflight，并发 poll 共享同一次下载。
 	if status.Done && status.Status == "success" && s.genStore != nil {
-		materializeStarted := time.Now()
+		persistStarted := time.Now()
 		logger.InfoContext(r.Context(), "[media] stage",
-			"media_kind", "video", "task", taskID,
-			"provider", providerName, "model", status.Model,
-			"stage", "materialize", "status", "started",
-			"elapsed_ms", int64(0), "result_count", 0)
-		logger.InfoContext(r.Context(), "[media] stage",
-			"media_kind", "video", "task", taskID,
+			"media_kind", "video", "task_ref", taskRef,
 			"provider", providerName, "model", status.Model,
 			"stage", "persist", "status", "started",
 			"elapsed_ms", int64(0), "result_count", 0)
@@ -280,39 +289,36 @@ func (s *Server) handleVideoGenPoll(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		expectedCount := 0
-		if status.VideoURL != "" {
-			expectedCount++
-		}
-		if status.CoverURL != "" {
-			expectedCount++
-		}
 		resultCount := 0
 		if status.VideoFilePath != "" {
-			resultCount++
+			resultCount = 1
 		}
-		if status.CoverFilePath != "" {
-			resultCount++
+		persistFailed := flightErr != nil ||
+			(status.VideoURL != "" && status.VideoFilePath == "") ||
+			(status.CoverURL != "" && status.CoverFilePath == "")
+		persistStatus := "completed"
+		if persistFailed {
+			persistStatus = "failed"
 		}
-		materializeStatus := "completed"
-		if flightErr != nil || resultCount < expectedCount {
-			materializeStatus = "failed"
+		elapsedMS := time.Since(persistStarted).Milliseconds()
+		if persistFailed {
+			errorType := "persist_incomplete"
+			if flightErr != nil {
+				errorType = "store_error"
+			}
+			logger.WarnContext(r.Context(), "[media] stage",
+				"media_kind", "video", "task_ref", taskRef,
+				"provider", providerName, "model", status.Model,
+				"stage", "persist", "status", persistStatus,
+				"elapsed_ms", elapsedMS, "result_count", resultCount,
+				"error_type", errorType)
+		} else {
+			logger.InfoContext(r.Context(), "[media] stage",
+				"media_kind", "video", "task_ref", taskRef,
+				"provider", providerName, "model", status.Model,
+				"stage", "persist", "status", persistStatus,
+				"elapsed_ms", elapsedMS, "result_count", resultCount)
 		}
-		elapsedMS := time.Since(materializeStarted).Milliseconds()
-		logStage := logger.InfoContext
-		if materializeStatus == "failed" {
-			logStage = logger.WarnContext
-		}
-		logStage(r.Context(), "[media] stage",
-			"media_kind", "video", "task", taskID,
-			"provider", providerName, "model", status.Model,
-			"stage", "materialize", "status", materializeStatus,
-			"elapsed_ms", elapsedMS, "result_count", resultCount)
-		logStage(r.Context(), "[media] stage",
-			"media_kind", "video", "task", taskID,
-			"provider", providerName, "model", status.Model,
-			"stage", "persist", "status", materializeStatus,
-			"elapsed_ms", elapsedMS, "result_count", resultCount)
 	}
 
 	writeJSON(w, http.StatusOK, status)
