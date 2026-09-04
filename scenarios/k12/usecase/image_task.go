@@ -1124,6 +1124,13 @@ func (c *ImageTaskCoordinator) Run(
 			automaticCtx,
 			invocation.RouteSnapshot,
 		)
+		if k12.NormalizeImageTaskRouteSnapshot(invocation.RouteSnapshot).Model ==
+			k12.RecognizingPolicyModel {
+			providerCtx = k12.WithGradingModelRequestPolicy(
+				providerCtx,
+				k12.ApprovedRecognizingRequestPolicy(),
+			)
+		}
 		classified, classifyErr := c.Classifier.ClassifyImageTask(
 			providerCtx,
 			ImageTaskClassificationInput{

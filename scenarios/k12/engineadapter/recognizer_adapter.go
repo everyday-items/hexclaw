@@ -220,18 +220,18 @@ Rules:
 
 const wholePageSelfInventoryPrompt = wholePageRecognitionPrompt + `
 
-This is whole-page recognition. The following whole-page completeness protocol takes precedence over the general top-level JSON-array format above:
-- Output exactly one JSON object with only the printed_inventory and questions fields: {"printed_inventory":[...],"questions":[...]}.
-- First complete printed_inventory as the single source of printed-question identity before composing questions.
-- printed_inventory independently reviews every printed question on the same page from top to bottom and left to right within each row. Each item must contain exactly source_number_path, display_label, and question, for example {"source_number_path":[],"display_label":"","question":"4÷0.5="}. Never omit a field, even when empty.
-- printed_inventory reviews only the printed question text and visible source numbering. Without visible numbering, output [] / "". When numbering exists, the path and display label must appear together. Do not repeat source_section_path, source_section_label, subject, or knowledge_points, and do not include student_answer, answer_state, answer_canonical_markdown, bbox, or any system-generated sequence field.
-- Then build questions in the same order. For each corresponding item, copy source_number_path, display_label, and question character for character from printed_inventory. Do not transcribe the printed question a second time. Only add answer, subject, and knowledge facts using the complete field protocol above.
-- questions contains every item with answer facts and must preserve the complete coverage of printed_inventory.
-- Before returning JSON, compare every corresponding identity field byte for byte and correct questions from printed_inventory when any character differs. For example, if printed_inventory contains "question":"8的1/4的4/5是多少？", questions must contain exactly "question":"8的1/4的4/5是多少？"; never rewrite it as Chinese fraction words or another equivalent expression.
-- Before returning JSON, verify every problem_kind against these exact parent, subproblem, and answer-field combinations. Never clear an invalid field merely to make the response pass validation.
-- Ignore worksheet metadata fields such as title, date, name, and time, along with page labels, QR codes, decoration, section headings, and instructions such as "把下面每题的得数化简" or "计算下面各题，能简算的要简算". Their labels, blanks, and instruction text are not questions and must not appear in either array.
-- The two arrays must correspond item by item and provide complete coverage. List every horizontal arithmetic, fill-in-the-blank, and multiple-choice item separately. Do not substitute section headings for questions, omit or invent questions, or merge multiple questions.
-- The question field in printed_inventory copies only the printed question text and must not read or infer the student's answer.`
+This is whole-page recognition. This completeness protocol overrides only the top-level shape and JSON field positions above; every semantic rule above still applies after expanding the positions below.
+- Output exactly one compact JSON object with only pi and qs: {"pi":[...],"qs":[...]}.
+- Each pi item is exactly a 3-value array in this fixed order: [np,dl,qt]. Example: [[],"","4÷0.5="]. Complete pi first, reviewing every printed question from top to bottom and left to right within each row.
+- Each qs item is exactly a 19-value array in this fixed order, even when a value is empty: [id,pk,pr,sb,np,dl,sp,sl,qt,cm,sj,kp,as,sa,am,rc,os,et,ae]. Example: ["p1","standalone","","",[],"",[],"","4÷0.5=","$4\\div0.5=$","数学",[],"blank","","",0.98,[],[],[]].
+- Position mapping: pi=printed_inventory, qs=questions; id=problem_id, pk=problem_kind, pr=parent_problem_id, sb=subproblem_no, np=source_number_path, dl=display_label, sp=source_section_path, sl=source_section_label, qt=question, cm=canonical_markdown, sj=subject, kp=knowledge_points, as=answer_state, sa=student_answer, am=answer_canonical_markdown, rc=recognition_confidence, os=ocr_signals, et=evidence_transcriptions, ae=answer_evidence_transcriptions.
+- pi reviews only printed question text and visible source numbering. Without visible numbering use np=[] and dl="". Do not include section, subject, knowledge, answer, bbox, or system sequence fields in pi.
+- Build qs in the same order. Copy np, dl, and qt character for character from the corresponding pi item; do not transcribe printed identity a second time. Add answer, section, subject, and knowledge facts using the complete mapped field protocol.
+- Use compound_parent and subproblem only when every child has a visible, stable printed subproblem label such as (1)/(2) or a/b. In that case pi and qs both include the shared parent once and each visibly labelled child once. If one printed block contains multiple unlabelled question sentences, keep the complete block as one standalone item. Never invent subproblem_no from sentence order or duplicate the parent text as synthetic children.
+- Before returning JSON, compare each corresponding np, dl, and qt byte for byte and correct qs from pi. Verify every pk/pr/sb/as/sa combination against the parent-child rules above; never clear an invalid field merely to pass validation.
+- Ignore title, date, name, time, page labels, QR codes, decoration, section headings, and worksheet instructions. They are not questions and must not appear in either array.
+- The arrays must correspond item by item and completely cover every independently answerable horizontal arithmetic, fill-in-the-blank, and multiple-choice item. Do not omit, invent, merge, or duplicate questions.
+- qt in pi copies only printed source text and must not read or infer the student's answer. Output JSON only.`
 
 const recognitionLayoutManifestPromptV2 = `This is the compact layout-manifest stage for a dense worksheet page, not question recognition, solving, or grading.
 Locate only the region of each independently answerable question. Section headings, headers, footers, and decoration are not targets. Split horizontal arithmetic, fill-in-the-blank, and multiple-choice questions into individual items. Give each independently answerable subquestion in a compound question its own target.
@@ -370,6 +370,41 @@ var wholePagePrintedInventoryFields = map[string]struct{}{
 	"source_number_path": {},
 	"display_label":      {},
 	"question":           {},
+}
+
+var wholePageShortPrintedInventoryFields = map[string]string{
+	"np": "source_number_path",
+	"dl": "display_label",
+	"qt": "question",
+}
+
+var wholePageShortPrintedInventoryFieldOrder = []string{"np", "dl", "qt"}
+
+var wholePageShortQuestionFields = map[string]string{
+	"id": "problem_id",
+	"pk": "problem_kind",
+	"pr": "parent_problem_id",
+	"sb": "subproblem_no",
+	"np": "source_number_path",
+	"dl": "display_label",
+	"sp": "source_section_path",
+	"sl": "source_section_label",
+	"qt": "question",
+	"cm": "canonical_markdown",
+	"sj": "subject",
+	"kp": "knowledge_points",
+	"as": "answer_state",
+	"sa": "student_answer",
+	"am": "answer_canonical_markdown",
+	"rc": "recognition_confidence",
+	"os": "ocr_signals",
+	"et": "evidence_transcriptions",
+	"ae": "answer_evidence_transcriptions",
+}
+
+var wholePageShortQuestionFieldOrder = []string{
+	"id", "pk", "pr", "sb", "np", "dl", "sp", "sl", "qt", "cm",
+	"sj", "kp", "as", "sa", "am", "rc", "os", "et", "ae",
 }
 
 // invalidJSONEscape 匹配 JSON 字符串中的非法转义（\x 且 x ∉ "\/bfnrtu）——视觉模型在题干里
@@ -2106,30 +2141,62 @@ func validateRawRecognizedProblemStructure(dtos []recognizedDTO) error {
 func parseWholePageSelfInventory(raw string) ([]usecase.RecognizedQuestion, error) {
 	payload := []byte(sanitizeModelJSON(extractJSONObject(raw)))
 	var fields map[string]json.RawMessage
-	var envelope wholePageRecognitionEnvelopeDTO
 	if err := json.Unmarshal(payload, &fields); err != nil {
 		return nil, fmt.Errorf(
 			"%w: recognizer: failed to parse whole-page self-inventory result",
 			k12.ErrRecognitionProtocolInvalid,
 		)
 	}
-	if err := json.Unmarshal(payload, &envelope); err != nil || fields == nil || len(fields) != 2 {
+	if fields == nil || len(fields) != 2 {
 		return nil, fmt.Errorf(
 			"%w: recognizer: whole-page self-inventory must contain only questions and printed_inventory",
 			k12.ErrRecognitionProtocolInvalid,
 		)
 	}
-	questionsRaw, hasQuestions := fields["questions"]
-	inventoryRaw, hasInventory := fields["printed_inventory"]
+	var questionsRaw, inventoryRaw json.RawMessage
+	longQuestions, hasLongQuestions := fields["questions"]
+	longInventory, hasLongInventory := fields["printed_inventory"]
+	shortQuestions, hasShortQuestions := fields["qs"]
+	shortInventory, hasShortInventory := fields["pi"]
+	switch {
+	case hasLongQuestions && hasLongInventory && !hasShortQuestions && !hasShortInventory:
+		questionsRaw = longQuestions
+		inventoryRaw = longInventory
+	case hasShortQuestions && hasShortInventory && !hasLongQuestions && !hasLongInventory:
+		var err error
+		questionsRaw, err = expandWholePageShortFieldArray(
+			shortQuestions,
+			wholePageShortQuestionFields,
+			wholePageShortQuestionFieldOrder,
+			"questions",
+		)
+		if err != nil {
+			return nil, err
+		}
+		inventoryRaw, err = expandWholePageShortFieldArray(
+			shortInventory,
+			wholePageShortPrintedInventoryFields,
+			wholePageShortPrintedInventoryFieldOrder,
+			"printed_inventory",
+		)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf(
+			"%w: recognizer: whole-page self-inventory must use one complete field-name protocol",
+			k12.ErrRecognitionProtocolInvalid,
+		)
+	}
 	questionEntries, questionsAreArray := decodeJSONNonNilArray(questionsRaw)
 	inventoryEntries, inventoryIsArray := decodeJSONNonNilArray(inventoryRaw)
-	if !hasQuestions || !hasInventory || !questionsAreArray || !inventoryIsArray {
+	if !questionsAreArray || !inventoryIsArray {
 		return nil, fmt.Errorf(
 			"%w: recognizer: whole-page self-inventory questions and printed_inventory must both be JSON arrays",
 			k12.ErrRecognitionProtocolInvalid,
 		)
 	}
-	if len(envelope.Questions) == 0 || len(envelope.PrintedInventory) == 0 {
+	if len(questionEntries) == 0 || len(inventoryEntries) == 0 {
 		return nil, fmt.Errorf(
 			"%w: recognizer: whole-page self-inventory is missing a required array",
 			k12.ErrRecognitionProtocolInvalid,
@@ -2168,6 +2235,108 @@ func parseWholePageSelfInventory(raw string) ([]usecase.RecognizedQuestion, erro
 		return nil, err
 	}
 	return questions, nil
+}
+
+func expandWholePageShortFieldArray(
+	raw json.RawMessage,
+	fieldNames map[string]string,
+	fieldOrder []string,
+	label string,
+) (json.RawMessage, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil || entries == nil {
+		return nil, fmt.Errorf(
+			"%w: recognizer: whole-page compact %s must be a JSON array",
+			k12.ErrRecognitionProtocolInvalid,
+			label,
+		)
+	}
+	if len(fieldOrder) != len(fieldNames) {
+		return nil, fmt.Errorf(
+			"%w: recognizer: whole-page compact %s field order is invalid",
+			k12.ErrRecognitionProtocolInvalid,
+			label,
+		)
+	}
+	expanded := make([]map[string]json.RawMessage, len(entries))
+	var encoding byte
+	for index, rawEntry := range entries {
+		entryBytes := bytes.TrimSpace(rawEntry)
+		if len(entryBytes) == 0 || (entryBytes[0] != '[' && entryBytes[0] != '{') {
+			return nil, fmt.Errorf(
+				"%w: recognizer: whole-page compact %s item %d has an invalid encoding",
+				k12.ErrRecognitionProtocolInvalid,
+				label,
+				index+1,
+			)
+		}
+		if encoding == 0 {
+			encoding = entryBytes[0]
+		} else if encoding != entryBytes[0] {
+			return nil, fmt.Errorf(
+				"%w: recognizer: whole-page compact %s mixes tuple and object encodings",
+				k12.ErrRecognitionProtocolInvalid,
+				label,
+			)
+		}
+		canonical := make(map[string]json.RawMessage, len(fieldNames))
+		if entryBytes[0] == '[' {
+			var tuple []json.RawMessage
+			if err := json.Unmarshal(entryBytes, &tuple); err != nil || len(tuple) != len(fieldOrder) {
+				return nil, fmt.Errorf(
+					"%w: recognizer: whole-page compact %s item %d has an incomplete tuple",
+					k12.ErrRecognitionProtocolInvalid,
+					label,
+					index+1,
+				)
+			}
+			for position, shortName := range fieldOrder {
+				canonical[fieldNames[shortName]] = tuple[position]
+			}
+		} else {
+			var entry map[string]json.RawMessage
+			if err := json.Unmarshal(entryBytes, &entry); err != nil || entry == nil || len(entry) != len(fieldNames) {
+				return nil, fmt.Errorf(
+					"%w: recognizer: whole-page short-key %s item %d has an incomplete field set",
+					k12.ErrRecognitionProtocolInvalid,
+					label,
+					index+1,
+				)
+			}
+			for shortName, canonicalName := range fieldNames {
+				value, present := entry[shortName]
+				if !present {
+					return nil, fmt.Errorf(
+						"%w: recognizer: whole-page short-key %s item %d is missing a required field",
+						k12.ErrRecognitionProtocolInvalid,
+						label,
+						index+1,
+					)
+				}
+				canonical[canonicalName] = value
+			}
+			for field := range entry {
+				if _, allowed := fieldNames[field]; !allowed {
+					return nil, fmt.Errorf(
+						"%w: recognizer: whole-page short-key %s item %d contains a disallowed field",
+						k12.ErrRecognitionProtocolInvalid,
+						label,
+						index+1,
+					)
+				}
+			}
+		}
+		expanded[index] = canonical
+	}
+	encoded, err := json.Marshal(expanded)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: recognizer: failed to expand whole-page short-key %s",
+			k12.ErrRecognitionProtocolInvalid,
+			label,
+		)
+	}
+	return encoded, nil
 }
 
 type wholePageRawIdentity struct {

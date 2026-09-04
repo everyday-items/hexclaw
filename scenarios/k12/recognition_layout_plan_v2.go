@@ -144,15 +144,40 @@ func BuildRecognitionLayoutPlanV2(input RecognitionLayoutPlanInputV2) (Recogniti
 			targets[index].Region = region
 		}
 	}
+	// 同一视觉行的题框会有少量纵坐标噪声；先按中心纵坐标归入行带，再在行内从左到右排序。
 	sort.SliceStable(targets, func(left, right int) bool {
-		if targets[left].Region.Y != targets[right].Region.Y {
-			return targets[left].Region.Y < targets[right].Region.Y
+		leftCenter := targets[left].Region.Y*2 + targets[left].Region.Height
+		rightCenter := targets[right].Region.Y*2 + targets[right].Region.Height
+		if leftCenter != rightCenter {
+			return leftCenter < rightCenter
 		}
-		if targets[left].Region.X != targets[right].Region.X {
-			return targets[left].Region.X < targets[right].Region.X
-		}
-		return targets[left].ManifestOrder < targets[right].ManifestOrder
+		return targets[left].Region.X < targets[right].Region.X
 	})
+	for rowStart := 0; rowStart < len(targets); {
+		anchor := targets[rowStart].Region
+		anchorCenter := anchor.Y*2 + anchor.Height
+		rowEnd := rowStart + 1
+		for rowEnd < len(targets) {
+			region := targets[rowEnd].Region
+			delta := region.Y*2 + region.Height - anchorCenter
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta > min(anchor.Height, region.Height) {
+				break
+			}
+			rowEnd++
+		}
+		sort.SliceStable(targets[rowStart:rowEnd], func(left, right int) bool {
+			leftTarget := targets[rowStart+left]
+			rightTarget := targets[rowStart+right]
+			if leftTarget.Region.X != rightTarget.Region.X {
+				return leftTarget.Region.X < rightTarget.Region.X
+			}
+			return leftTarget.ManifestOrder < rightTarget.ManifestOrder
+		})
+		rowStart = rowEnd
+	}
 
 	pageDigest := recognitionLayoutSHA256(input.PagePNG)
 	plan := RecognitionLayoutPlanV2{

@@ -116,7 +116,7 @@ func completeKnowledgePDFPageOCR(
 		mime = "image/png"
 	}
 	dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(image)
-	response, err := provider.Complete(ctx, hexagon.CompletionRequest{
+	request := hexagon.CompletionRequest{
 		Model: model,
 		Messages: []hexagon.Message{{
 			Role: hexagon.RoleUser,
@@ -125,7 +125,13 @@ func completeKnowledgePDFPageOCR(
 				llm.NewImageURLPart(dataURL, "auto"),
 			},
 		}},
-	})
+	}
+	if model == k12.RecognizingPolicyModel {
+		// 教材逐页 OCR 只做忠实转写，关闭与结果无关的模型推理。
+		request.Metadata = map[string]any{"thinking": "off"}
+		request.ReasoningPolicyScope = llm.ReasoningPolicyScopeStructuredVisionRecognition
+	}
+	response, err := provider.Complete(ctx, request)
 	if err != nil {
 		return knowledge.CaptionResult{}, err
 	}

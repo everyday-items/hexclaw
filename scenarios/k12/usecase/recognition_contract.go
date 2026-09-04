@@ -136,7 +136,8 @@ func distinctEvidenceCount(values []string) int {
 }
 
 // CanonicalMarkdownValid 做不猜测语义的结构校验：UTF-8、花括号、\(...\)/\[...\]
-// 以及 \frac 的两个参数必须闭合。失败由 UI 回显 raw，不把损坏公式送去批改。
+// 以及 \frac 的两个参数必须是闭合花括号或单个字母/数字 token。失败由 UI 回显 raw，
+// 不把损坏公式送去批改。
 func CanonicalMarkdownValid(markdown string) bool {
 	if strings.TrimSpace(markdown) == "" || !utf8.ValidString(markdown) || strings.ContainsRune(markdown, '\x00') {
 		return false
@@ -204,7 +205,15 @@ func consumeLatexGroup(s string, pos int) (int, bool) {
 	for pos < len(s) && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n') {
 		pos++
 	}
-	if pos >= len(s) || s[pos] != '{' {
+	if pos >= len(s) {
+		return pos, false
+	}
+	if s[pos] != '{' {
+		if (s[pos] >= '0' && s[pos] <= '9') ||
+			(s[pos] >= 'a' && s[pos] <= 'z') ||
+			(s[pos] >= 'A' && s[pos] <= 'Z') {
+			return pos + 1, true
+		}
 		return pos, false
 	}
 	depth := 0
