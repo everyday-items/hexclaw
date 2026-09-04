@@ -23,7 +23,7 @@ var (
 	removedNumberMarkerRe = regexp.MustCompile(`划去(?:数)?\s*[:：]?\s*([+\-]?[0-9]+)`)
 	bareQuantityRe        = regexp.MustCompile(`(?i)^\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)\s*(平方米|千克|公斤|m²|m2|kg|克|米|g|m)?\s*$`)
 	equationQuantityRe    = regexp.MustCompile(`(?i)[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)(?:\s*(?:[（(]\s*)?(平方米|千克|公斤|m²|m\^?2|kg|克|米|g|m)(?:\s*[）)])?)?`)
-	studentEquationRe     = regexp.MustCompile(`([+\-]?[0-9][0-9.\s()（）\[\]+\-×÷*/]*?)\s*[=＝]\s*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)`)
+	equationUnitSuffixRe  = regexp.MustCompile(`(?i)\s*(?:[（(]\s*)?(?:平方米|千克|公斤|m²|m\^?2|kg|克|米|g|m)(?:\s*[）)])?\s*$`)
 )
 
 type elementaryWordSolution struct {
@@ -259,13 +259,22 @@ func parseAnswerQuantity(answer string) (answerQuantity, bool) {
 		match = bareQuantityRe.FindStringSubmatch(answer)
 	}
 	if len(match) != 3 {
+		if value, ok := arithmeticAnswerValue(answer); ok {
+			return answerQuantity{value: value}, true
+		}
 		return answerQuantity{}, false
+	}
+	unit := normalizeAnswerUnit(match[2])
+	if unit == "" {
+		if value, ok := arithmeticAnswerValue(answer); ok {
+			return answerQuantity{value: value}, true
+		}
 	}
 	_, value, ok := solveTrivialArithmetic(match[1])
 	if !ok {
 		return answerQuantity{}, false
 	}
-	return answerQuantity{value: value, unit: normalizeAnswerUnit(match[2])}, true
+	return answerQuantity{value: value, unit: unit}, true
 }
 
 func normalizeAnswerUnit(unit string) string {
@@ -289,19 +298,56 @@ func quantitiesEqual(a, b answerQuantity) bool {
 
 // validateStudentArithmeticWork 对学生已经写出的纯数值等式逐条复算。若有等号却无法完整、
 // 保守地解析，则返回 conclusive=false 交给 grader；能确认某一步算错时才本地判错。
-func validateStudentArithmeticWork(answer string) (valid, conclusive bool) {
-	equationCount := strings.Count(answer, "=") + strings.Count(answer, "＝")
-	if equationCount == 0 {
+func validateStudentArithmeticWork(problem, answer string) (valid, conclusive bool) {
+	answer = strings.ReplaceAll(answer, "＝", "=")
+	previous := ""
+	if expr, _, ok := normalizeTrivialArithmetic(problem); ok {
+		previous = expr
+	}
+	pairs := make([][2]string, 0, strings.Count(answer, "="))
+	for _, line := range strings.FieldsFunc(answer, func(r rune) bool {
+		return r == '\n' || r == ';' || r == '；' || r == '，'
+	}) {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "=") {
+			continue
+		}
+		parts := strings.Split(line, "=")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		if parts[0] == "" {
+			if previous == "" {
+				return false, false
+			}
+			parts[0] = previous
+		}
+		for i := 0; i+1 < len(parts); i++ {
+			if parts[i] == "" || parts[i+1] == "" {
+				return false, false
+			}
+			pairs = append(pairs, [2]string{parts[i], parts[i+1]})
+		}
+		previous = parts[len(parts)-1]
+	}
+	if len(pairs) == 0 {
 		return true, true
 	}
-	matches := studentEquationRe.FindAllStringSubmatch(answer, -1)
-	if len(matches) != equationCount {
-		return false, false
-	}
-	for _, match := range matches {
-		lhs := strings.NewReplacer("[", "(", "]", ")", "（", "(", "）", ")").Replace(strings.TrimSpace(match[1]))
+	for _, pair := range pairs {
+		lhs := strings.NewReplacer("[", "(", "]", ")", "（", "(", "）", ")").Replace(strings.TrimSpace(pair[0]))
+		if firstDigit := strings.IndexFunc(lhs, unicode.IsDigit); firstDigit > 0 {
+			prefix := lhs[:firstDigit]
+			if strings.IndexFunc(prefix, func(r rune) bool {
+				return unicode.IsLetter(r) || r == ':' || r == '：'
+			}) >= 0 {
+				lhs = lhs[firstDigit:]
+			}
+		}
+		lhs = strings.Trim(lhs, "。.；;，,、 ")
+		rhs := equationUnitSuffixRe.ReplaceAllString(strings.TrimSpace(pair[1]), "")
+		rhs = strings.Trim(rhs, "。.；;，,、 ")
 		_, left, leftOK := solveTrivialArithmetic(lhs)
-		_, right, rightOK := solveTrivialArithmetic(strings.TrimSpace(match[2]))
+		_, right, rightOK := solveTrivialArithmetic(rhs)
 		if !leftOK || !rightOK {
 			return false, false
 		}

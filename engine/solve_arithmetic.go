@@ -12,6 +12,12 @@ import (
 )
 
 var writtenFinalAnswerRe = regexp.MustCompile(`(?:答案?|答)[^0-9+\-]*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)`)
+var answerLatexFractionRe = regexp.MustCompile(`\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}`)
+var answerLatexCompactFractionRe = regexp.MustCompile(`\\frac\s*([0-9])\s*([0-9])`)
+var answerLatexTextRe = regexp.MustCompile(`\\text\s*\{([^{}]*)\}`)
+var answerParenthesizedFractionRe = regexp.MustCompile(`\(([0-9]+)\)\s*/\s*\(([0-9]+)\)`)
+var answerMixedFractionRe = regexp.MustCompile(`([0-9]+)\s*\(([0-9]+/[0-9]+)\)`)
+var answerSpacedMixedFractionRe = regexp.MustCompile(`([0-9]+)\s+([0-9]+/[0-9]+)`)
 
 // itemNumberPrefixRe 题号列表前缀（bug 2026-07-18：照片识别题干自带「1. 」「3、」「4)」等
 // 题号，去空白后「1. 26*3」曾被误拼成小数「1.26*3」）。两类可安全剥离的形态：
@@ -115,15 +121,17 @@ func normalizeTrivialArithmetic(problem string) (expr, display string, ok bool) 
 // arithmeticAnswerValue 只从“纯数值/算式答案”中取精确值。允许学生写完整等式或在最后一行写
 // “答案：…”，但不剥单位、不从自然语言里猜数字；无法保守判定时仍交给 grader。
 func arithmeticAnswerValue(answer string) (string, bool) {
-	s := strings.TrimSpace(answer)
+	s := normalizeArithmeticAnswerMarkup(answer)
 	if s == "" || len(s) > 512 {
 		return "", false
 	}
 	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		candidate := strings.TrimSpace(lines[i])
+		candidate := strings.Trim(strings.TrimSpace(lines[i]), "`*。.；;，,、 ")
 		candidate = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(candidate, "答案："), "答："))
 		candidate = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(candidate, "答案:"), "答:"))
+		candidate = strings.TrimSpace(strings.TrimPrefix(candidate, "是"))
+		candidate = strings.Trim(candidate, "`*。.；;，,、 ")
 		candidate = strings.ReplaceAll(candidate, "＝", "=")
 		if eq := strings.LastIndexByte(candidate, '='); eq >= 0 {
 			rhs := strings.TrimSpace(candidate[eq+1:])
@@ -148,6 +156,30 @@ func arithmeticAnswerValue(answer string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// normalizeArithmeticAnswerMarkup 只把识题 canonical Markdown 的数学包装投影为
+// 本机计算器可读文本；持久化与用户展示仍保留原始 canonical 内容。
+func normalizeArithmeticAnswerMarkup(answer string) string {
+	s := strings.TrimSpace(answer)
+	for {
+		next := answerLatexFractionRe.ReplaceAllString(s, `($1/$2)`)
+		if next == s {
+			break
+		}
+		s = next
+	}
+	s = answerLatexCompactFractionRe.ReplaceAllString(s, `($1/$2)`)
+	s = answerLatexTextRe.ReplaceAllString(s, `$1`)
+	s = answerParenthesizedFractionRe.ReplaceAllString(s, `($1/$2)`)
+	s = strings.NewReplacer(
+		`\begin{aligned}`, "", `\end{aligned}`, "",
+		`\left`, "", `\right`, "", `\times`, "×", `\div`, "÷", `\cdot`, "×",
+		`\\`, "\n", "$", "", "&", "",
+	).Replace(s)
+	s = answerMixedFractionRe.ReplaceAllString(s, `$1+($2)`)
+	s = answerSpacedMixedFractionRe.ReplaceAllString(s, `$1+($2)`)
+	return strings.TrimSpace(s)
 }
 
 // mixedNumberAnswerValue parses elementary-school mixed numbers such as "6 2/7" or "6又2/7".

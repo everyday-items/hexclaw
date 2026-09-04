@@ -147,6 +147,16 @@ type answerGroup struct {
 	sols   []solverSolution
 }
 
+const verifiedTextbookEvidenceSeparator = "\n\nVerified textbook evidence ("
+
+// deterministicProblemStem 只给本地确定性求解器取原题；模型路径仍消费完整教材证据。
+func deterministicProblemStem(problem string) string {
+	if index := strings.Index(problem, verifiedTextbookEvidenceSeparator); index >= 0 {
+		return strings.TrimSpace(problem[:index])
+	}
+	return problem
+}
+
 func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.Result, error) {
 	problem, _ := args["problem"].(string)
 	if strings.TrimSpace(problem) == "" {
@@ -162,12 +172,13 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	// 显式传 method_diversity/self_consistency 表示调用方要求完整的 solver/verifier 流程；
 	// 即使题目只是一步算术，也不能被确定性快速路径绕过。
 	auto := !hasArg(args, "method_diversity") && !hasArg(args, "self_consistency")
+	deterministicProblem := deterministicProblemStem(problem)
 
 	// 纯一步算式走本机精确求值器：这类题不该因云端余额/限流，或本地模型 tools 请求挂起而
 	// 变成“未能解出”。求值器只接受数字、四则运算与括号，拒绝变量/文字/方程；复杂题仍进入
 	// solver + verifier 多 Agent 链。结果来自确定性程序计算，可直接给 numeric_exec 强证据。
-	if auto && !gradingMode && trivialArithmeticAllowedByConstraint(problem, constraint) {
-		if worked, computed, ok := solveTrivialArithmetic(problem); ok {
+	if auto && !gradingMode && trivialArithmeticAllowedByConstraint(deterministicProblem, constraint) {
+		if worked, computed, ok := solveTrivialArithmetic(deterministicProblem); ok {
 			return &skill.Result{
 				Content: worked,
 				Metadata: map[string]string{
@@ -181,8 +192,8 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	}
 	// 单变量一次方程同样走本机精确有理数求解：严格白名单解析、左右都必须为 ax+b，
 	// 非线性/变量作除数/无解/无穷解一律 fail-closed 回到完整模型链。
-	if auto && !gradingMode && linearEquationAllowedByConstraint(problem, constraint) {
-		if worked, computed, ok := solveLinearEquation(problem); ok {
+	if auto && !gradingMode && linearEquationAllowedByConstraint(deterministicProblem, constraint) {
+		if worked, computed, ok := solveLinearEquation(deterministicProblem); ok {
 			return &skill.Result{
 				Content: worked,
 				Metadata: map[string]string{
@@ -198,8 +209,8 @@ func (o *SolveSkill) Execute(ctx context.Context, args map[string]any) (*skill.R
 	// 超出当前约束时直接返回 out_of_scope，不能再掉进 5 分钟慢模型链；题型本身缺条件/歧义
 	// 才交给 solver + verifier。
 	if auto && !gradingMode {
-		if solution, ok := solveElementaryWordProblemDetailed(problem); ok {
-			if !elementaryWordAllowedByConstraint(problem, constraint) {
+		if solution, ok := solveElementaryWordProblemDetailed(deterministicProblem); ok {
+			if !elementaryWordAllowedByConstraint(deterministicProblem, constraint) {
 				return &skill.Result{
 					Content: fmt.Sprintf("本题涉及「%s」，超出当前已学范围。请先确认孩子的年级/学期，再决定是否讲解。", solution.knowledgePoint),
 					Metadata: map[string]string{
@@ -371,22 +382,27 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 	if groundTruth == "" {
 		return nil, fmt.Errorf("verified solution has no final answer")
 	}
+	deterministicProblem := deterministicProblemStem(problem)
 	// 可确定性求解的题已由本机程序复算；但快路只有在“本机复算结果”和调用方传入的
 	// verifiedSolution 完全一致时才能启用。否则必须尊重前序已验证解法，降级给 grader，
 	// 避免规则误匹配反过来覆盖可信 ground truth。
-	if _, computed, ok := solveTrivialArithmetic(problem); ok {
+	if _, computed, ok := solveTrivialArithmetic(deterministicProblem); ok {
 		verifiedValue, verifiedOK := arithmeticAnswerValue(groundTruth)
 		if verifiedOK && verifiedValue == computed {
+			normalizedStudent := normalizeArithmeticAnswerMarkup(studentAnswer)
 			if studentValue, arithmeticAnswer := arithmeticAnswerValue(studentAnswer); arithmeticAnswer {
 				finalAnswerCorrect := studentValue == computed
-				assess := deterministicGradeAssessment(finalAnswerCorrect, finalAnswerCorrect, false)
-				return deterministicGradeResult(studentAnswer, computed, "grading_deterministic_arithmetic", assess), nil
+				workValid, conclusive := validateStudentArithmeticWork(deterministicProblem, normalizedStudent)
+				if conclusive {
+					assess := deterministicGradeAssessment(finalAnswerCorrect && workValid, finalAnswerCorrect, !workValid)
+					return deterministicGradeResult(studentAnswer, computed, "grading_deterministic_arithmetic", assess), nil
+				}
 			}
 		}
 	}
-	if _, computed, ok := solveLinearEquation(problem); ok {
+	if _, computed, ok := solveLinearEquation(deterministicProblem); ok {
 		verifiedValue, verifiedOK := arithmeticAnswerValue(strings.NewReplacer("$", "", `\times`, "×").Replace(groundTruth))
-		comparisonAnswer := strings.NewReplacer("$", "", `\times`, "×").Replace(studentAnswer)
+		comparisonAnswer := normalizeArithmeticAnswerMarkup(studentAnswer)
 		if verifiedOK && verifiedValue == computed && !strings.ContainsAny(comparisonAnswer, "\r\n") {
 			if studentValue, answerOK := arithmeticAnswerValue(comparisonAnswer); answerOK {
 				finalAnswerCorrect := studentValue == computed
@@ -395,16 +411,21 @@ func (o *SolveSkill) GradeVerified(ctx context.Context, problem, verifiedSolutio
 			}
 		}
 	}
-	if solution, ok := solveElementaryWordProblemDetailed(problem); ok && solution.problemIssue == "" {
+	if solution, ok := solveElementaryWordProblemDetailed(deterministicProblem); ok && solution.problemIssue == "" {
 		expected := answerQuantity{value: solution.value, unit: solution.unit}
 		verified, verifiedOK := parseAnswerQuantity(groundTruth)
 		// 单位是应用题答案的一部分；verifiedSolution 缺单位、单位冲突或数值冲突时都不走快路。
 		if verifiedOK && quantitiesEqual(verified, expected) {
-			comparisonAnswer := strings.NewReplacer("$", "", `\times`, "×").Replace(studentAnswer)
+			comparisonAnswer := normalizeArithmeticAnswerMarkup(studentAnswer)
 			if student, studentOK := parseAnswerQuantity(comparisonAnswer); studentOK {
-				workValid, conclusive := validateStudentArithmeticWork(comparisonAnswer)
+				finalAnswerCorrect := quantitiesEqual(student, expected)
+				if !finalAnswerCorrect {
+					groundTruthWithUnit := solution.value + solution.unit
+					assess := deterministicGradeAssessment(false, false, false)
+					return deterministicGradeResult(studentAnswer, groundTruthWithUnit, "grading_deterministic_elementary_word", assess), nil
+				}
+				workValid, conclusive := validateStudentArithmeticWork(deterministicProblem, comparisonAnswer)
 				if conclusive {
-					finalAnswerCorrect := quantitiesEqual(student, expected)
 					assess := deterministicGradeAssessment(
 						finalAnswerCorrect && workValid,
 						finalAnswerCorrect,
