@@ -182,7 +182,7 @@ const recognizePrompt = `识别这张作业图片里的所有题目，并逐题�
 - problem_kind=compound_parent 时 parent_problem_id 与 subproblem_no 必须同时是空字符串，answer_state 必须是 blank 且 student_answer 必须为空字符串。
 - problem_kind=subproblem 时 parent_problem_id 与 subproblem_no 必须同时非空，parent_problem_id 必须精确引用本次 JSON 内唯一对应的 compound_parent。
 - question/student_answer 必须逐字保留视觉原始转写；canonical_markdown/answer_canonical_markdown 独立输出可渲染 Markdown/LaTeX，不得用规范形覆盖原始转写。
-- recognition_confidence 是 0~1 置信度；ocr_signals 只可使用 fraction/decimal_point/negative_sign/unit/erasure/unclear_handwriting。高置信度也必须如实输出格式信号。
+- recognition_confidence 是印刷原题转写的 0~1 置信度，不是对解题答案或学生字迹的信心。空白作答区、没有学生答案、答案区擦痕不得降低清晰原题的置信度。返回前自行对照原图复核有疑问的数字、运算符和小数点；仍无法辨认才保留不确定性。ocr_signals 只可使用 fraction/decimal_point/negative_sign/unit/erasure/unclear_handwriting。高置信度也必须如实输出格式信号。
 - subject 逐题判定题目学科，只能取以下之一：数学 / 语文 / 英语 / 物理 / 化学；确实判不出学科时才留空字符串 ""。
 - question 题干只抄印刷体/原题内容，绝不能把铅笔、黑笔等手写墨迹拼进题干；student_answer 只如实誊录图中孩子**已经写下**的手写作答（包括紧跟在印刷等号后的数字）。例如印刷题是“4÷0.5=”且等号后手写“8”，必须让 question 写 "4÷0.5="、student_answer 写 "8"，不能把 question 写成“4÷0.5=8”。
 - answer_state 只能是 blank / present / unclear：
@@ -210,7 +210,7 @@ Rules:
 - For problem_kind=compound_parent, parent_problem_id and subproblem_no must both be empty strings, answer_state must be blank, and student_answer must be an empty string.
 - For problem_kind=subproblem, parent_problem_id and subproblem_no must both be non-empty, and parent_problem_id must exactly reference the one corresponding compound_parent in this JSON.
 - Preserve question and student_answer as verbatim visual transcriptions. Emit canonical_markdown and answer_canonical_markdown separately as renderable normalized forms; never overwrite the source transcription with a normalized form.
-- recognition_confidence is between 0 and 1. ocr_signals may contain only fraction, decimal_point, negative_sign, unit, erasure, or unclear_handwriting. Report formatting signals honestly even at high confidence.
+- recognition_confidence measures only the printed question transcription, from 0 to 1, not confidence in a solution or the student's handwriting. An empty answer area, missing student answer, or erased answer must not lower confidence in a clearly readable question. Before returning, recheck uncertain digits, operators and decimal points against the image; retain uncertainty only when the source remains unreadable. ocr_signals may contain only fraction, decimal_point, negative_sign, unit, erasure, or unclear_handwriting. Report formatting signals honestly even at high confidence.
 - Determine subject per question. It must be exactly one of 数学, 语文, 英语, 物理, 化学, or an empty string only when the subject truly cannot be determined.
 - question copies only printed source text and must never incorporate pencil, pen, or other handwritten marks. student_answer copies only work the student has already written, including a number immediately following a printed equals sign. If the printed question is “4÷0.5=” and the student wrote “8” after the equals sign, question must be "4÷0.5=" and student_answer must be "8"; never make question "4÷0.5=8".
 - answer_state must be blank, present, or unclear. blank means no student response is present and requires student_answer="". present means a response exists and can be transcribed reliably, and student_answer must contain the visible response. unclear means handwriting, an erasure, or an answer area is visible but cannot be read reliably, and requires student_answer="".
@@ -258,6 +258,7 @@ Each items entry must contain exactly target_id, kind, and recognition:
 A question recognition uses these structured-recognition fields: problem_id, problem_kind, parent_problem_id, subproblem_no, source_number_path, display_label, source_section_path, source_section_label, question, canonical_markdown, subject, knowledge_points, answer_state, student_answer, answer_canonical_markdown, recognition_confidence, ocr_signals, evidence_transcriptions, answer_evidence_transcriptions. Do not output any field outside this list.
 Printed numbers in the question, choices, or candidate list are never student answers merely because they are visible. For fill-in prompts such as 划去数（ ）, present is allowed only when separate handwriting is visibly written inside or beside the blank, or in an independent working area. With no separate handwriting, return blank with empty student_answer and answer_canonical_markdown; never solve the problem or copy a printed candidate. answer_evidence_transcriptions may contain only independently visible student handwriting.
 answer_state must be blank, present, or unclear. present requires a legible student_answer; blank and unclear require an empty student_answer. subject must be 数学, 语文, 英语, 物理, 化学, or empty.
+recognition_confidence measures only the printed question transcription, not a solution or student answer. Empty answer areas and erased answers must not lower confidence in a clear printed question. Recheck uncertain source digits, operators and decimal points against the image before returning; never guess an unreadable source. Use unclear only for independently visible unreadable handwriting, not blank space or printed answer lines.
 The authorized target list, in order, follows:
 `
 
@@ -3585,8 +3586,13 @@ func mergeRecognitionAuditEvidence(preferred, other usecase.RecognizedQuestion) 
 		preferred.AnswerEvidenceTranscriptions, preferred.AnswerRawTranscription, other.AnswerRawTranscription,
 	)
 	preferred.OCRSignals = appendUniqueEvidence(preferred.OCRSignals, other.OCRSignals...)
+	// 一致的独立原题读数采用更清晰观察的置信度；真正冲突仍保留更低值和全部原始证据。
+	sameQuestion := recognizedQuestionKey(preferred.RawTranscription) != "" &&
+		recognizedQuestionKey(preferred.RawTranscription) == recognizedQuestionKey(other.RawTranscription)
 	if preferred.RecognitionConfidence == nil ||
-		(other.RecognitionConfidence != nil && *other.RecognitionConfidence < *preferred.RecognitionConfidence) {
+		(other.RecognitionConfidence != nil &&
+			((sameQuestion && *other.RecognitionConfidence > *preferred.RecognitionConfidence) ||
+				(!sameQuestion && *other.RecognitionConfidence < *preferred.RecognitionConfidence))) {
 		preferred.RecognitionConfidence = other.RecognitionConfidence
 	}
 	return preferred
