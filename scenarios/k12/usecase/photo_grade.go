@@ -367,7 +367,7 @@ func (d Deps) assessPhotoItem(
 	item.ParentGuide = &blankResult.Guide
 	item.Status = PhotoBlankSolved
 	if !photoEvidenceTrusted(blankResult.Solved.Evidence) {
-		item.Warning = "答案未通过程序级验算，请家长核对"
+		item.Warning = "Independent programmatic verification is unavailable for this answer."
 	}
 	return item, nil
 }

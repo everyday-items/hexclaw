@@ -351,6 +351,15 @@ func publicImageTask(view usecase.ImageTaskView) publicImageTaskDispatch {
 			if strings.Contains(dispatch.FailureKind, "outcome_unknown") {
 				out.Progress.State = "recovering"
 			}
+		} else if view.Creative != nil {
+			// 外层 dispatch 失败优先于旧的创作点评进行态，避免已终止任务继续显示处理中。
+			if view.Creative.Status == k12.CreativeWorkIntakePromoted && out.Progress.Operation == "promotion" {
+				out.Progress.State = "feedback_failed"
+			} else if dispatch.RetrySafe {
+				out.Progress.State = "failed_retryable"
+			} else {
+				out.Progress.State = "failed_terminal"
+			}
 		}
 	}
 	if view.CreativeFeedback == "feedback_failed" {

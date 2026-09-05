@@ -106,8 +106,28 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 	if job.Record.Status == k12.GradingStageCompleted {
 		completedAt = job.Record.UpdatedAt
 	}
+	stage := job.Record.Status
+	if stage == k12.GradingStageAwaitingConfirmation &&
+		job.Fields.ConfirmationState == k12.GradingConfirmationPending &&
+		job.Fields.BudgetSnapshot.IsFrozen() && automaticPhotoConfirmationSource(job.Fields.SourceKind) {
+		if run, loadErr := o.ensureRun(ctx, jobID); loadErr == nil && run.req.TaskIntent == PhotoTaskBlankWorksheet {
+			clear := clearWorksheetQuestionIDs(questions)
+			published := make(map[string]int)
+			for _, item := range durableProjection.ProgressiveSnapshot.ProblemProgress {
+				published[item.ProblemID] = item.PublishedRevision
+			}
+			// 依赖组仍在等确认时，清晰题的当前回执尚未完成就仍是实际执行态。
+			for _, question := range questions {
+				if question.ProblemKind != ProblemKindCompoundParent && clear[question.ProblemID] &&
+					(question.ConfirmedVersion == 0 || published[question.ProblemID] != question.ConfirmedVersion) {
+					stage = k12.GradingStageAssessing
+					break
+				}
+			}
+		}
+	}
 	return ImageTaskHomeworkProjection{
-		Stage: job.Record.Status, CompletedAt: completedAt, Retryable: job.Fields.Retryable,
+		Stage: stage, CompletedAt: completedAt, Retryable: job.Fields.Retryable,
 		ConfirmationState: job.Fields.ConfirmationState,
 		AnchorState:       job.Fields.AnchorState, Subject: subject,
 		retryFailureKind: job.Fields.FailureKind,
