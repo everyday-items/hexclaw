@@ -1435,7 +1435,9 @@ func applyAndValidateGradingConfirmation(run *gradingRun, in ConfirmPhotoGrading
 			!confirmed[q.ProblemID] {
 			return fmt.Errorf("%w: problem %s 需逐题确认（%s）", ErrInvalidInput, q.ProblemID, joinOCRRiskReasons(q.ConfirmationReasons))
 		}
-		q.ConfirmedVersion++
+		if q.ConfirmedVersion == 0 || confirmed[q.ProblemID] {
+			q.ConfirmedVersion++
+		}
 		run.questions[i] = q
 	}
 	run.questions = FreezeRecognizedQuestionInputDigests(run.questions, run.req.Grade)

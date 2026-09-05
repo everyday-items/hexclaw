@@ -519,7 +519,7 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		item.ParentGuide = &guide
 		item.Status = PhotoBlankSolved
 		if !photoEvidenceTrusted(solved.Evidence) {
-			item.Warning = "答案未通过程序级验算，请家长核对"
+			item.Warning = "Independent programmatic verification is unavailable for this answer."
 		}
 		return commitGradingAssessmentItem(durableCtx, deps, job, q, item,
 			solveInvocationID, "", parentGuideInvocationID, k12storage.GradingAssessmentEffects{})

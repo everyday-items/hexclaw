@@ -480,6 +480,18 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 					continue
 				}
 			}
+			if automaticPhotoConfirmationSource(v.Fields.SourceKind) &&
+				run.req.TaskIntent == PhotoTaskBlankWorksheet &&
+				v.Fields.ConfirmationState == k12.GradingConfirmationPending &&
+				v.Fields.BudgetSnapshot.IsFrozen() {
+				if err := o.assessClearWorksheetQuestions(ctx, run, v); err != nil {
+					if errors.Is(err, ErrGradingPhysicalCallOutcomeUnknown) ||
+						errors.Is(err, ErrModelInvocationRequiresReconciliation) {
+						return o.markGradingOutcomeUnknown(context.WithoutCancel(ctx), run, jobID, "item_invocation_outcome_unknown")
+					}
+					return o.failStage(ctx, run, jobID, "assess_item_failed", err)
+				}
+			}
 			// 停点：等家长确认（规则 7 不自动过期）。ConfirmAndRun 续跑。
 			return v, nil
 		case k12.GradingStageAssessing:
@@ -511,6 +523,65 @@ func recognizedQuestionsRequireGuardianConfirmation(
 		}
 	}
 	return false
+}
+
+// 清晰题先冻结并复用既有逐题账本求解；疑问题及其公共题干依赖组不执行。
+// 后续整页确认保留这些输入版本和回执，不重复调用模型。
+func clearWorksheetQuestionIDs(questions []RecognizedQuestion) map[string]bool {
+	blocked := make(map[string]bool)
+	for _, q := range questions {
+		if recognizedQuestionRequiresGuardianConfirmation(q, PhotoTaskBlankWorksheet) {
+			blocked[q.ProblemID] = true
+			if q.ParentProblemID != "" {
+				blocked[q.ParentProblemID] = true
+			}
+		}
+	}
+	clear := make(map[string]bool)
+	for _, q := range questions {
+		if !blocked[q.ProblemID] && !blocked[q.ParentProblemID] {
+			clear[q.ProblemID] = true
+		}
+	}
+	return clear
+}
+
+func (o *GradingOrchestrator) assessClearWorksheetQuestions(ctx context.Context, run *gradingRun, job GradingJobView) error {
+	clear := clearWorksheetQuestionIDs(run.questions)
+	candidate := *run
+	candidate.questions = cloneRecognizedQuestions(run.questions)
+	for i := range candidate.questions {
+		q := &candidate.questions[i]
+		if clear[q.ProblemID] && q.ConfirmedVersion == 0 {
+			q.ConfirmedVersion = 1
+		}
+	}
+	candidate.questions = FreezeRecognizedQuestionInputDigests(candidate.questions, run.req.Grade)
+	for i := range candidate.questions {
+		if candidate.questions[i].ConfirmedVersion == 0 {
+			candidate.questions[i].InputDigest = ""
+		}
+	}
+	if candidate.anchored != nil {
+		candidate.anchored = mergeAnchorGeometry(candidate.questions, candidate.anchored)
+	}
+	if err := o.persistProblemAttemptFacts(ctx, run.agentName, job.Fields.SubmissionID, candidate.questions); err != nil {
+		return err
+	}
+	if err := o.persistRun(job.Record.RecordID, &candidate); err != nil {
+		return err
+	}
+	run.questions = candidate.questions
+	run.anchored = candidate.anchored
+	for _, q := range RecognizedQuestionsForAssessment(run.questions) {
+		if !clear[q.ProblemID] {
+			continue
+		}
+		if _, err := o.assessDurablePhotoItem(ctx, o.deps, job, run.req, PhotoModeSolve, q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func recognizedQuestionRequiresGuardianConfirmation(
