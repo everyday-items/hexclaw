@@ -69,6 +69,11 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 	for _, reason := range q.ConfirmationReasons {
 		// 旧检查点中的内容形态原因与 evidence_conflict 均按当前事实重算，
 		// 避免已合并的多行互补证据永久停留在确认态。
+		// 类型化恢复记录只保存风险结论时，缺少原始观察不能反证冲突已经消失。
+		if reason == OCRRiskEvidenceConflict && len(q.EvidenceTranscriptions) == 0 &&
+			len(q.AnswerEvidenceTranscriptions) == 0 {
+			reasons[reason] = struct{}{}
+		}
 		if reason != OCRRiskEvidenceConflict && independentOCRUncertaintyReason(reason) {
 			reasons[reason] = struct{}{}
 		}
