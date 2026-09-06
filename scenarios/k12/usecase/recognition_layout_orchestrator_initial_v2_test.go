@@ -85,18 +85,16 @@ func (p *recognitionLayoutInitialV2Probe) Recognize(
 	return nil, errRecognitionLayoutInitialV2ProbeComplete
 }
 
-// REG-K12-RECOGNITION-DURABILITY-BUDGET-20260808-001：已冻结的 V2 Job 必须在
-// 进入 Recognizer 前发布不可变的父项、头部和清单授权，并向该调用注入准确的
-// 持久化头部摘要。
+// V2 Job 在进入 Recognizer 前发布父项、头部和清单授权；非 Sol 模型不携带专属参数。
 func TestREGK12RecognitionDurabilityBudget20260808001OrchestratesInitialV2HeaderAndManifest(
 	t *testing.T,
 ) {
 	const nowUnix int64 = 1_800_000_000
-	policy := k12.ApprovedRecognizingRequestPolicy()
+	policy := k12.ModelRequestPolicySnapshot{}
 	route := k12.GradingModelSnapshot{
 		Provider:                 "hexclaw-gpt",
-		Model:                    k12.RecognizingPolicyModel,
-		Route:                    "hexclaw-gpt/" + k12.RecognizingPolicyModel,
+		Model:                    "gpt-5.6-luna",
+		Route:                    "hexclaw-gpt/gpt-5.6-luna",
 		Capability:               "vision",
 		RecognizingRequestPolicy: policy,
 	}
@@ -169,6 +167,9 @@ func TestREGK12RecognitionDurabilityBudget20260808001OrchestratesInitialV2Header
 	if probe.parent.InvocationID == "" ||
 		probe.parent.Status != k12.ModelInvocationSent {
 		t.Fatalf("recognizer entry parent=%+v, want sent", probe.parent)
+	}
+	if !probe.parent.RequestPolicySnapshot.IsZero() {
+		t.Fatalf("non-Sol recognition inherited request policy: %+v", probe.parent.RequestPolicySnapshot)
 	}
 	if probe.runtime.HeaderDigest != probe.headerDigest ||
 		probe.runtime.Status != "prepared_manifest" ||

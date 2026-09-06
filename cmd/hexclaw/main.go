@@ -2165,19 +2165,35 @@ Set source only when the material explicitly names a work, title, or another rel
 			cctx, ccancel := context.WithTimeout(cctx, timeout)
 			defer ccancel()
 			temp := 0.4
+			systemPrompt := "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
+				"直接给最终题目与答案、不要展开长篇推理。输出必须严格使用 GitHub Markdown，固定为 `## 问题`、`## 解答`、`## 答案` 三段；" +
+				"解答步骤必须用 `1. `、`2. ` 有序列表，最终答案用粗体，不要使用 Markdown 代码围栏，也不要用普通的“问题：/解答：/答案：”标签行。" +
+				"数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），" +
+				"禁止输出 LaTeX（不要 \\times \\frac \\text{} ^{} 或 $…$、\\(…\\) 定界符）。"
+			completionStartedAt := time.Now()
+			completionDeadline, hasCompletionDeadline := cctx.Deadline()
+			callLogger := logger.FromContext(cctx)
+			callLogger.Info("[k12逐题出题] 模型请求开始", "provider", snapshot.Provider, "model", snapshot.Model,
+				"context_has_deadline", hasCompletionDeadline, "context_deadline", completionDeadline,
+				"timeout_ms", timeout.Milliseconds(), "remaining_ms", time.Until(completionDeadline).Milliseconds(),
+				"user_bytes", len(task), "system_bytes", len(systemPrompt), "prompt_bytes", len(task)+len(systemPrompt),
+				"max_tokens", 1024, "temperature", temp)
 			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
 				Model: snapshot.Model,
 				Messages: []hexagon.Message{
-					{Role: hexagon.RoleSystem, Content: "你是中小学出题老师。据给定学科/年级/知识点直接出一道同类变式练习题并给简要解答，" +
-						"直接给最终题目与答案、不要展开长篇推理。输出必须严格使用 GitHub Markdown，固定为 `## 问题`、`## 解答`、`## 答案` 三段；" +
-						"解答步骤必须用 `1. `、`2. ` 有序列表，最终答案用粗体，不要使用 Markdown 代码围栏，也不要用普通的“问题：/解答：/答案：”标签行。" +
-						"数学一律用 Unicode 符号（×÷√≤≥、分数 a/b、平方 x²、下标 H₂O、单位 cm³），" +
-						"禁止输出 LaTeX（不要 \\times \\frac \\text{} ^{} 或 $…$、\\(…\\) 定界符）。"},
+					{Role: hexagon.RoleSystem, Content: systemPrompt},
 					{Role: hexagon.RoleUser, Content: task},
 				},
 				MaxTokens:   1024,
 				Temperature: &temp,
 			})
+			outputBytes := 0
+			if resp != nil {
+				outputBytes = len(resp.Content)
+			}
+			callLogger.Info("[k12逐题出题] 模型请求结束", "provider", snapshot.Provider, "model", snapshot.Model,
+				"elapsed_ms", time.Since(completionStartedAt).Milliseconds(), "output_bytes", outputBytes,
+				"context_error", cctx.Err(), "error_type", fmt.Sprintf("%T", err))
 			if err != nil {
 				return "", err
 			}
@@ -2300,23 +2316,42 @@ Set source only when the material explicitly names a work, title, or another rel
 			}
 			// 只含作品文本与教学任务（题目要求/原文），不含孩子敏感档案——归 general_chat/general。
 			cctx := egress.WithRequest(ctx, egress.PurposeGeneralChat, "k12-work-feedback", egress.ClassGeneral)
-			cctx, ccancel := context.WithTimeout(cctx, 60*time.Second)
-			defer ccancel()
+			if _, hasDeadline := cctx.Deadline(); !hasDeadline {
+				var ccancel context.CancelFunc
+				cctx, ccancel = context.WithTimeout(cctx, 60*time.Second)
+				defer ccancel()
+			}
 			temp := 0.3
 			// 点评框架与输出信封由任务提示词携带（writing-feedback skill 正文基座，
 			// engineadapter/work_feedback.go 注入；skill 缺失时回退硬编码两段式）。
 			// 系统提示只钉红线（与提示词红线、usecase INV-011 构成三道保险），
 			// 不再下发与 skill 输出信封冲突的固定两段式/字数上限。
+			systemPrompt := "你是小学写作辅导老师，给孩子作文做形成性点评。红线：只点评不打分——禁止输出任何分数、等第、评级、排名；" +
+				"提供家长参考改句与完整参考稿，说明先讲什么、怎样追问、卡住时如何引导和检查理解；不覆盖孩子原稿，不编造孩子经历。点评框架与输出格式按用户消息里的技能指引执行；语气鼓励、具体、可执行。"
+			completionStartedAt := time.Now()
+			completionDeadline, hasCompletionDeadline := cctx.Deadline()
+			callLogger := logger.FromContext(cctx)
+			callLogger.Info("[k12写作点评] 模型请求开始", "provider", provider.Name(), "model", model,
+				"context_has_deadline", hasCompletionDeadline, "context_deadline", completionDeadline,
+				"remaining_ms", time.Until(completionDeadline).Milliseconds(),
+				"user_bytes", len(task), "system_bytes", len(systemPrompt), "prompt_bytes", len(task)+len(systemPrompt),
+				"max_tokens", 1536, "temperature", temp)
 			resp, err := provider.Complete(k12NonIdempotentLLMContext(cctx), hexagon.CompletionRequest{
 				Model: model,
 				Messages: []hexagon.Message{
-					{Role: hexagon.RoleSystem, Content: "你是小学写作辅导老师，给孩子作文做形成性点评。红线：只点评不打分——禁止输出任何分数、等第、评级、排名；" +
-						"不代写——禁止给范文、禁止改写或重写全文。点评框架与输出格式按用户消息里的技能指引执行；语气鼓励、具体、可执行。"},
+					{Role: hexagon.RoleSystem, Content: systemPrompt},
 					{Role: hexagon.RoleUser, Content: task},
 				},
 				MaxTokens:   1536,
 				Temperature: &temp,
 			})
+			outputBytes := 0
+			if resp != nil {
+				outputBytes = len(resp.Content)
+			}
+			callLogger.Info("[k12写作点评] 模型请求结束", "provider", provider.Name(), "model", model,
+				"elapsed_ms", time.Since(completionStartedAt).Milliseconds(), "output_bytes", outputBytes,
+				"context_error", cctx.Err(), "error_type", fmt.Sprintf("%T", err))
 			if err != nil {
 				return "", err
 			}

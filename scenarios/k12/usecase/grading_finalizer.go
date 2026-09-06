@@ -224,6 +224,9 @@ func (o *GradingOrchestrator) freezeGradingFinalAnnotatedAsset(
 	if len(annotated.Data) == 0 {
 		return fmt.Errorf("%w: annotated image bytes are empty", ErrGradingFinalizationIncomplete)
 	}
+	if job.Fields.ConfirmationState != k12.GradingConfirmationConfirmed {
+		return fmt.Errorf("%w: annotated image job source is invalid", ErrGradingFinalizationIncomplete)
+	}
 	dispatchID, err := gradingFinalImageTaskDispatchID(job)
 	if err != nil {
 		return err
@@ -270,7 +273,6 @@ func (o *GradingOrchestrator) freezeGradingFinalAnnotatedAsset(
 func gradingFinalImageTaskDispatchID(job GradingJobView) (string, error) {
 	if job.Record == nil || strings.TrimSpace(job.Record.AgentName) == "" ||
 		strings.TrimSpace(job.Fields.SourceKind) != "image_task" ||
-		job.Fields.ConfirmationState != k12.GradingConfirmationConfirmed ||
 		job.Fields.ConfirmedVersion < 0 {
 		return "", fmt.Errorf("%w: annotated image job source is invalid", ErrGradingFinalizationIncomplete)
 	}
@@ -658,7 +660,8 @@ func validateRecoveredFinalTutoringTips(
 		tips.Sections[1].SourceLabel != TutoringTipsSourceLearningEvidence {
 		return fmt.Errorf("durable result learning-evidence section contract changed")
 	}
-	if strings.TrimSpace(tips.Sections[2].Title) != "每道题怎么带（不直接给答案）" ||
+	if (strings.TrimSpace(tips.Sections[2].Title) != "每道题的答案与讲法" &&
+		strings.TrimSpace(tips.Sections[2].Title) != "每道题怎么带（不直接给答案）") ||
 		tips.Sections[2].SourceLabel != TutoringTipsSourceAI {
 		return fmt.Errorf("durable result per-problem section contract changed")
 	}
@@ -672,9 +675,12 @@ func renderCanonicalGradingFinal(
 	var out strings.Builder
 	out.WriteString("# 作业批改结果\n\n")
 	correctCount, processIssueCount, attentionCount, skippedCount := 0, 0, 0, 0
+	// 空白题的家长解答与历史未作答单列，不把缺少学生作答当作需关注的批改结果。
+	detailGroups := [3][]gradingFinalEntry{}
 	for _, entry := range entries {
 		if entry.skip != nil {
 			skippedCount++
+			detailGroups[0] = append(detailGroups[0], entry)
 			continue
 		}
 		if entry.assessment == nil {
@@ -685,17 +691,32 @@ func renderCanonicalGradingFinal(
 			correctCount++
 		case k12.GradingAssessmentProcessIssue:
 			processIssueCount++
+			detailGroups[0] = append(detailGroups[0], entry)
+		case k12.GradingAssessmentBlankSolved:
+			detailGroups[1] = append(detailGroups[1], entry)
+		case k12.GradingAssessmentUnanswered:
+			detailGroups[2] = append(detailGroups[2], entry)
 		default:
 			attentionCount++
+			detailGroups[0] = append(detailGroups[0], entry)
 		}
 	}
 	out.WriteString("## 批改摘要\n\n")
-	fmt.Fprintf(&out, "**共 %d 题 · %d 题正确", len(entries), correctCount)
+	fmt.Fprintf(&out, "**共 %d 题", len(entries))
+	if correctCount+processIssueCount+attentionCount > 0 {
+		fmt.Fprintf(&out, " · %d 题正确", correctCount)
+	}
 	if processIssueCount > 0 {
 		fmt.Fprintf(&out, " · %d 题过程需关注", processIssueCount)
 	}
 	if attentionCount > 0 {
 		fmt.Fprintf(&out, " · %d 题需关注", attentionCount)
+	}
+	if solvedCount := len(detailGroups[1]); solvedCount > 0 {
+		fmt.Fprintf(&out, " · %d 题已解答", solvedCount)
+	}
+	if unansweredCount := len(detailGroups[2]); unansweredCount > 0 {
+		fmt.Fprintf(&out, " · %d 题未作答", unansweredCount)
 	}
 	if skippedCount > 0 {
 		fmt.Fprintf(&out, " · %d 题未判断", skippedCount)
@@ -705,40 +726,41 @@ func renderCanonicalGradingFinal(
 		out.WriteString("> 过程问题表示最终答案正确，但书写过程需要核对，不记为错题。\n\n")
 	}
 
-	detailCount := processIssueCount + attentionCount + skippedCount
-	if detailCount > 0 {
-		out.WriteString("## 需关注的题\n\n")
-	}
-	for _, entry := range entries {
-		if entry.skip == nil && (entry.assessment == nil || entry.assessment.Status == k12.GradingAssessmentCorrect) {
+	detailCount := len(detailGroups[0]) + len(detailGroups[1]) + len(detailGroups[2])
+	detailTitles := [...]string{"需关注的题", "已解答", "未作答"}
+	for groupIndex, group := range detailGroups {
+		if len(group) == 0 {
 			continue
 		}
-		label := RecognizedQuestionSourceDisplayLabel(entry.question)
-		if label == "" {
-			label = "题目位置待确认"
-		}
-		out.WriteString("### ")
-		out.WriteString(label)
-		out.WriteString("\n\n")
-		if question := strings.TrimSpace(entry.question.CanonicalMarkdown); question != "" &&
-			(entry.assessment == nil || entry.assessment.Status != k12.GradingAssessmentProcessIssue) {
-			out.WriteString(question)
+		fmt.Fprintf(&out, "## %s\n\n", detailTitles[groupIndex])
+		for _, entry := range group {
+			label := RecognizedQuestionSourceDisplayLabel(entry.question)
+			if label == "" {
+				label = "题目位置待确认"
+			}
+			out.WriteString("### ")
+			out.WriteString(label)
 			out.WriteString("\n\n")
-		}
-		if entry.skip != nil {
-			out.WriteString("**已跳过 · 未判断对错**\n\n")
-			continue
-		}
-		out.WriteString("**批改状态：** ")
-		out.WriteString(gradingAssessmentParentStatus(entry.assessment.Status))
-		out.WriteString("\n\n")
-		if entry.assessment.Status == k12.GradingAssessmentProcessIssue {
-			writeCanonicalProcessIssueDetails(&out, entry.assessment.ResultJSON)
-		} else if details, status, ok := RenderCanonicalGradingAssessmentDetails(
-			entry.assessment.ResultJSON,
-		); ok && string(status) == string(entry.assessment.Status) && details != "" {
-			out.WriteString(details)
+			if question := strings.TrimSpace(entry.question.CanonicalMarkdown); question != "" &&
+				(entry.assessment == nil || entry.assessment.Status != k12.GradingAssessmentProcessIssue) {
+				out.WriteString(question)
+				out.WriteString("\n\n")
+			}
+			if entry.skip != nil {
+				out.WriteString("**已跳过 · 未判断对错**\n\n")
+				continue
+			}
+			out.WriteString("**批改状态：** ")
+			out.WriteString(gradingAssessmentParentStatus(entry.assessment.Status))
 			out.WriteString("\n\n")
+			if entry.assessment.Status == k12.GradingAssessmentProcessIssue {
+				writeCanonicalProcessIssueDetails(&out, entry.assessment.ResultJSON)
+			} else if details, status, ok := RenderCanonicalGradingAssessmentDetails(
+				entry.assessment.ResultJSON,
+			); ok && string(status) == string(entry.assessment.Status) && details != "" {
+				out.WriteString(details)
+				out.WriteString("\n\n")
+			}
 		}
 	}
 	if correctCount > 0 {

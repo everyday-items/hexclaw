@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
@@ -41,8 +43,8 @@ type WorkFeedbackOutput struct {
 
 // WorkFeedbackGenerator 是作品点评生成的可选 Skill Executor 扩展 port（与
 // CauseSummarizer 同纪律：由 Solver 实现发现，未实现即诚实报错，不留假点评）。
-// 输出契约（INV-011）：只点评不打分不代写——写作为好句摘出 + 一处具体建议，美术为
-// 观察描述式点评；含分数/等第/代写成文的输出由用例层拒绝入库。
+// 写作反馈提供原稿观察、家长参考稿与修改讲法，美术反馈依据可见画面。
+// 评分与替换原画的输出由用例层拒绝入库，参考文本不覆盖孩子原稿。
 type WorkFeedbackGenerator interface {
 	GenerateWorkFeedback(ctx context.Context, req WorkFeedbackRequest) (WorkFeedbackOutput, error)
 }
@@ -120,7 +122,14 @@ func (d Deps) GenerateWorkFeedback(ctx context.Context, agentName, recordID stri
 func (d Deps) GenerateWorkFeedbackCommand(
 	ctx context.Context,
 	agentName, recordID, commandKey string,
-) (CreativeWorkView, error) {
+) (feedbackView CreativeWorkView, feedbackErr error) {
+	startedAt := time.Now()
+	generationID := ""
+	slog.Info("K12 work feedback command started", "agent_id", agentName, "work_id", recordID)
+	defer func() {
+		slog.Info("K12 work feedback command finished", "agent_id", agentName, "work_id", recordID,
+			"generation_id", generationID, "elapsed_ms", time.Since(startedAt).Milliseconds(), "error", feedbackErr)
+	}()
 	v, err := d.GetCreativeWork(ctx, agentName, recordID)
 	if err != nil {
 		return CreativeWorkView{}, err
@@ -180,14 +189,24 @@ func (d Deps) GenerateWorkFeedbackCommand(
 			req.Grade = p.GradeTerm
 		}
 	}
+	now := time.Now().Unix()
+	if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
+		now = window.NowAt
+	}
 	generation, _, err := d.Records.PrepareWorkFeedbackGeneration(
-		ctx, agentName, recordID, commandKey, digestJSON(req),
+		ctx, agentName, recordID, commandKey, digestJSON(req), now,
 	)
+	generationID = generation.GenerationID
+	slog.Info("K12 work feedback generation prepared", "agent_id", agentName, "work_id", recordID,
+		"generation_id", generationID, "status", generation.Status, "error", err)
 	if err != nil {
 		return CreativeWorkView{}, err
 	}
 	if generation.Status == k12.WorkFeedbackSucceeded {
 		return d.GetCreativeWork(ctx, agentName, recordID)
+	}
+	if generation.Status == k12.WorkFeedbackFailed {
+		return CreativeWorkView{}, fmt.Errorf("%w: %s", ErrSolveFailed, generation.FailureReason)
 	}
 	generation, err = d.Records.MarkWorkFeedbackGenerationRunning(
 		ctx, agentName, generation.GenerationID,
@@ -222,14 +241,27 @@ func (d Deps) GenerateWorkFeedbackCommand(
 		providerCtx := ctx
 		if invocation != nil {
 			now := time.Now().Unix()
-			if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
+			window, hasAutomaticWindow := imageTaskAutomaticWindowFromContext(ctx)
+			if hasAutomaticWindow {
 				now = window.NowAt
 			}
+			claimStartedAt := time.Now()
+			slog.Info("K12 work feedback invocation claim started", "agent_id", agentName,
+				"work_id", recordID, "generation_id", generationID, "invocation_id", invocation.InvocationID,
+				"status", invocation.Status, "deadline_at", invocation.DeadlineAt, "now_at", now,
+				"automatic_window_present", hasAutomaticWindow)
 			claimedInvocation, claimed, err := d.Records.ClaimImageTaskInvocationSend(
 				ctx, agentName, invocation.InvocationID,
 				"creative-work:"+recordID+":feedback",
 				now,
 			)
+			slog.Info("K12 work feedback invocation claim finished", "agent_id", agentName,
+				"work_id", recordID, "generation_id", generationID, "invocation_id", invocation.InvocationID,
+				"claimed", claimed, "status", claimedInvocation.Status,
+				"deadline_at", invocation.DeadlineAt, "now_at", now,
+				"deadline_expired", invocation.DeadlineAt > 0 && invocation.DeadlineAt <= now,
+				"automatic_window_present", hasAutomaticWindow,
+				"elapsed_ms", time.Since(claimStartedAt).Milliseconds(), "error", err)
 			if err != nil {
 				_, _ = d.Records.FailWorkFeedbackGeneration(
 					context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
@@ -237,6 +269,19 @@ func (d Deps) GenerateWorkFeedbackCommand(
 				return CreativeWorkView{}, err
 			}
 			if !claimed {
+				if !hasAutomaticWindow && claimedInvocation.Status == k12.ImageTaskInvocationPrepared &&
+					claimedInvocation.DeadlineAt > 0 && claimedInvocation.DeadlineAt <= now {
+					count, expireErr := d.Records.ExpirePreparedWorkFeedbackGenerations(
+						context.WithoutCancel(ctx), agentName, recordID, now,
+					)
+					slog.Info("K12 work feedback expired prepared generation reconciled",
+						"agent_id", agentName, "work_id", recordID, "generation_id", generationID,
+						"invocation_id", claimedInvocation.InvocationID, "now_at", now,
+						"deadline_at", claimedInvocation.DeadlineAt, "count", count, "error", expireErr)
+					if expireErr != nil {
+						return CreativeWorkView{}, expireErr
+					}
+				}
 				if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok &&
 					window.DispatchID != "" &&
 					claimedInvocation.Status == k12.ImageTaskInvocationPrepared &&
@@ -264,8 +309,33 @@ func (d Deps) GenerateWorkFeedbackCommand(
 				invocation.RouteSnapshot,
 			)
 			defer cancelProvider()
+			if invocation.DeadlineAt > 0 {
+				var cancelDeadline context.CancelFunc
+				providerCtx, cancelDeadline = context.WithDeadline(providerCtx, time.Unix(invocation.DeadlineAt, 0))
+				defer cancelDeadline()
+			}
 		}
+		providerStartedAt := time.Now()
+		providerDeadline, hasProviderDeadline := providerCtx.Deadline()
+		var route k12.ImageTaskRouteSnapshot
+		var invocationID string
+		if invocation != nil {
+			route, invocationID = invocation.RouteSnapshot, invocation.InvocationID
+		}
+		providerCtx = logger.ContextWithLogger(providerCtx, logger.NewWithHandler(slog.Default().Handler()).With(
+			"agent_id", agentName, "work_id", recordID, "generation_id", generationID,
+			"invocation_id", invocationID, "stage", "work_feedback",
+		))
+		slog.Info("K12 work feedback provider started", "agent_id", agentName,
+			"work_id", recordID, "generation_id", generationID, "invocation_id", invocationID,
+			"provider", route.Provider, "model", route.Model, "timeout_ms", route.TimeoutMS,
+			"context_has_deadline", hasProviderDeadline, "context_deadline", providerDeadline)
 		out, err = gen.GenerateWorkFeedback(providerCtx, req)
+		slog.Info("K12 work feedback provider finished", "agent_id", agentName,
+			"work_id", recordID, "generation_id", generationID, "invocation_id", invocationID,
+			"provider", route.Provider, "model", route.Model,
+			"elapsed_ms", time.Since(providerStartedAt).Milliseconds(), "feedback_bytes", len(out.Feedback),
+			"context_error", providerCtx.Err(), "error", err)
 		if err != nil {
 			if invocation != nil {
 				unknown := sentProviderOutcomeUnknown(err, providerCtx.Err())
@@ -332,11 +402,14 @@ func (d Deps) GenerateWorkFeedbackCommand(
 			return CreativeWorkView{}, err
 		}
 	}
-	structured := buildStructuredWorkFeedback(
+	structured, err := buildStructuredWorkFeedback(
 		v.Fields.WorkType, last, feedback, k12.FeedbackSourceAI,
 		strings.TrimSpace(out.SkillStamp),
 	)
-	if err := structured.Validate(); err != nil {
+	if err == nil {
+		err = structured.Validate()
+	}
+	if err != nil {
 		_, _ = d.Records.FailWorkFeedbackGeneration(
 			context.WithoutCancel(ctx), agentName, generation.GenerationID, err.Error(),
 		)
@@ -420,6 +493,14 @@ func (d Deps) prepareWorkFeedbackInvocation(
 	operationKey := "work:" + work.Record.RecordID + ":version:" +
 		version.VersionID + ":feedback"
 	requestDigest := digestJSON(req)
+	preparedAt := time.Now()
+	deadlineAt := preparedAt.Add(time.Duration(k12.ImageTaskAutomaticBudgetSeconds) * time.Second).Unix()
+	if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
+		deadlineAt = min(deadlineAt, window.DeadlineAt)
+	}
+	if callerDeadline, ok := ctx.Deadline(); ok {
+		deadlineAt = min(deadlineAt, callerDeadline.Unix())
+	}
 	prior, err := d.Records.GetLatestWorkFeedbackInvocation(
 		ctx, work.Record.AgentName, work.Record.RecordID, operationKey,
 	)
@@ -445,10 +526,10 @@ func (d Deps) prepareWorkFeedbackInvocation(
 			Operation:    k12.ImageTaskOperationWorkFeedback,
 			OperationKey: prior.OperationKey, RequestDigest: prior.RequestDigest,
 			RouteSnapshot: prior.RouteSnapshot, Status: k12.ImageTaskInvocationPrepared,
-			Attempt: prior.Attempt + 1,
+			Attempt: prior.Attempt + 1, DeadlineAt: deadlineAt,
 		}
-		if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
-			next.DeadlineAt = window.DeadlineAt
+		if prior.RouteSnapshot.TimeoutMS > 0 {
+			next.DeadlineAt = min(next.DeadlineAt, preparedAt.Add(time.Duration(prior.RouteSnapshot.TimeoutMS)*time.Millisecond).Unix())
 		}
 		prepared, _, prepareErr := d.Records.PrepareImageTaskInvocation(ctx, next)
 		return &prepared, nil, prepareErr
@@ -480,9 +561,10 @@ func (d Deps) prepareWorkFeedbackInvocation(
 		Operation:    k12.ImageTaskOperationWorkFeedback,
 		OperationKey: operationKey, RequestDigest: requestDigest,
 		RouteSnapshot: route, Status: k12.ImageTaskInvocationPrepared, Attempt: 1,
+		DeadlineAt: deadlineAt,
 	}
-	if window, ok := imageTaskAutomaticWindowFromContext(ctx); ok {
-		invocation.DeadlineAt = window.DeadlineAt
+	if route.TimeoutMS > 0 {
+		invocation.DeadlineAt = min(invocation.DeadlineAt, preparedAt.Add(time.Duration(route.TimeoutMS)*time.Millisecond).Unix())
 	}
 	prepared, _, err := d.Records.PrepareImageTaskInvocation(ctx, invocation)
 	return &prepared, nil, err
@@ -507,11 +589,11 @@ var scorePattern = regexp.MustCompile(`[0-9０-９]+(\.[0-9]+)?\s*分`)
 // scoreOutOfPattern 命中“85/100”类比值打分。
 var scoreOutOfPattern = regexp.MustCompile(`[0-9]+\s*/\s*(10|100)\b`)
 
-// 打分/等第/代写的关键词黑名单（INV-011 从紧口径：宁可错拒重生成，不放假点评入库）。
+// 评分与替换原画的关键词边界；参考稿不作为违规判据。
 var (
-	scoreWords = []string{"打分", "评分", "得分", "满分", "总分", "计分", "评级", "评等", "排名", "名次"}
-	rankWords  = []string{"等第", "甲等", "乙等", "丙等", "优等", "次等", "不及格", "及格线"}
-	ghostWords = []string{"范文", "代写", "帮你写", "替你写", "替他写", "改写全文", "重写全文", "全文如下", "修改后的作文", "示范作文", "我来重画", "替孩子重画"}
+	scoreWords  = []string{"打分", "评分", "得分", "满分", "总分", "计分", "评级", "评等", "排名", "名次"}
+	rankWords   = []string{"等第", "甲等", "乙等", "丙等", "优等", "次等", "不及格", "及格线"}
+	redrawWords = []string{"我来重画", "替孩子重画"}
 )
 
 // WorkFeedbackRedlineViolation 是 workFeedbackInvariantViolation 的导出别名，
@@ -521,7 +603,7 @@ func WorkFeedbackRedlineViolation(feedback string) string {
 	return workFeedbackInvariantViolation(feedback)
 }
 
-// workFeedbackInvariantViolation 检查生成点评是否违反 INV-011（只点评不打分不代写）。
+// workFeedbackInvariantViolation 检查延期点评、评分与替换原画的边界。
 // 返回非空原因即违规。关键词/模式为确定性契约（契约测试钉死），不依赖模型自律。
 func workFeedbackInvariantViolation(feedback string) string {
 	for _, marker := range []string{
@@ -545,9 +627,9 @@ func workFeedbackInvariantViolation(feedback string) string {
 			return "出现等第口径「" + w + "」"
 		}
 	}
-	for _, w := range ghostWords {
+	for _, w := range redrawWords {
 		if strings.Contains(feedback, w) {
-			return "出现代写口径「" + w + "」"
+			return "artwork redraw request: " + w
 		}
 	}
 	// “数字+分”视为打分，但“10 分钟”这类时长表述放行（分后紧跟“钟”）。

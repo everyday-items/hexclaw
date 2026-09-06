@@ -197,7 +197,7 @@ func TestGradeHomeworkPhotoBlankWorksheetRejectsIncompleteGenericGuide(t *testin
 	}
 }
 
-func TestGradeHomeworkPhotoCompletedHomeworkKeepsBlankItemsUnanswered(t *testing.T) {
+func TestGradeHomeworkPhotoCompletedHomeworkSolvesBlankItemsForParent(t *testing.T) {
 	d, _ := newPipeline(t, blankWorksheetSolver{}, fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil)
 	generator := &parentTeachingGuideSpy{}
 	d.ParentTeachingGuide = generator
@@ -217,14 +217,14 @@ func TestGradeHomeworkPhotoCompletedHomeworkKeepsBlankItemsUnanswered(t *testing
 	}
 	if len(got.Items) != 2 ||
 		got.Items[0].ResultKind != PhotoItemAssessment ||
-		got.Items[1].Status != PhotoUnanswered ||
-		got.Items[1].ResultKind != PhotoItemUnanswered ||
-		got.Items[1].ParentGuide != nil ||
-		got.Items[1].Solve.Solution != "" {
-		t.Fatalf("mixed completed-homework routing leaked a blank-item solution: %#v", got.Items)
+		got.Items[1].Status != PhotoBlankSolved ||
+		got.Items[1].ResultKind != PhotoItemParentTeachingGuide ||
+		got.Items[1].ParentGuide == nil ||
+		got.Items[1].Solve.Solution == "" || got.Items[1].Grade.RecordCreated {
+		t.Fatalf("mixed completed-homework must solve blanks without grading them: %#v", got.Items)
 	}
 	if calls := generator.snapshot(); len(calls) != 0 {
-		t.Fatalf("completed homework must not generate parent answers for blank items: %#v", calls)
+		t.Fatalf("verified arithmetic must use the local parent guide without another provider call: %#v", calls)
 	}
 }
 

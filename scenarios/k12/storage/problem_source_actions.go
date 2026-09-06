@@ -1162,7 +1162,7 @@ func buildProblemSourceProgressiveSnapshot(
 ) (ProblemSourceProgressiveSnapshot, error) {
 	rows, err := q.QueryContext(ctx, `
 		SELECT p.problem_id,sm.input_revision,p.confirmation_required,
-		       ir.page_asset_id,ir.source_region_json,
+		       COALESCE(ir.page_asset_id,p.page_asset_id),ir.source_region_json,
 		       COALESCE(pa.pixel_width,0),COALESCE(pa.pixel_height,0)
 		FROM k12_problem_structure_snapshots ss
 		JOIN k12_problem_structure_members sm
@@ -1173,7 +1173,7 @@ func buildProblemSourceProgressiveSnapshot(
 		  ON p.agent_name=sm.agent_name
 		 AND p.submission_id=sm.submission_id
 		 AND p.problem_id=sm.problem_id
-		JOIN k12_problem_input_revisions ir
+		LEFT JOIN k12_problem_input_revisions ir
 		  ON ir.agent_name=sm.agent_name
 		 AND ir.submission_id=sm.submission_id
 		 AND ir.structure_version=sm.structure_version
@@ -1181,8 +1181,8 @@ func buildProblemSourceProgressiveSnapshot(
 		 AND ir.input_revision=sm.input_revision
 		 AND ir.current_disposition='current'
 		LEFT JOIN k12_page_assets pa
-		  ON pa.agent_name=ir.agent_name
-		 AND pa.page_asset_id=ir.page_asset_id
+		  ON pa.agent_name=p.agent_name
+		 AND pa.page_asset_id=COALESCE(ir.page_asset_id,p.page_asset_id)
 		 AND pa.storage_state='ready'
 		WHERE ss.agent_name=? AND ss.submission_id=?
 		  AND ss.structure_version=? AND ss.current_disposition='current'

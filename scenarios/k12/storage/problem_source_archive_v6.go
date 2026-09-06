@@ -2180,7 +2180,8 @@ func validateProblemSourceArchiveSummaryResult(
 		summary.Sections[1].SourceLabel != "🧠 学情信号" {
 		return fmt.Errorf("typed summary learning-evidence contract changed")
 	}
-	if strings.TrimSpace(summary.Sections[2].Title) != "每道题怎么带（不直接给答案）" ||
+	if (strings.TrimSpace(summary.Sections[2].Title) != "每道题的答案与讲法" &&
+		strings.TrimSpace(summary.Sections[2].Title) != "每道题怎么带（不直接给答案）") ||
 		summary.Sections[2].SourceLabel != "🤖 AI 归纳·供参考" {
 		return fmt.Errorf("typed summary per-problem contract changed")
 	}

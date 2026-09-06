@@ -14,6 +14,7 @@ import (
 
 func TestTextbookCatalogCheckpointExtractorUsesTOCAndPrintedFooterProof(t *testing.T) {
 	source := syntheticTextbookCatalogSource()
+	source.DocumentTitle = "五年级下册-数学-冒烟0905.pdf"
 
 	publication, err := (TextbookCatalogCheckpointExtractor{}).Extract(
 		context.Background(), source,
@@ -42,7 +43,7 @@ func TestTextbookCatalogCheckpointExtractorUsesTOCAndPrintedFooterProof(t *testi
 		t.Fatal(err)
 	}
 	if catalog.TextbookEdition != "人教版" || catalog.TextbookVersion != "2022" ||
-		catalog.Title != "义务教育教科书·数学五年级下册" || catalog.Volume != "下册" {
+		catalog.Title != "五年级下册-数学-冒烟0905" || catalog.Volume != "下册" {
 		t.Fatalf("catalog metadata was not derived from exact evidence: %+v", catalog)
 	}
 	if catalog.PageMin != 1 || catalog.PageMax != 3 || len(catalog.Units) != 2 {
@@ -93,7 +94,7 @@ func TestTextbookCatalogCheckpointExtractorPrefersCurrentApprovalYearAcrossPDFLi
 
 func TestTextbookCatalogCheckpointExtractorAcceptsUnicodeTOCWhitespace(t *testing.T) {
 	source := syntheticTextbookCatalogSource()
-	source.Pages[1].Content = "目 录\n1　观察物体（三）　1\n2　因数和倍数　2\n"
+	source.Pages[1].Content = "目 录\n1. **观察物体（三）**　1\n2. **因数和倍数**　2\n"
 	source.Pages[1].ContentDigest = testTextbookContentDigest(source.Pages[1].Content)
 	publication, err := (TextbookCatalogCheckpointExtractor{}).Extract(
 		context.Background(), source,

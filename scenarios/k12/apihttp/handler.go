@@ -1333,9 +1333,9 @@ func (h *handler) export(w http.ResponseWriter, r *http.Request) {
 			name = p.ChildName + "_学习档案_" + p.GradeTerm + "." + format
 		}
 	}
-	// filename* 携带 RFC 5987 UTF-8 编码，兼容非 ASCII 称呼；filename 保留原文供现代客户端。
+	// filename* 携带 RFC 5987 UTF-8 原名；filename 使用 ASCII 回退以兼容原生响应头。
 	w.Header().Set("Content-Disposition",
-		"attachment; filename=\""+name+"\"; filename*=UTF-8''"+url.PathEscape(name))
+		"attachment; filename=\"mistakes."+format+"\"; filename*=UTF-8''"+url.PathEscape(name))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -1434,13 +1434,12 @@ func (h *handler) mistakeSheet(w http.ResponseWriter, r *http.Request) {
 }
 
 type tutorTurnReq struct {
-	// BUG-3：agent 必填、grade 可选（前端契约）——PRD §3.3.3 + AP-4「年级来自孩子档案确定性
-	// 注入」：省略 grade 时后端据 agent 从档案取生效年级，供阶段三 solve 携带年级边界。
+	// agent 必填；省略 grade 时从孩子档案取生效年级，供求解链携带年级边界。
 	Agent         string `json:"agent"`
-	PriorStage    int    `json:"prior_stage"`    // 上一轮阶段（0 起于阶段一）
-	ParentMessage string `json:"parent_message"` // 家长本轮消息（升级/情绪/作答信号）
+	PriorStage    int    `json:"prior_stage"`    // 历史阶段兼容字段
+	ParentMessage string `json:"parent_message"` // 家长本轮消息
 	StudentAnswer string `json:"student_answer"` // 家长转述的孩子作答（可空）
-	Problem       string `json:"problem"`        // 题目（阶段三取验算解用）
+	Problem       string `json:"problem"`        // 自动求解并验算的题目
 	Grade         string `json:"grade"`          // 生效年级
 }
 
@@ -1450,12 +1449,11 @@ type tutorTurnResp struct {
 	EmotionCue string `json:"emotion_cue,omitempty"`
 	Escalated  bool   `json:"escalated"`
 	PromptHint string `json:"prompt_hint"`
-	Solution   string `json:"solution,omitempty"` // 阶段三验算解
-	Badge      string `json:"badge,omitempty"`    // 阶段三验算徽章
+	Solution   string `json:"solution,omitempty"` // 完整验算解
+	Badge      string `json:"badge,omitempty"`    // 验算徽章
 }
 
-// tutorTurn POST /tutor-turn —— 渐进提示三阶段 + 情绪守门编排（PRD §3.3.4）。
-// 返回分阶段指令（供上游注入 LLM 生成话术）；阶段三附带验算过的完整解。
+// tutorTurn 自动返回家长讲题指令与验算过的完整解。
 func (h *handler) tutorTurn(w http.ResponseWriter, r *http.Request) {
 	var req tutorTurnReq
 	if !decode(w, r, &req) {
@@ -1473,8 +1471,7 @@ func (h *handler) tutorTurn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d := res.Directive
-	// 徽章仅阶段三给（有验算解时）——阶段一二无解、Evidence 为零值，Badge() 会返回
-	// "unverifiable" 非空串，前端契约标注 badge 仅阶段三，无条件下发会让方向提示阶段误显徽章。
+	// 只有取得解答时才展示对应验算徽章。
 	badge := ""
 	if res.Solution != "" {
 		badge = res.Evidence.Badge()

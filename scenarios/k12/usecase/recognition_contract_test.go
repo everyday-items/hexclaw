@@ -26,9 +26,12 @@ func TestEvaluateOCRConfirmationRisk_Table(t *testing.T) {
 		{
 			name: "clear high confidence fraction auto freezes",
 			q: RecognizedQuestion{
-				Question: `计算 \frac{3}{5}+\frac{1}{5}`, Subject: "数学",
-				RecognitionConfidence: float64Ptr(0.99),
-				OCRSignals:            []string{"fraction"},
+				Question: "0.25＋11/15＋4/15＋3/4", Subject: "数学",
+				RecognitionConfidence:  float64Ptr(0.99),
+				OCRSignals:             []string{"fraction"},
+				EvidenceTranscriptions: []string{"0.25", "11/15", "4/15", "3/4"},
+				AnswerState:            AnswerStatePresent, StudentAnswer: "=0.25+1+0.75\n=2",
+				AnswerEvidenceTranscriptions: []string{"=0.25+1+0.75", "=2"},
 			},
 		},
 		{
@@ -50,8 +53,10 @@ func TestEvaluateOCRConfirmationRisk_Table(t *testing.T) {
 		{
 			name: "stale format only reasons are discarded on reevaluation",
 			q: RecognizedQuestion{
-				Question: "(-3)÷0.5= -6 cm", Subject: "数学",
+				Question: "15.02－6.8－1.02", Subject: "数学",
 				RecognitionConfidence: float64Ptr(0.99),
+				AnswerState:           AnswerStatePresent, StudentAnswer: "14－6.8＝7.2",
+				AnswerEvidenceTranscriptions: []string{"＝14－6.8", "＝7.2"},
 				ConfirmationReasons: []OCRRiskReason{
 					OCRRiskFraction,
 					OCRRiskDecimalPoint,
@@ -113,6 +118,106 @@ func TestEvaluateOCRConfirmationRisk_Table(t *testing.T) {
 			}
 			if got.ConfirmationRequired != (len(tt.want) > 0) {
 				t.Fatalf("confirmation_required = %v, want %v", got.ConfirmationRequired, len(tt.want) > 0)
+			}
+			if tt.name == "independent observations disagree" {
+				roles := RecognizedQuestion{
+					RawTranscription:       "在下列六个数：5、6、12、14、23、29中，划去数（ ）后，能使其中3个数的和为另外2个数和的2倍。",
+					AnswerRawTranscription: "划去：29\n因为：5+23+14=42\n6+12=18\n42=18×2",
+					AnswerState:            AnswerStatePresent, Subject: "数学", RecognitionConfidence: float64Ptr(0.99),
+					AnswerEvidenceTranscriptions: []string{"划去：29", "因为：5+23+14=42", "6+12=18", "42=18×2"},
+				}
+				roles.CanonicalMarkdown = roles.RawTranscription
+				roles.AnswerCanonicalMarkdown = roles.AnswerRawTranscription
+				roles.EvidenceTranscriptions = []string{"印刷体：" + roles.RawTranscription, "手写：划去：29；因为：5+23+14=42；6+12=18；42=18×2。"}
+				matched := EvaluateOCRConfirmationRisk(roles)
+				if matched.ConfirmationRequired {
+					t.Errorf("full printed question and handwritten answer must match their normalized roles: %v", matched.ConfirmationReasons)
+				}
+				if matched.RawTranscription != roles.RawTranscription || matched.AnswerRawTranscription != roles.AnswerRawTranscription ||
+					matched.CanonicalMarkdown != roles.CanonicalMarkdown || matched.AnswerCanonicalMarkdown != roles.AnswerCanonicalMarkdown ||
+					!reflect.DeepEqual(matched.EvidenceTranscriptions, roles.EvidenceTranscriptions) ||
+					!reflect.DeepEqual(matched.AnswerEvidenceTranscriptions, roles.AnswerEvidenceTranscriptions) {
+					t.Error("role comparison must preserve all raw evidence bytes")
+				}
+				changed := roles
+				changed.EvidenceTranscriptions = append(append([]string{}, roles.EvidenceTranscriptions...), roles.EvidenceTranscriptions[0])
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("a third evidence entry must not be accepted as the two-role envelope")
+				}
+				changed.EvidenceTranscriptions = []string{roles.EvidenceTranscriptions[0], roles.EvidenceTranscriptions[0]}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("duplicate evidence roles must remain conflicting")
+				}
+				changed.EvidenceTranscriptions = []string{"不是：" + roles.RawTranscription, roles.EvidenceTranscriptions[1]}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("an unapproved or negated prefix must remain conflicting")
+				}
+				changed.EvidenceTranscriptions = []string{roles.EvidenceTranscriptions[0] + "另有条件", roles.EvidenceTranscriptions[1]}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("additional question content must remain conflicting")
+				}
+				changed.EvidenceTranscriptions = []string{roles.EvidenceTranscriptions[0], strings.Replace(roles.EvidenceTranscriptions[1], "42=18×2", "42=21×2", 1)}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("a different handwritten value must remain conflicting")
+				}
+				changed.EvidenceTranscriptions = []string{roles.EvidenceTranscriptions[0], strings.Replace(roles.EvidenceTranscriptions[1], "42=18×2", "42=18+2", 1)}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("a different handwritten operator must remain conflicting")
+				}
+				changed = roles
+				changed.AnswerEvidenceTranscriptions = []string{"划去：29", "因为：5+23+14=42", "6+12=18", "42=21×2"}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("matching roles must not bypass conflicting answer evidence")
+				}
+				changed = roles
+				changed.OCRSignals = []string{"evidence_conflict"}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Error("matching roles must not bypass an independent OCR conflict signal")
+				}
+			}
+			if tt.name == "clear high confidence fraction auto freezes" {
+				changed := tt.q
+				changed.EvidenceTranscriptions = []string{"0.25", "11/15", "7/15", "3/4"}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Fatal("changed numeric evidence must remain conflicting")
+				}
+				changed.EvidenceTranscriptions = []string{"0.25", "4/15", "11/15", "3/4"}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Fatal("reordered evidence must remain conflicting")
+				}
+				changed.EvidenceTranscriptions = []string{tt.q.Question, "0.25－11/15＋4/15＋3/4"}
+				if !EvaluateOCRConfirmationRisk(changed).ConfirmationRequired {
+					t.Fatal("different full-expression operators must remain conflicting")
+				}
+				if evidenceTranscriptionsConflict(`= 8.7 × (17.4 − 7.4)\n= 8.7 × 10\n= 87`,
+					[]string{"= 8.7 × (17.4 − 7.4)", "= 8.7 × 10", "= 87"}, "") {
+					t.Error("literal newline serialization must not conflict with separate decimal steps")
+				}
+				if evidenceTranscriptionsConflict(`= 15.02 − 1.02 − 6.8\n= 14 − 6.8\n= 7.2`,
+					[]string{"= 15.02 − 1.02 − 6.8", "= 14 − 6.8", "= 7.2"}, "") {
+					t.Error("literal newline serialization must preserve the full subtraction chain")
+				}
+				if evidenceTranscriptionsConflict(`= 0.25 + (\frac{11}{15} + \frac{4}{15}) + \frac{3}{4}\n= 0.25 + \frac{15}{15} + \frac{3}{4}\n= 0.25 + 1 + 0.75\n= 2`,
+					[]string{"= 0.25 + (11/15 + 4/15) + 3/4", "= 0.25 + 15/15 + 3/4", "= 0.25 + 1 + 0.75", "= 2"}, "") {
+					t.Error("literal newlines and numeric fraction notation must compare equally")
+				}
+				if evidenceTranscriptionsConflict("24 ÷ \\(\\frac{3}{8}\\) = 24 × \\(\\frac{8}{3}\\) = 64\n答：这个数是64。",
+					[]string{"24 ÷ 3/8 = 24 × 8/3 = 64", "答：这个数是64。"}, "") {
+					t.Error("LaTeX wrappers must not conflict with the same visible fraction chain")
+				}
+				if evidenceTranscriptionsConflict("8 × \\(\\frac{1}{4}\\) × \\(\\frac{4}{5}\\) = 2 × \\(\\frac{4}{5}\\) = \\(\\frac{8}{5}\\) = 1\\(\\frac{3}{5}\\)\n答：是1\\(\\frac{3}{5}\\)。",
+					[]string{"8 × 1/4 × 4/5 = 2 × 4/5 = 8/5 = 1 3/5", "答：是1 3/5。"}, "") {
+					t.Error("mixed-number notation must retain the integer and fractional parts")
+				}
+				if !evidenceTranscriptionsConflict(`1\frac{3}{5}=\frac{8}{5}`, []string{"13/5", "=8/5"}, "") {
+					t.Error("mixed number 1 3/5 must not become fraction 13/5")
+				}
+				if !evidenceTranscriptionsConflict("1/(2+3)=0.2", []string{"1/2+3", "=0.2"}, "") {
+					t.Error("grouping parentheses must not be discarded")
+				}
+				if evidenceTranscriptionsConflict(`1\neq2`, []string{"1", "≠2"}, "") {
+					t.Error("LaTeX inequality must not be decoded as a newline")
+				}
 			}
 		})
 	}
@@ -261,24 +366,24 @@ func TestDD041_UnnumberedSectionItemsReceiveOnlyServerDerivedSystemOrder(t *test
 		},
 		{
 			ProblemKind:        ProblemKindStandalone,
-			SourceNumberPath:  []string{"三", "1"},
-			DisplayLabel:      "三、1",
-			SourceSectionPath: []string{"三"},
+			SourceNumberPath:   []string{"三", "1"},
+			DisplayLabel:       "三、1",
+			SourceSectionPath:  []string{"三"},
 			SourceSectionLabel: "三、列式计算",
-			Question:          "3/8 是 24",
-			Subject:           "数学",
-			AnswerState:       AnswerStateBlank,
+			Question:           "3/8 是 24",
+			Subject:            "数学",
+			AnswerState:        AnswerStateBlank,
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for index, want := range []struct {
-		sourcePath []string
-		sectionPath []string
-		sectionLabel string
+		sourcePath    []string
+		sectionPath   []string
+		sectionLabel  string
 		systemOrdinal int
-		systemLabel string
+		systemLabel   string
 	}{
 		{nil, []string{"一"}, "一、直接写得数", 1, "第 1 题（系统序号）"},
 		{nil, []string{"一"}, "一、直接写得数", 2, "第 2 题（系统序号）"},

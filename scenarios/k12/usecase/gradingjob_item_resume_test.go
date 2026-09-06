@@ -310,15 +310,50 @@ func TestGradingOrchestratorItemResume_OutcomeUnknownDoesNotResendAfterRecovery(
 		Question: "q1", Subject: "数学", StudentAnswer: "1", AnswerState: AnswerStatePresent,
 	}}, solver, grader)
 	jobID := runItemResumeJobToAssessing(t, o1, "item-resume-unknown")
-
-	unknown, err := o1.ConfirmAndRun(context.Background(), jobID, nil)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("unknown provider call err=%v, want deadline exceeded", err)
+	ctx := context.Background()
+	run := o1.lookup(jobID)
+	run.req.TaskIntent = PhotoTaskCompletedHomework
+	job, err := o1.deps.GetGradingJob(ctx, run.agentName, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o1.markGradingOutcomeUnknown(ctx, run, jobID, "item_invocation_outcome_unknown"); err == nil {
+		t.Fatal("人工等待没有已执行调用时不得进入 outcome_unknown")
+	}
+	lock := o1.jobLock(jobID)
+	lock.Lock()
+	assessErr := o1.assessClearWorksheetQuestions(ctx, run, job)
+	lock.Unlock()
+	if !errors.Is(assessErr, context.DeadlineExceeded) {
+		t.Fatalf("unknown provider call err=%v, want deadline exceeded", assessErr)
+	}
+	if _, err := o1.markGradingOutcomeUnknown(ctx, run, jobID, "provider_timeout"); err == nil {
+		t.Fatal("人工等待不得由普通自动阶段超时推进")
+	}
+	unknown, err := o1.markGradingOutcomeUnknown(ctx, run, jobID, "item_invocation_outcome_unknown")
+	if err != nil {
+		t.Fatalf("park partial assessment: %v", err)
 	}
 	if unknown.Record.Status != k12.GradingStageOutcomeUnknown || unknown.Fields.Retryable {
 		t.Fatalf("unknown call must stop without retry: stage=%s fields=%+v", unknown.Record.Status, unknown.Fields)
 	}
-	assertAssessStageInvocationStatuses(t, o1, jobID, k12.ModelInvocationOutcomeUnknown)
+	if unknown.Fields.FailedStage != k12.GradingStageAwaitingConfirmation ||
+		unknown.Fields.FailureKind != "item_invocation_outcome_unknown" || unknown.Fields.Deadline != 0 {
+		t.Fatalf("partial assessment failure facts changed: %+v", unknown.Fields)
+	}
+	invocations, err := o1.deps.Records.ListGradingItemInvocations(ctx, run.agentName, jobID)
+	unknownReceipts := 0
+	for _, invocation := range invocations {
+		if invocation.Status == k12.ModelInvocationOutcomeUnknown {
+			unknownReceipts++
+		}
+	}
+	if err != nil || len(invocations) != 2 || unknownReceipts != 1 {
+		t.Fatalf("partial item receipts: invocations=%+v err=%v", invocations, err)
+	}
+	if _, err := o1.RetryAndRun(ctx, jobID); err == nil {
+		t.Fatal("ordinary retry must reject an ambiguous partial assessment")
+	}
 
 	o2 := trackGradingOrchestrator(t, NewGradingOrchestrator(o1.deps, orchestratorSnapshotResolver,
 		WithGradingRunDir(runDir)))

@@ -586,7 +586,7 @@ func tutoringTipsPerProblem(problems []TutoringTipsProblem) TutoringTipsSection 
 		}
 	}
 	return TutoringTipsSection{
-		Title: "每道题怎么带（不直接给答案）", Content: strings.TrimSpace(content.String()),
+		Title: "每道题的答案与讲法", Content: strings.TrimSpace(content.String()),
 		SourceLabel: TutoringTipsSourceAI,
 	}
 }

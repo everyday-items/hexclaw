@@ -87,6 +87,10 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			if !preProblemSource.IsEmpty() {
 				snapshot.ProblemSource = &preProblemSource
 			}
+			snapshot.CurrentCreativeWorks, err = a.records.ExportCreativeWorksArchiveV7Tx(ctx, tx, plan.TargetAgent)
+			if err != nil {
+				return fmt.Errorf("snapshot current creative works: %w", err)
+			}
 			recordAssets, err := usecase.PackHexbakAssets(plan.TargetAgent, preRecords)
 			if err != nil {
 				return fmt.Errorf("pack pre-restore snapshot assets: %w", err)
@@ -101,8 +105,12 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			if err != nil {
 				return fmt.Errorf("pack pre-restore snapshot source PageAssets: %w", err)
 			}
+			currentAssets, err := usecase.PackHexbakCurrentCreativeAssets(plan.TargetAgent, snapshot.CurrentCreativeWorks)
+			if err != nil {
+				return err
+			}
 			snapshot.Assets, err = usecase.MergeHexbakAssets(
-				recordAssets, problemAssets, problemSourceAssets,
+				recordAssets, problemAssets, problemSourceAssets, currentAssets,
 			)
 			if err != nil {
 				return fmt.Errorf("merge pre-restore snapshot assets: %w", err)
@@ -162,6 +170,9 @@ func (a *ArchiveRestoreAdapter) RestoreArchiveAs(
 			}
 			if err := a.records.ImportAgentRecordsTx(ctx, tx, plan.TargetAgent, migrated.Records); err != nil {
 				return fmt.Errorf("merge owner-rewritten records: %w", err)
+			}
+			if err := a.records.ImportCreativeWorksArchiveV7Tx(ctx, tx, plan.TargetAgent, migrated.CurrentCreativeWorks); err != nil {
+				return fmt.Errorf("restore migrated current creative works: %w", err)
 			}
 			if err := a.records.ImportProblemAttemptSnapshotsTx(
 				ctx, tx, plan.TargetAgent, migrated.ProblemAttempts,
@@ -306,6 +317,27 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 			if err != nil {
 				return rollbackFailure(fmt.Errorf("snapshot current problem-source state: %w", err), nil)
 			}
+			beforeCreative, err := a.records.ExportCreativeWorksArchiveV7Tx(ctx, tx, req.TargetAgent)
+			if err != nil {
+				return rollbackFailure(err, nil)
+			}
+			invocations := map[string]k12.ImageTaskInvocation{}
+			for _, works := range [][]k12storage.CreativeWorkArchiveV7{current.Snapshot.CurrentCreativeWorks, migrated.CurrentCreativeWorks} {
+				for _, work := range works {
+					for _, invocation := range work.Invocations {
+						invocations[invocation.InvocationID] = invocation
+					}
+				}
+			}
+			for _, work := range beforeCreative {
+				for _, invocation := range work.Invocations {
+					prior, found := invocations[invocation.InvocationID]
+					// 回退不能删除迁移之后已经发出的新调用或更晚的结果事实。
+					if invocation.Status != k12.ImageTaskInvocationPrepared && (!found || prior.Status != invocation.Status || prior.ResultDigest != invocation.ResultDigest) {
+						return rollbackFailure(fmt.Errorf("%w: creative invocation advanced after restore", records.ErrVersionConflict), nil)
+					}
+				}
+			}
 			if err := a.records.DeleteProblemSourceArchiveV6Tx(
 				ctx, tx, req.TargetAgent,
 			); err != nil {
@@ -313,6 +345,9 @@ func (a *ArchiveRestoreAdapter) RollbackRestoreAs(
 			}
 			if err := a.records.ReplaceAgentRecordsTx(ctx, tx, req.TargetAgent, current.Snapshot.Records); err != nil {
 				return rollbackFailure(fmt.Errorf("restore pre-migration records: %w", err), nil)
+			}
+			if err := a.records.ImportCreativeWorksArchiveV7Tx(ctx, tx, req.TargetAgent, current.Snapshot.CurrentCreativeWorks); err != nil {
+				return rollbackFailure(fmt.Errorf("restore current creative snapshot: %w", err), nil)
 			}
 			if err := a.records.ReplaceProblemAttemptSnapshotsTx(
 				ctx, tx, req.TargetAgent, current.Snapshot.ProblemAttempts,

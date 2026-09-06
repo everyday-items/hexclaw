@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const TextbookCatalogExtractorContract = "checkpoint-toc-footer-v2"
+const TextbookCatalogExtractorContract = "checkpoint-toc-footer-v3"
 
 var ErrTextbookCatalogSourceIncomplete = errors.New("textbook catalog source evidence incomplete")
 

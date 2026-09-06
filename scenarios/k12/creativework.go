@@ -157,6 +157,9 @@ type WorkFeedback struct {
 	SourceSnapshot     WorkFeedbackSourceSnapshot `json:"source_snapshot"`
 	Limitations        string                     `json:"limitations"`
 	Suggestions        []string                   `json:"suggestions"`
+	Affirmation        string                     `json:"affirmation,omitempty"`
+	ParentGuidance     string                     `json:"parent_guidance,omitempty"`
+	NextStep           string                     `json:"next_step,omitempty"`
 	ProjectionMarkdown string                     `json:"projection_markdown"`
 }
 
@@ -229,6 +232,17 @@ func validateWorkFeedbackAtoms(feedback WorkFeedback) error {
 			return err
 		}
 	}
+	parentAtoms := []string{feedback.Affirmation, feedback.NextStep}
+	if feedback.FeedbackType != WorkTypeWriting {
+		parentAtoms = append(parentAtoms, feedback.ParentGuidance)
+	}
+	for _, value := range parentAtoms {
+		if value != "" {
+			if err := validateWorkFeedbackAtom("parent feedback", value); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -256,27 +270,34 @@ func ProjectWorkFeedbackMarkdown(feedback WorkFeedback) string {
 		fmt.Fprintf(&b, "- **%s**：%s\n", label, strings.TrimSpace(observation.Evidence))
 	}
 
-	if len(feedback.Observations) > 0 {
-		evidence := strings.TrimSpace(feedback.Observations[0].Evidence)
-		b.WriteString("\n## 先这样肯定\n\n")
-		if feedback.FeedbackType == WorkTypeArt {
-			fmt.Fprintf(&b, "可以先这样肯定孩子：“我看到了你画里的具体安排：%s”\n", evidence)
-		} else {
-			fmt.Fprintf(&b, "可以先这样肯定孩子：“我注意到了你写出的具体内容：%s”\n", evidence)
-		}
-	}
-
-	b.WriteString("\n## 家长可以这样问或讲\n\n")
-	if feedback.FeedbackType == WorkTypeArt {
-		b.WriteString("可以问孩子：“画面里你最想保留的是哪一处？为什么？”\n")
+	if feedback.Affirmation != "" || feedback.ParentGuidance != "" || feedback.NextStep != "" {
+		fmt.Fprintf(&b, "\n## 先这样肯定\n\n%s\n", strings.TrimSpace(feedback.Affirmation))
+		fmt.Fprintf(&b, "\n## 家长可以这样问或讲\n\n%s\n", strings.TrimSpace(feedback.ParentGuidance))
+		fmt.Fprintf(&b, "\n## 下一次只试一个点\n\n%s\n", strings.TrimSpace(feedback.NextStep))
 	} else {
-		b.WriteString("可以问孩子：“这篇作文里你最想保留的是哪一句或哪一段？为什么？”\n")
-	}
+		// 旧记录缺少明确角色时保持原投影，不回写或猜造新的点评事实。
+		if len(feedback.Observations) > 0 {
+			evidence := strings.TrimSpace(feedback.Observations[0].Evidence)
+			b.WriteString("\n## 先这样肯定\n\n")
+			if feedback.FeedbackType == WorkTypeArt {
+				fmt.Fprintf(&b, "可以先这样肯定孩子：“我看到了你画里的具体安排：%s”\n", evidence)
+			} else {
+				fmt.Fprintf(&b, "可以先这样肯定孩子：“我注意到了你写出的具体内容：%s”\n", evidence)
+			}
+		}
 
-	if len(feedback.Suggestions) > 0 {
-		b.WriteString("\n## 下一次只试一个点\n\n")
-		b.WriteString(strings.TrimSpace(feedback.Suggestions[0]))
-		b.WriteByte('\n')
+		b.WriteString("\n## 家长可以这样问或讲\n\n")
+		if feedback.FeedbackType == WorkTypeArt {
+			b.WriteString("可以问孩子：“画面里你最想保留的是哪一处？为什么？”\n")
+		} else {
+			b.WriteString("可以问孩子：“这篇作文里你最想保留的是哪一句或哪一段？为什么？”\n")
+		}
+
+		if len(feedback.Suggestions) > 0 {
+			b.WriteString("\n## 下一次只试一个点\n\n")
+			b.WriteString(strings.TrimSpace(feedback.Suggestions[0]))
+			b.WriteByte('\n')
+		}
 	}
 	if limitation := strings.TrimSpace(feedback.Limitations); limitation != "" {
 		b.WriteString("\n说明：")

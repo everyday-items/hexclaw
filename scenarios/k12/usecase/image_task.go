@@ -1359,6 +1359,13 @@ func (c *ImageTaskCoordinator) Run(
 				k12.ApprovedRecognizingRequestPolicy(),
 			)
 		}
+		classificationStartedAt := time.Now()
+		slog.Info("K12 ImageTask classification started", "agent_id", dispatch.AgentName,
+			"dispatch_id", dispatch.DispatchID, "invocation_id", invocation.InvocationID,
+			"provider", invocation.RouteSnapshot.Provider, "model", invocation.RouteSnapshot.Model,
+			"capability", invocation.RouteSnapshot.Capability,
+			"capability_receipt_digest", invocation.RouteSnapshot.CapabilityReceiptDigest,
+			"timeout_ms", invocation.RouteSnapshot.TimeoutMS, "images", len(images))
 		classified, classifyErr := c.Classifier.ClassifyImageTask(
 			providerCtx,
 			ImageTaskClassificationInput{
@@ -1366,6 +1373,13 @@ func (c *ImageTaskCoordinator) Run(
 			},
 		)
 		providerCtxErr := providerCtx.Err()
+		slog.Info("K12 ImageTask classification finished", "agent_id", dispatch.AgentName,
+			"dispatch_id", dispatch.DispatchID, "invocation_id", invocation.InvocationID,
+			"provider", invocation.RouteSnapshot.Provider, "model", invocation.RouteSnapshot.Model,
+			"elapsed_ms", time.Since(classificationStartedAt).Milliseconds(), "intent", classified.Intent,
+			"confidence", classified.Confidence, "confirmation_candidates", classified.ConfirmationCandidates,
+			"capability_unverified", errors.Is(classifyErr, k12.ErrModelCapabilityUnverified),
+			"context_error", providerCtxErr, "error", classifyErr)
 		cancelProvider()
 		cancelAutomatic()
 		if classifyErr != nil {
@@ -1386,6 +1400,7 @@ func (c *ImageTaskCoordinator) Run(
 			failed, _ := c.Get(context.WithoutCancel(ctx), dispatch.AgentName, dispatch.DispatchID)
 			return failed, fmt.Errorf("classify image task: %w", classifyErr)
 		}
+		routingStartedAt := time.Now()
 		routed, target, commitErr := c.Records.CommitImageTaskRouting(
 			ctx, dispatch.AgentName, dispatch.DispatchID, dispatch.Version,
 			k12storage.ImageTaskRoutingDecision{
@@ -1400,6 +1415,10 @@ func (c *ImageTaskCoordinator) Run(
 				InvocationResultDigest:   digestJSON(classified),
 			},
 		)
+		slog.Info("K12 ImageTask routing commit finished", "agent_id", dispatch.AgentName,
+			"dispatch_id", dispatch.DispatchID, "invocation_id", invocation.InvocationID,
+			"intent", classified.Intent, "status", routed.Status,
+			"elapsed_ms", time.Since(routingStartedAt).Milliseconds(), "error", commitErr)
 		if commitErr != nil {
 			_ = c.Records.FailImageTaskInvocation(
 				context.WithoutCancel(ctx), dispatch.AgentName, invocation.InvocationID,
@@ -1560,7 +1579,7 @@ func (c *ImageTaskCoordinator) projectTarget(
 			)
 			switch {
 			case invocationErr == nil:
-				if view.CreativeFeedback != "feedback_ready" {
+				if view.CreativeFeedback != "feedback_ready" && view.CreativeFeedback != "feedback_failed" {
 					view.CreativeFeedback = publicCreativeFeedbackInvocationState(invocation)
 				}
 				view.CreativeFeedbackRetryable =
@@ -1570,6 +1589,8 @@ func (c *ImageTaskCoordinator) projectTarget(
 					invocation.Status == k12.ImageTaskInvocationSent {
 					view.ActiveInvocationDeadlineAt = invocation.DeadlineAt
 				}
+			case errors.Is(invocationErr, k12storage.ErrImageTaskNotFound):
+				view.CreativeFeedbackRetryable = generation.Status == k12.WorkFeedbackFailed
 			case !errors.Is(invocationErr, k12storage.ErrImageTaskNotFound):
 				return ImageTaskView{}, invocationErr
 			}
@@ -1591,6 +1612,9 @@ func creativeFeedbackProjectionState(work CreativeWorkView) string {
 			strings.TrimSpace(version.StructuredFeedback.ProjectionMarkdown) != "" {
 			return "feedback_ready"
 		}
+	}
+	if work.GenerationState.Initial != nil && work.GenerationState.Initial.Status == k12.WorkFeedbackFailed {
+		return "feedback_failed"
 	}
 	return "feedback_pending"
 }
@@ -1721,16 +1745,46 @@ func (c *ImageTaskCoordinator) continueCreativeFeedback(
 		c.now(),
 	)
 	defer cancelAutomatic()
+	routeStartedAt := time.Now()
+	slog.Info("K12 ImageTask feedback route resolution started", "agent_id", view.Dispatch.AgentName,
+		"dispatch_id", view.Dispatch.DispatchID, "work_id", view.Creative.PromotedWorkID,
+		"work_type", view.Creative.WorkType, "routing_provenance", view.Dispatch.RoutingProvenance)
 	feedbackRoute, err := c.resolveWorkFeedbackRoute(automaticCtx, projected)
+	slog.Info("K12 ImageTask feedback route resolution finished", "agent_id", view.Dispatch.AgentName,
+		"dispatch_id", view.Dispatch.DispatchID, "work_id", view.Creative.PromotedWorkID,
+		"provider", feedbackRoute.Provider, "model", feedbackRoute.Model, "capability", feedbackRoute.Capability,
+		"capability_receipt_digest", feedbackRoute.CapabilityReceiptDigest,
+		"elapsed_ms", time.Since(routeStartedAt).Milliseconds(), "error", err)
 	if err != nil {
-		return projected, err
+		if _, failErr := c.Records.FailWorkFeedbackGeneration(
+			context.WithoutCancel(ctx), view.Dispatch.AgentName,
+			view.Creative.PromotedGenerationID, err.Error(),
+		); failErr != nil {
+			return projected, failErr
+		}
+		failed, projectionErr := c.projectTarget(ctx, view.Dispatch)
+		if projectionErr != nil {
+			return projected, projectionErr
+		}
+		return failed, err
 	}
 	feedbackCtx := imageTaskWorkFeedbackContext(automaticCtx, feedbackRoute)
+	feedbackStartedAt := time.Now()
+	slog.Info("K12 ImageTask feedback generation started", "agent_id", view.Dispatch.AgentName,
+		"dispatch_id", view.Dispatch.DispatchID, "work_id", view.Creative.PromotedWorkID,
+		"provider", feedbackRoute.Provider, "model", feedbackRoute.Model, "timeout_ms", feedbackRoute.TimeoutMS)
 	if _, err := c.WorkFeedback.GenerateWorkFeedback(
 		feedbackCtx, view.Dispatch.AgentName, view.Creative.PromotedWorkID,
 	); err != nil {
+		slog.Warn("K12 ImageTask feedback generation failed", "agent_id", view.Dispatch.AgentName,
+			"dispatch_id", view.Dispatch.DispatchID, "work_id", view.Creative.PromotedWorkID,
+			"elapsed_ms", time.Since(feedbackStartedAt).Milliseconds(),
+			"capability_unverified", errors.Is(err, k12.ErrModelCapabilityUnverified), "error", err)
 		return projected, err
 	}
+	slog.Info("K12 ImageTask feedback generation completed", "agent_id", view.Dispatch.AgentName,
+		"dispatch_id", view.Dispatch.DispatchID, "work_id", view.Creative.PromotedWorkID,
+		"elapsed_ms", time.Since(feedbackStartedAt).Milliseconds())
 	return c.projectTarget(ctx, view.Dispatch)
 }
 
@@ -1757,6 +1811,9 @@ func (c *ImageTaskCoordinator) continueTarget(
 			allow, err := c.IMCompletedHomeworkRoutingGate.AllowIMCompletedHomeworkGrading(
 				ctx, view.Dispatch,
 			)
+			slog.Info("K12 ImageTask IM homework routing gate evaluated", "agent_id", view.Dispatch.AgentName,
+				"dispatch_id", view.Dispatch.DispatchID, "submission_id", view.Homework.SubmissionID,
+				"allowed", allow, "error", err)
 			if err != nil {
 				return view, err
 			}
@@ -1949,9 +2006,14 @@ func (c *ImageTaskCoordinator) continueTarget(
 		if _, err := c.readDispatchImages(ctx, view.Dispatch); err != nil {
 			return view, err
 		}
+		promotionStartedAt := time.Now()
 		workID, _, err := c.Records.PromoteCreativeWorkIntake(
 			ctx, view.Creative.AgentName, view.Creative.IntakeID, view.Creative.Version,
 		)
+		slog.Info("K12 ImageTask creative intake promotion finished", "agent_id", view.Creative.AgentName,
+			"dispatch_id", view.Dispatch.DispatchID, "intake_id", view.Creative.IntakeID,
+			"work_id", workID, "work_type", view.Creative.WorkType,
+			"elapsed_ms", time.Since(promotionStartedAt).Milliseconds(), "error", err)
 		if err != nil {
 			return view, err
 		}
@@ -2062,8 +2124,22 @@ func (c *ImageTaskCoordinator) executeWritingOCR(
 		automaticCtx,
 		invocation.RouteSnapshot,
 	)
+	ocrStartedAt := time.Now()
+	slog.Info("K12 ImageTask writing OCR started", "agent_id", intake.AgentName,
+		"dispatch_id", dispatch.DispatchID, "intake_id", intake.IntakeID, "invocation_id", invocation.InvocationID,
+		"provider", invocation.RouteSnapshot.Provider, "model", invocation.RouteSnapshot.Model,
+		"capability_receipt_digest", invocation.RouteSnapshot.CapabilityReceiptDigest,
+		"timeout_ms", invocation.RouteSnapshot.TimeoutMS, "image_bytes", len(images[0]))
 	ocr, err := c.WritingOCR.RecognizeImageTaskWriting(providerCtx, images[0])
 	providerCtxErr := providerCtx.Err()
+	slog.Info("K12 ImageTask writing OCR finished", "agent_id", intake.AgentName,
+		"dispatch_id", dispatch.DispatchID, "intake_id", intake.IntakeID, "invocation_id", invocation.InvocationID,
+		"provider", invocation.RouteSnapshot.Provider, "model", invocation.RouteSnapshot.Model,
+		"elapsed_ms", time.Since(ocrStartedAt).Milliseconds(), "raw_bytes", len(ocr.Raw),
+		"canonical_bytes", len(ocr.CanonicalContent), "confidence", ocr.Confidence,
+		"risk_segments", len(ocr.RiskSegments), "promotion_policy", intake.PromotionPolicy,
+		"capability_unverified", errors.Is(err, k12.ErrModelCapabilityUnverified),
+		"context_error", providerCtxErr, "error", err)
 	cancelProvider()
 	cancelAutomatic()
 	if err != nil {
@@ -2820,7 +2896,15 @@ func (c *ImageTaskCoordinator) Retry(
 			c.now(),
 		)
 		defer cancelAutomatic()
+		retryStartedAt := time.Now()
+		slog.Info("K12 ImageTask feedback retry started", "agent_id", agentName,
+			"dispatch_id", dispatchID, "work_id", current.Creative.PromotedWorkID)
 		feedbackRoute, routeErr := c.resolveWorkFeedbackRoute(automaticCtx, current)
+		slog.Info("K12 ImageTask feedback retry route resolved", "agent_id", agentName,
+			"dispatch_id", dispatchID, "work_id", current.Creative.PromotedWorkID,
+			"provider", feedbackRoute.Provider, "model", feedbackRoute.Model, "capability", feedbackRoute.Capability,
+			"capability_receipt_digest", feedbackRoute.CapabilityReceiptDigest,
+			"elapsed_ms", time.Since(retryStartedAt).Milliseconds(), "error", routeErr)
 		if routeErr != nil {
 			return current, routeErr
 		}
@@ -2828,8 +2912,14 @@ func (c *ImageTaskCoordinator) Retry(
 		if _, err := c.WorkFeedback.GenerateWorkFeedback(
 			feedbackCtx, agentName, current.Creative.PromotedWorkID,
 		); err != nil {
+			slog.Warn("K12 ImageTask feedback retry failed", "agent_id", agentName,
+				"dispatch_id", dispatchID, "work_id", current.Creative.PromotedWorkID,
+				"elapsed_ms", time.Since(retryStartedAt).Milliseconds(), "error", err)
 			return current, err
 		}
+		slog.Info("K12 ImageTask feedback retry completed", "agent_id", agentName,
+			"dispatch_id", dispatchID, "work_id", current.Creative.PromotedWorkID,
+			"elapsed_ms", time.Since(retryStartedAt).Milliseconds())
 		return c.projectTarget(ctx, dispatch)
 	}
 	if original.Status == k12.ImageTaskStatusFailed &&
@@ -2896,11 +2986,23 @@ func (c *ImageTaskCoordinator) Retry(
 			automaticCtx,
 			invocation.RouteSnapshot,
 		)
+		retryStartedAt := time.Now()
+		slog.Info("K12 ImageTask classification retry started", "agent_id", agentName,
+			"dispatch_id", dispatchID, "invocation_id", invocation.InvocationID,
+			"provider", invocation.RouteSnapshot.Provider, "model", invocation.RouteSnapshot.Model,
+			"capability_receipt_digest", invocation.RouteSnapshot.CapabilityReceiptDigest,
+			"timeout_ms", invocation.RouteSnapshot.TimeoutMS, "images", len(images))
 		classified, err := c.Classifier.ClassifyImageTask(
 			providerCtx,
 			ImageTaskClassificationInput{Images: images, MessageIntent: dispatch.MessageIntent},
 		)
 		providerCtxErr := providerCtx.Err()
+		slog.Info("K12 ImageTask classification retry finished", "agent_id", agentName,
+			"dispatch_id", dispatchID, "invocation_id", invocation.InvocationID,
+			"elapsed_ms", time.Since(retryStartedAt).Milliseconds(), "intent", classified.Intent,
+			"confidence", classified.Confidence,
+			"capability_unverified", errors.Is(err, k12.ErrModelCapabilityUnverified),
+			"context_error", providerCtxErr, "error", err)
 		cancelProvider()
 		cancelAutomatic()
 		if err != nil {

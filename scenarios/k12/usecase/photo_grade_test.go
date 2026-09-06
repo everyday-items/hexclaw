@@ -68,9 +68,10 @@ func (f *photoAnnotatorFake) Annotate(_ context.Context, _ []byte, marks []Photo
 
 func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testing.T) {
 	d, _ := newPipeline(t,
-		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		blankWorksheetSolver{},
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
 	)
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{Question: "1+1=", Subject: "数学", StudentAnswer: "2"},
 		{Question: "2+2=", Subject: "数学", StudentAnswer: ""},
@@ -89,7 +90,7 @@ func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testin
 	if got.Mode != PhotoModeGrade || len(got.Items) != 2 {
 		t.Fatalf("mode/items = %q/%d, want grade/2", got.Mode, len(got.Items))
 	}
-	if got.Items[0].Status != PhotoCorrect || got.Items[1].Status != PhotoUnanswered {
+	if got.Items[0].Status != PhotoCorrect || got.Items[1].Status != PhotoBlankSolved {
 		t.Fatalf("unexpected statuses: %#v", got.Items)
 	}
 	if got.AnnotatedImage == nil || string(got.AnnotatedImage.Data) != "png" {
@@ -101,7 +102,8 @@ func TestGradeHomeworkPhoto_AnsweredSheetGradesAndAnnotatesTrustedBBox(t *testin
 	if anchorer.calls != 1 {
 		t.Fatalf("photo grading must invoke the page-batch answer anchorer once, calls=%d", anchorer.calls)
 	}
-	if !strings.Contains(got.Markdown, "作业批改完成") || !strings.Contains(got.Markdown, "未作答") {
+	if !strings.Contains(got.Markdown, "作业批改完成") || !strings.Contains(got.Markdown, "**答案：** 4") ||
+		!strings.Contains(got.Markdown, "已解答") || strings.Contains(got.Markdown, "待核对") {
 		t.Fatalf("grade markdown missing summary: %s", got.Markdown)
 	}
 }
@@ -146,9 +148,10 @@ func TestGradeHomeworkPhotoFrozenDispatchIntentFailsClosedOnRecognitionMismatch(
 
 func TestGradeHomeworkPhoto_CompoundParentIsNotAssessedAndChildrenStayIndependent(t *testing.T) {
 	d, _ := newPipeline(t,
-		fakeSolver{solution: "答案", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
 		fakeGrader{outcome: GradeOutcome{Verdict: VerdictAgree}}, nil,
 	)
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{ProblemID: "parent-1", ProblemKind: ProblemKindCompoundParent, Question: "阅读短文《春天》", Subject: "语文"},
 		{ProblemID: "child-1", ProblemKind: ProblemKindSubproblem, ParentProblemID: "parent-1", SubproblemNo: "1", Question: "写出中心句", Subject: "语文", StudentAnswer: "春天来了"},

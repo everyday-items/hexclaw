@@ -286,13 +286,14 @@ func normalizeRecognizedQuestionFacts(q RecognizedQuestion) RecognizedQuestion {
 		q.SourceNumberPath = nil
 		q.DisplayLabel = ""
 	}
-	if q.RawTranscription == "" {
+	// 仅初始化尚无 canonical 事实的旧输入；明确的空 raw 不能由展示别名回填。
+	if q.RawTranscription == "" && q.CanonicalMarkdown == "" {
 		q.RawTranscription = legacyQuestion
 	}
 	if q.CanonicalMarkdown == "" {
 		q.CanonicalMarkdown = strings.TrimSpace(legacyQuestion)
 	}
-	if q.AnswerRawTranscription == "" && legacyAnswer != "" {
+	if q.AnswerRawTranscription == "" && q.AnswerCanonicalMarkdown == "" && legacyAnswer != "" {
 		q.AnswerRawTranscription = legacyAnswer
 	}
 	if q.AnswerCanonicalMarkdown == "" && legacyAnswer != "" {

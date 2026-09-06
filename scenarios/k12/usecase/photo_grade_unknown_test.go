@@ -183,12 +183,13 @@ func TestGradeHomeworkPhoto_OrdinaryFailureWithZeroCompletedItemsReturnsAggregat
 	}
 }
 
-func TestGradeHomeworkPhoto_UnansweredItemDoesNotHideZeroSuccessfulAssessments(t *testing.T) {
+func TestGradeHomeworkPhoto_BlankSolvedItemDoesNotHideFailedAssessment(t *testing.T) {
 	ordinaryErr := errors.New("provider returned 503")
 	d, _ := newPipeline(t,
-		fakeSolver{solution: "2", ev: SolveEvidence{Verdict: VerdictAgree, EvidenceType: EvidenceNumericExec}},
+		blankWorksheetSolver{},
 		photoGradeErrorGrader{err: ordinaryErr}, nil,
 	)
+	d.ParentTeachingGuide = &parentTeachingGuideSpy{}
 	d.Recognizer = photoRecognizerFake{questions: []RecognizedQuestion{
 		{Question: "1+1=", Subject: "数学", StudentAnswer: "3", AnswerState: AnswerStatePresent},
 		{Question: "2+2=", Subject: "数学", AnswerState: AnswerStateBlank},
@@ -198,10 +199,13 @@ func TestGradeHomeworkPhoto_UnansweredItemDoesNotHideZeroSuccessfulAssessments(t
 		AgentName: "mingming", Grade: "五年级上", Image: []byte("jpeg"),
 	})
 	if !errors.Is(err, ordinaryErr) {
-		t.Fatalf("unanswered metadata must not turn zero successful assessments into success: %v", err)
+		t.Fatalf("blank solved item must not turn a failed assessment into success: %v", err)
 	}
-	if len(result.Items) != 2 || result.Items[0].Status != PhotoFailed || result.Items[1].Status != PhotoUnanswered {
-		t.Fatalf("diagnostic statuses=%#v, want failed then unanswered", result.Items)
+	if len(result.Items) != 2 || result.Items[0].Status != PhotoFailed || result.Items[1].Status != PhotoBlankSolved {
+		t.Fatalf("diagnostic statuses=%#v, want failed then blank_solved", result.Items)
+	}
+	if result.Items[1].Recognized.StudentAnswer != "" || result.Items[1].Grade.RecordCreated {
+		t.Fatalf("blank solved item must not create student evidence: %#v", result.Items[1])
 	}
 }
 

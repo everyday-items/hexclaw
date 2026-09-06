@@ -213,7 +213,7 @@ func TestK12ProblemGroundingProjectionUsesAssessmentStatusOperationExactSet(t *t
 	const outOfScopeProblem = "999+1="
 	grounding := &gradingItemPinnedGrounding{active: "revision-a"}
 	solver := &gradingItemGroundedPhysicalSolver{
-		grounding: grounding, outOfScopeProblem: outOfScopeProblem,
+		grounding: grounding, outOfScopeProblem: outOfScopeProblem, solution: "78",
 	}
 	grader := &gradingItemGroundedPhysicalGrader{}
 	o := newParallelAnchorOrchestrator(t, &countingRecognizer{questions: []RecognizedQuestion{
@@ -272,8 +272,8 @@ func TestK12ProblemGroundingProjectionUsesAssessmentStatusOperationExactSet(t *t
 		t.Fatalf("confirm status grounded grading: handled=%v err=%v", handled, err)
 	}
 	waitForStage(t, o.deps, "mingming", jobID, k12.GradingStageCompleted)
-	if solver.callCount() != 2 || grader.callCount() != 1 {
-		t.Fatalf("status Provider calls solve/grade=%d/%d want 2/1", solver.callCount(), grader.callCount())
+	if solver.callCount() != 3 || grader.callCount() != 1 {
+		t.Fatalf("status Provider calls solve/grade=%d/%d want 3/1", solver.callCount(), grader.callCount())
 	}
 	projection, err := o.ImageTaskHomeworkProjection(context.Background(), "mingming", jobID)
 	if err != nil {
@@ -302,7 +302,7 @@ func TestK12ProblemGroundingProjectionUsesAssessmentStatusOperationExactSet(t *t
 	}{
 		"57+38=":          {status: k12.GradingAssessmentCorrect, operations: []string{"solve", "grade"}},
 		outOfScopeProblem: {status: k12.GradingAssessmentOutOfScope, operations: []string{"solve"}},
-		"26×3=":           {status: k12.GradingAssessmentUnanswered, operations: nil},
+		"26×3=":           {status: k12.GradingAssessmentBlankSolved, operations: []string{"solve"}},
 		"48÷6=":           {status: k12.GradingAssessmentAnswerUnclear, operations: nil},
 	}
 	for _, question := range projection.Questions {
@@ -320,6 +320,10 @@ func TestK12ProblemGroundingProjectionUsesAssessmentStatusOperationExactSet(t *t
 		if len(want.operations) == 0 &&
 			(assessment.SolveInvocationID != "" || assessment.GradeInvocationID != "") {
 			t.Fatalf("question %q unexpectedly reached Provider: %+v", question.Question, assessment)
+		}
+		if question.AnswerState == AnswerStateBlank &&
+			(question.StudentAnswer != "" || assessment.GradeInvocationID != "" || assessment.ProjectionCreated) {
+			t.Fatalf("blank question %q must not acquire a student grade or mistake: %+v", question.Question, assessment)
 		}
 	}
 }
@@ -393,6 +397,20 @@ func TestK12ProblemGroundingProjectionBlankSolvedUsesSolveOnly(t *testing.T) {
 	if len(assessments) != 1 || assessments[0].Status != k12.GradingAssessmentBlankSolved ||
 		assessments[0].SolveInvocationID == "" || assessments[0].GradeInvocationID != "" {
 		t.Fatalf("blank_solved assessment=%+v", assessments)
+	}
+	artifact, err := o.deps.Records.GetGradingFinalArtifactByJob(context.Background(), "mingming", jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"共 1 题 · 1 题已解答", "## 已解答", "**正确答案：** 2"} {
+		if !strings.Contains(artifact.CanonicalMarkdown, want) {
+			t.Fatalf("blank final artifact lacks %q: %s", want, artifact.CanonicalMarkdown)
+		}
+	}
+	for _, forbidden := range []string{"0 题正确", "1 题需关注", "## 需关注的题", "## 已答对的题"} {
+		if strings.Contains(artifact.CanonicalMarkdown, forbidden) {
+			t.Fatalf("blank final artifact invents a grading result %q: %s", forbidden, artifact.CanonicalMarkdown)
+		}
 	}
 }
 

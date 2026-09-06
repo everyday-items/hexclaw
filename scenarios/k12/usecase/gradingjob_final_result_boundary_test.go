@@ -128,8 +128,9 @@ func TestFinalResultBoundaryEnforcesExactParentGuidePolicy(t *testing.T) {
 			wantErr: true, answerState: AnswerStatePresent,
 		},
 		{
-			name:   "completed unanswered remains guide-free",
-			intent: PhotoTaskCompletedHomework, mode: PhotoModeGrade, status: PhotoUnanswered,
+			name:   "completed blank solved complete guide",
+			intent: PhotoTaskCompletedHomework, mode: PhotoModeGrade, status: PhotoBlankSolved,
+			guide: completeBoundaryParentGuide(), guideRef: "parent-guide-succeeded",
 			answerState: AnswerStateBlank,
 		},
 		{
@@ -138,9 +139,8 @@ func TestFinalResultBoundaryEnforcesExactParentGuidePolicy(t *testing.T) {
 			answerState: AnswerStateUnclear,
 		},
 		{
-			name:   "completed unanswered rejects an attached guide",
-			intent: PhotoTaskCompletedHomework, mode: PhotoModeGrade, status: PhotoUnanswered,
-			guide:   completeBoundaryParentGuide(),
+			name:   "completed blank solved rejects a missing guide",
+			intent: PhotoTaskCompletedHomework, mode: PhotoModeGrade, status: PhotoBlankSolved,
 			wantErr: true, answerState: AnswerStateBlank,
 		},
 		{

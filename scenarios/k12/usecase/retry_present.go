@@ -41,7 +41,7 @@ func SplitRetryPresentation(solution string) (question, answer, expectedAnswer s
 	return q, a, expectedAnswer
 }
 
-// extractAnswerSection 取 ## 答案 章节正文（到下一个 ## 标题为止），去外层粗体标记。
+// extractAnswerSection 取答案章节，剥离末尾确切验算尾注并成对去除完整外层粗体。
 func extractAnswerSection(lines []string) string {
 	start := -1
 	for i, line := range lines {
@@ -61,6 +61,9 @@ func extractAnswerSection(lines []string) string {
 		return ""
 	}
 	body := strings.TrimSpace(strings.Join(lines[start:], "\n"))
-	body = strings.TrimSuffix(strings.TrimPrefix(body, "**"), "**")
+	body = strings.TrimSpace(strings.TrimSuffix(body, "\n> ✅ 最终答案已由独立校验员用代码重算核验一致（高置信）。"))
+	if strings.HasPrefix(body, "**") && strings.HasSuffix(body, "**") && strings.Count(body, "**") == 2 {
+		body = body[2 : len(body)-2]
+	}
 	return strings.TrimSpace(body)
 }

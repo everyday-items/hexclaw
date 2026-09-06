@@ -2505,6 +2505,23 @@ func (s *Store) ExpireImageTaskInvocation(
 			return dispatch, invocation, false, err
 		}
 	}
+	if invocation.Operation == k12.ImageTaskOperationWorkFeedback && invocation.Status == k12.ImageTaskInvocationPrepared {
+		if _, err := tx.ExecContext(ctx, `UPDATE k12_work_feedback_generations
+			SET status='failed',failure_reason=?,updated_at=?
+			WHERE agent_name=? AND work_id=? AND status IN ('queued','running')
+			  AND 'work:'||work_id||':version:'||generation_id||':feedback'=?`,
+			failureKind, now, agentName, invocation.WorkRecordID, invocation.OperationKey); err != nil {
+			return dispatch, invocation, false, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE k12_creative_works
+			SET feedback_state='failed',row_version=row_version+1
+			WHERE agent_name=? AND record_id=? AND latest_feedback_generation_id=''
+			  AND deleted_at IS NULL AND feedback_state IN ('queued','running')
+			  AND 'work:'||record_id||':version:'||initial_feedback_generation_id||':feedback'=?`,
+			agentName, invocation.WorkRecordID, invocation.OperationKey); err != nil {
+			return dispatch, invocation, false, err
+		}
+	}
 	res, err = tx.ExecContext(ctx, `UPDATE k12_image_task_dispatches
         SET status='failed',failure_kind=?,retry_safe=?,
             automatic_deadline_at=0,automatic_remaining_seconds=0,
@@ -2656,12 +2673,8 @@ func (s *Store) resolveImageTaskInvocationDeadline(
             WHERE d.agent_name=? AND i.agent_name=? AND i.intake_id=?`,
 			invocation.AgentName, invocation.AgentName, invocation.IntakeID)
 	case k12.ImageTaskOperationWorkFeedback:
-		row = s.db.QueryRowContext(ctx, `SELECT d.automatic_deadline_at
-            FROM k12_image_task_dispatches d
-            JOIN k12_creative_work_intakes i ON i.dispatch_id=d.dispatch_id
-            WHERE d.agent_name=? AND i.agent_name=? AND i.promoted_work_id=?
-            ORDER BY i.updated_at DESC LIMIT 1`,
-			invocation.AgentName, invocation.AgentName, invocation.WorkRecordID)
+		// 点评期限已按本次执行预算冻结，不能被作品过去的图片窗口覆盖。
+		return invocation.DeadlineAt, false, nil
 	case k12.ImageTaskOperationSolve:
 		row = s.db.QueryRowContext(ctx, `SELECT automatic_deadline_at
             FROM k12_image_task_dispatches

@@ -3,6 +3,7 @@ package usecase
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -45,30 +46,61 @@ func TestBackupV3PacksReferencedAssetContentAndMigrateRewritesEveryNestedAssetOw
 			t.Fatal(err)
 		}
 	}
+	currentImage := validPNGFixture(t, "current-work-asset")
+	currentAssetID, err := assetstore.Save("mingming", currentImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentWork, err := k12.NewCreativeWorkRecord("mingming", "", k12.CreativeWorkFields{
+		WorkType: k12.WorkTypeArt, GradeTerm: "五年级上", DisplayName: "当前美术作品",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentGeneration, _, err := store.CreateCreativeWorkWithInitialGeneration(
+		context.Background(), currentWork, "current-art-backup", "current-art-source",
+		k12.CreativeWorkSourceSnapshot{WorkType: k12.WorkTypeArt, DisplayName: "当前美术作品", SourceAssetID: currentAssetID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	bak, err := d.Backup(context.Background(), "mingming")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bak.Assets) != 1 {
-		t.Fatalf("packed assets=%+v want one deduplicated content entry", bak.Assets)
+	if len(bak.Assets) != 2 {
+		t.Fatalf("packed assets=%d want legacy and current source assets", len(bak.Assets))
 	}
-	asset := bak.Assets[0]
+	var asset HexbakAsset
+	for _, item := range bak.Assets {
+		if item.AssetID == sourceAssetID {
+			asset = item
+		}
+	}
 	if asset.AssetID != sourceAssetID || asset.OwnerAgent != "mingming" || asset.SHA256 == "" || asset.MIME != "image/png" || !bytes.Equal(asset.Data, image) {
 		t.Fatalf("packed asset=%+v", asset)
 	}
 	if err := VerifyHexbak(bak); err != nil {
 		t.Fatalf("v3 archive with asset content must verify: %v", err)
 	}
+	encoded, err := json.Marshal(bak)
+	if err != nil || !bytes.Contains(encoded, []byte(currentGeneration.GenerationID)) ||
+		!bytes.Contains(encoded, []byte(currentAssetID)) {
+		t.Fatalf("current creative source/generation is absent: err=%v", err)
+	}
 
 	migrated, err := MigrateHexbakOwner(bak, "target-child")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrated.Assets) != 1 || migrated.Assets[0].OwnerAgent != "target-child" || bytes.Equal(nil, migrated.Assets[0].Data) {
+	if len(migrated.Assets) != 2 || migrated.Assets[0].OwnerAgent != "target-child" || bytes.Equal(nil, migrated.Assets[0].Data) {
 		t.Fatalf("migrated asset manifest=%+v", migrated.Assets)
 	}
-	targetAssetID := migrated.Assets[0].AssetID
+	targetAssetID, _, _, err := assetstore.Describe("target-child", image)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if targetAssetID == sourceAssetID || targetAssetID == "" {
 		t.Fatalf("asset owner was not rewritten: source=%q target=%q", sourceAssetID, targetAssetID)
 	}
@@ -82,8 +114,15 @@ func TestBackupV3PacksReferencedAssetContentAndMigrateRewritesEveryNestedAssetOw
 	if err := VerifyHexbak(migrated); err != nil {
 		t.Fatalf("migrated v3 checksum/assets invalid: %v", err)
 	}
-	if bak.Assets[0].AssetID != sourceAssetID || !bytes.Equal(bak.Assets[0].Data, image) {
+	if asset.AssetID != sourceAssetID || !bytes.Equal(asset.Data, image) {
 		t.Fatal("source archive asset payload was mutated")
+	}
+	if bak.CurrentCreativeWorks[0].AgentName != "mingming" || bak.CurrentCreativeWorks[0].InitialID != currentGeneration.GenerationID || bak.CurrentCreativeWorks[0].Generations[0].Source.SourceAssetID != currentAssetID {
+		t.Fatal("owner migration mutated source current creative facts")
+	}
+	current := migrated.CurrentCreativeWorks[0]
+	if current.AgentName != "target-child" || current.InitialID == currentGeneration.GenerationID || current.Generations[0].Source.SourceAssetID == currentAssetID {
+		t.Fatal("current creative identity and source owner were not migrated")
 	}
 }
 

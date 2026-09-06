@@ -1,26 +1,32 @@
 package usecase_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 type singlePracticeGenerator struct {
-	mu        sync.Mutex
-	fail      bool
-	ambiguous bool
-	calls     int
-	snapshot  k12.GradingModelSnapshot
+	mu         sync.Mutex
+	fail       bool
+	ambiguous  bool
+	calls      int
+	snapshot   k12.GradingModelSnapshot
+	prompt     string
+	callLogger *logger.Logger
 }
 
 type singlePracticeProviderResponseError struct{}
@@ -35,12 +41,14 @@ func (singlePracticeProviderResponseError) ProviderResponseStatusCode() int {
 
 func (g *singlePracticeGenerator) GeneratePracticeVariant(
 	ctx context.Context,
-	_, _, _ string,
+	_, prompt, _ string,
 ) (usecase.SolveResult, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.calls++
 	g.snapshot, _ = k12.GradingModelSnapshotFromContext(ctx)
+	g.prompt = prompt
+	g.callLogger = logger.FromContext(ctx)
 	if g.fail {
 		if g.ambiguous {
 			return usecase.SolveResult{}, fmt.Errorf("connection reset after send")
@@ -112,7 +120,7 @@ func singlePracticeTestDigest(parts ...[]byte) string {
 }
 
 func singlePracticeTestPrompt() string {
-	return "生成一道同等难度的小学变式练习。保持来源知识点与方法，不复述原题，不泄露答案；教材边界=人教版；年级=五年级下；来源题=4÷0.5=8；知识点=小数除法。严格输出 ## 问题 / ## 解答 / ## 答案 三段 Markdown。"
+	return "生成一道同等难度的小学变式练习。保持来源知识点与方法，不复述原题，给家长答案和讲法；教材边界=人教版；年级=五年级下；来源题=4÷0.5=8；知识点=小数除法。严格输出 ## 问题 / ## 解答 / ## 答案 三段 Markdown。"
 }
 
 func seedSinglePracticeMistake(t *testing.T, d usecase.Deps, idempotencySuffix string) string {
@@ -181,8 +189,13 @@ func TestSinglePracticeGeneration_OneClickPersistsThenCommitsOnFrozenRoute(t *te
 	if replayed.GenerationJobID != pending.GenerationJobID || routeCalls != 1 {
 		t.Fatalf("replay changed identity or re-resolved route: replay=%+v routeCalls=%d", replayed, routeCalls)
 	}
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	callCtx := context.Background()
 	joined, err := d.ProcessSinglePracticeGeneration(
-		context.Background(), "xiaoming", pending.GenerationJobID,
+		callCtx, "xiaoming", pending.GenerationJobID,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +219,18 @@ func TestSinglePracticeGeneration_OneClickPersistsThenCommitsOnFrozenRoute(t *te
 		invocations[0].Status != k12.ModelInvocationSucceeded ||
 		invocations[1].Status != k12.ModelInvocationSucceeded {
 		t.Fatalf("generate+validate must each have one succeeded invocation: %+v", invocations)
+	}
+	if generator.prompt != singlePracticeTestPrompt() || strings.Contains(generator.prompt, "不泄露答案") {
+		t.Fatalf("practice prompt must retain structure and provide parent answers: %q", generator.prompt)
+	}
+	logs.Reset()
+	generator.callLogger.Info("practice provider context")
+	var logged map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &logged); err != nil {
+		t.Fatal(err)
+	}
+	if logged["job_id"] != pending.GenerationJobID || logged["stage"] != "practice_generate" || logged["invocation_id"] == "" || logged["invocation_id"] == nil {
+		t.Fatalf("provider logger lost invocation correlation: %v", logged)
 	}
 }
 

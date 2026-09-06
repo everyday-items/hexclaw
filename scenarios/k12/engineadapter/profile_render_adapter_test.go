@@ -3,11 +3,14 @@ package engineadapter
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/hexagon-codes/hexclaw/router"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
+	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
+	"github.com/hexagon-codes/hexclaw/storage/migrate"
 )
 
 // fakeAgentRW 内存 agent 路由。
@@ -117,17 +120,62 @@ func (f *fakeAgentRW) UpdateAgent(cfg router.AgentConfig) error {
 }
 
 func TestProfileAdapter_OnlyChangesK12Keys_NoAlias(t *testing.T) {
+	f := newArchiveRestoreFixture(t)
 	// 实例已有非 K12 metadata（如 provider），改档不能覆盖它
 	orig := map[string]string{"provider": "glm", k12.MetaKeyChildName: "小明", k12.MetaKeyGradeTerm: "五年级上"}
+	temperature := 0.4
 	rw := &fakeAgentRW{agents: map[string]*router.AgentConfig{
-		"mingming": {Name: "mingming", Metadata: orig},
+		"mingming": {Name: "mingming", Metadata: orig, DisplayName: "旧名称", Description: "旧说明",
+			SystemPrompt: "五年级上学期辅导", Provider: "old-provider", Model: "old-model",
+			Skills: []string{"old-skill"}, MaxTokens: 1234, Temperature: &temperature},
 	}}
-	a := NewProfileAdapter(rw, nil)
+	a := NewProfileAdapter(rw, &failingPersister{err: errors.New("publish must not persist again")})
 	ctx := context.Background()
+	deps := usecase.Deps{Profiles: a, Records: f.records}
+	req := usecase.UpdateProfileBundleRequest{
+		OwnerID: "owner", AgentName: "mingming", IdempotencyKey: "profile-publish",
+		ClearCurriculumProgress: true,
+		Profile: k12.ChildProfile{ChildName: "小明", GradeTerm: "五年级下", SubjectTextbooks: k12.SubjectTextbooks{
+			Math: "人教版", Chinese: "人教版", English: "人教PEP版", Science: "教科版",
+			InformationTechnology: "浙教版", Art: "人美版",
+		}},
+		AgentConfig: &k12.ProfileBundleAgentConfig{DisplayName: "小明的辅导老师", Description: "家长辅导",
+			SystemPrompt: "五年级下学期：答案、步骤、家长讲法", Provider: "hexclaw-gpt", Model: "sol",
+			Skills: []string{"math-tutor"}},
+		WeeklyPracticeSettings: usecase.WeeklyPracticeSettingsInput{Timezone: "Asia/Shanghai",
+			TextbookConsolidationTier: k12.WeeklyTextbookTierStandard, ArithmeticMinutes: 2},
+	}
 
-	// 升学：只改年级
-	if err := a.SaveProfile(ctx, "mingming", k12.ChildProfile{GradeTerm: "五年级下"}); err != nil {
+	// 档案事务提交后，一次发布规范化配置与档案，不重复持久化。
+	result, err := deps.UpdateProfileBundle(ctx, req)
+	if err != nil {
 		t.Fatal(err)
+	}
+	updated := rw.agents["mingming"]
+	want := result.AgentConfig
+	if want == nil || updated.DisplayName != want.DisplayName || updated.Description != want.Description ||
+		updated.SystemPrompt != want.SystemPrompt || updated.Provider != want.Provider || updated.Model != want.Model ||
+		!reflect.DeepEqual(updated.Skills, want.Skills) {
+		t.Fatalf("committed agent config not published: got=%+v want=%+v", updated, want)
+	}
+	if updated.Name != "mingming" || updated.MaxTokens != 1234 || updated.Temperature != &temperature {
+		t.Fatalf("profile publication changed unrelated routing fields: %+v", updated)
+	}
+	committed, err := f.records.GetProfileState(ctx, "mingming")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := deps.UpdateProfileBundle(ctx, req)
+	if err != nil || !replay.Replayed || !reflect.DeepEqual(rw.agents["mingming"], updated) {
+		t.Fatalf("same command replay changed published configuration: result=%+v err=%v", replay, err)
+	}
+	afterReplay, err := f.records.GetProfileState(ctx, "mingming")
+	if err != nil || !reflect.DeepEqual(committed, afterReplay) {
+		t.Fatalf("same command replay changed persisted profile: before=%+v after=%+v err=%v", committed, afterReplay, err)
+	}
+	replay.AgentConfig.Skills[0] = "mutated"
+	if rw.agents["mingming"].Skills[0] == "mutated" {
+		t.Fatal("published skills alias the committed result")
 	}
 	// 原 map 不被污染（别名安全）
 	if orig[k12.MetaKeyGradeTerm] != "五年级上" {
@@ -145,6 +193,26 @@ func TestProfileAdapter_OnlyChangesK12Keys_NoAlias(t *testing.T) {
 	// 不存在的实例
 	if _, err := a.GetProfile(ctx, "nobody"); err == nil {
 		t.Error("不存在实例应报错")
+	}
+
+	// 已升级数据库缺失触发器时，正式向前迁移只恢复行为，不改写既有 revision。
+	if _, err := f.db.ExecContext(ctx, `DROP TRIGGER trg_k12_profile_revision_after_metadata_update;
+		DELETE FROM schema_migrations WHERE version=97`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(ctx, f.db, migrate.All); err != nil {
+		t.Fatal(err)
+	}
+	afterRecovery, err := f.records.GetProfileState(ctx, "mingming")
+	if err != nil || !reflect.DeepEqual(committed, afterRecovery) {
+		t.Fatalf("trigger recovery rewrote profile revision: before=%+v after=%+v err=%v", committed, afterRecovery, err)
+	}
+	if _, err := f.db.ExecContext(ctx, `UPDATE agents SET metadata=metadata WHERE name='mingming'`); err != nil {
+		t.Fatal(err)
+	}
+	afterUpdate, err := f.records.GetProfileState(ctx, "mingming")
+	if err != nil || afterUpdate.Revision != committed.Revision+1 {
+		t.Fatalf("recovered profile trigger did not advance revision: before=%+v after=%+v err=%v", committed, afterUpdate, err)
 	}
 }
 

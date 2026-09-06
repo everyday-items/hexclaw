@@ -2,6 +2,7 @@ package apihttp_test
 
 import (
 	"context"
+	"mime"
 	"net/http"
 	"strings"
 	"testing"
@@ -144,8 +145,22 @@ func TestHTTPExportFilenameFromProfile(t *testing.T) {
 	h := newServer(t, k12.ChildProfile{ChildName: "明明", GradeTerm: "五年级上"})
 	req, _ := do(t, h, "GET", "/export?agent=mingming&format=pdf", "")
 	cd := req.Header().Get("Content-Disposition")
-	// §4.13 文件名：导出（单孩）= {孩子称呼}_学习档案_{学期}.{ext}。
-	if !strings.Contains(cd, "明明_学习档案_五年级上.pdf") {
-		t.Errorf("导出文件名应为 明明_学习档案_五年级上.pdf（§4.13），got %q", cd)
+	for _, b := range []byte(cd) {
+		if b >= 128 {
+			t.Errorf("Content-Disposition must be ASCII for the native proxy: %q", cd)
+			break
+		}
+	}
+	if !strings.Contains(cd, `filename="mistakes.pdf"`) {
+		t.Errorf("missing ASCII filename fallback: %q", cd)
+	}
+	mediaType, params, err := mime.ParseMediaType(cd)
+	if err != nil || mediaType != "attachment" || params["filename"] != "明明_学习档案_五年级上.pdf" {
+		t.Errorf("export must preserve the profile filename: type=%q params=%v err=%v", mediaType, params, err)
+	}
+	for _, name := range []string{"X-HexClaw-Artifact-ID", "X-HexClaw-Source-Digest", "X-HexClaw-Object-Counts"} {
+		if req.Header().Get(name) == "" {
+			t.Errorf("missing archive response metadata: %s", name)
+		}
 	}
 }

@@ -2,6 +2,7 @@ package usecase_test
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -32,7 +33,7 @@ func newDataDeps(t *testing.T, agents ...string) usecase.Deps {
 	return usecase.Deps{
 		Records: k12storage.NewStore(db, reg.Records), Constraint: cur,
 		TextbookOwnerID: "desktop-user",
-		Now: func() int64 { return 1000 },
+		Now:             func() int64 { return 1000 },
 		WorkFeedbackRoute: func(
 			context.Context,
 			string,
@@ -57,7 +58,7 @@ func verifiedItem(id, q, a string) k12.PracticeItem {
 // TestPracticeSetFullLifecycle 覆盖 draft→confirmed→assigned→submitted→graded→closed 全链路。
 func TestPracticeSetFullLifecycle(t *testing.T) {
 	d := newDataDeps(t)
-	attachDeliveredPracticeTransport(&d, 1)
+	transport := attachDeliveredPracticeTransport(&d, 1)
 	ctx := context.Background()
 	f := k12.PracticeSetFields{
 		SourceKind: k12.PracticeSourceWeekly, Title: "本周复习卷 · 07/18",
@@ -98,6 +99,24 @@ func TestPracticeSetFullLifecycle(t *testing.T) {
 	}
 	if finalized.Fields.QuestionArtifact == finalized.Fields.AnswerArtifact {
 		t.Fatal("题目卷与答案卷必须分离")
+	}
+	batchBefore, err := d.Records.GetDeliveryBatch(ctx, "xiaoming", finalized.Fields.DeliveryBatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := d.ListPracticeSets(ctx, "xiaoming", k12.PracticeStatusAssigned)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("list finalized practice set: count=%d err=%v", len(listed), err)
+	}
+	if listed[0].Record.RecordID != id || listed[0].Fields.DeliveryStatus != string(k12.DeliveryDelivered) ||
+		listed[0].Fields.DeliveryStatus != finalized.Fields.DeliveryStatus {
+		t.Fatalf("list delivery status differs from durable detail: list=%s detail=%s",
+			listed[0].Fields.DeliveryStatus, finalized.Fields.DeliveryStatus)
+	}
+	batchAfter, err := d.Records.GetDeliveryBatch(ctx, "xiaoming", finalized.Fields.DeliveryBatchID)
+	if err != nil || !reflect.DeepEqual(batchBefore, batchAfter) || len(transport.sends) != 1 || len(transport.queries) != 0 {
+		t.Fatalf("list must not mutate delivery facts or contact transport: err=%v sends=%d queries=%d",
+			err, len(transport.sends), len(transport.queries))
 	}
 
 	submitWholeSet(t, d, "xiaoming", id)

@@ -46,8 +46,11 @@ func (d Deps) ListPracticeSets(ctx context.Context, agentName, status string) ([
 	}
 	out := make([]PracticeSetView, 0, len(recs))
 	for _, r := range recs {
-		f, _ := k12.ParsePracticeSetFields(r.Fields)
-		out = append(out, PracticeSetView{Record: r, Fields: f})
+		view, err := d.GetPracticeSet(ctx, agentName, r.RecordID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, view)
 	}
 	return out, nil
 }

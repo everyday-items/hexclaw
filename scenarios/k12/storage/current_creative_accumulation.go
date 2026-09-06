@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
@@ -17,6 +18,344 @@ import (
 )
 
 var ErrCurrentCommandConflict = errors.New("current K12 command identity conflict")
+
+// CreativeWorkArchiveV7 保存当前作品的持久事实，不创建旧版本或新的执行任务。
+type CreativeWorkArchiveV7 struct {
+	WorkID            string                            `json:"work_id"`
+	AgentName         string                            `json:"agent_name"`
+	InitialID         string                            `json:"initial_generation_id"`
+	LatestID          string                            `json:"latest_generation_id,omitempty"`
+	RowVersion        int                               `json:"row_version"`
+	FeedbackState     string                            `json:"feedback_state"`
+	DeletedAt         *int64                            `json:"deleted_at,omitempty"`
+	DeletedBy         string                            `json:"deleted_by,omitempty"`
+	DeleteCommandKey  string                            `json:"delete_command_key,omitempty"`
+	DeleteReceiptJSON string                            `json:"delete_receipt_json,omitempty"`
+	Generations       []CreativeWorkArchiveGenerationV7 `json:"generations"`
+	Invocations       []k12.ImageTaskInvocation         `json:"invocations,omitempty"`
+	PageAssets        []PageAssetMetadata               `json:"page_assets,omitempty"`
+}
+
+// 归档显式包含 Source 等内部字段；公开 generation DTO 仍保持原合同。
+type CreativeWorkArchiveGenerationV7 struct {
+	ID            string                         `json:"id"`
+	Number        int                            `json:"number"`
+	CommandKey    string                         `json:"command_key"`
+	RequestDigest string                         `json:"request_digest"`
+	Status        string                         `json:"status"`
+	Source        k12.CreativeWorkSourceSnapshot `json:"source"`
+	Feedback      *k12.WorkFeedback              `json:"feedback,omitempty"`
+	FailureReason string                         `json:"failure_reason,omitempty"`
+	Attempt       int                            `json:"attempt"`
+	CreatedAt     int64                          `json:"created_at"`
+	UpdatedAt     int64                          `json:"updated_at"`
+}
+
+func (s *Store) ExportCreativeWorksArchiveV7(ctx context.Context, agent string) ([]CreativeWorkArchiveV7, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := s.ExportCreativeWorksArchiveV7Tx(ctx, tx, agent)
+	if err != nil {
+		return nil, err
+	}
+	return result, tx.Commit()
+}
+
+func (s *Store) ExportCreativeWorksArchiveV7Tx(ctx context.Context, tx *sql.Tx, agent string) ([]CreativeWorkArchiveV7, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("current creative archive transaction is required")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT record_id,initial_feedback_generation_id,
+		latest_feedback_generation_id,row_version,feedback_state,deleted_at,deleted_by,
+		delete_command_key,delete_receipt_json FROM k12_creative_works
+		WHERE agent_name=? AND initial_feedback_generation_id<>'' ORDER BY record_id`, agent)
+	if err != nil {
+		return nil, err
+	}
+	var out []CreativeWorkArchiveV7
+	for rows.Next() {
+		item := CreativeWorkArchiveV7{AgentName: agent}
+		if err := rows.Scan(&item.WorkID, &item.InitialID, &item.LatestID, &item.RowVersion,
+			&item.FeedbackState, &item.DeletedAt, &item.DeletedBy, &item.DeleteCommandKey, &item.DeleteReceiptJSON); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	if err := rowsDone(rows); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		item := &out[i]
+		rows, err := tx.QueryContext(ctx, `SELECT generation_id FROM k12_work_feedback_generations
+			WHERE agent_name=? AND work_id=? ORDER BY generation_no`, agent, item.WorkID)
+		if err != nil {
+			return nil, err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+		if err := rowsDone(rows); err != nil {
+			return nil, err
+		}
+		assets := map[string]bool{}
+		for _, id := range ids {
+			g, err := getWorkFeedbackGenerationVia(ctx, tx, agent, id)
+			if err != nil {
+				return nil, err
+			}
+			item.Generations = append(item.Generations, CreativeWorkArchiveGenerationV7{
+				ID: g.GenerationID, Number: g.GenerationNo, CommandKey: g.CommandKey, RequestDigest: g.RequestDigest,
+				Status: g.Status, Source: g.Source, Feedback: g.Feedback, FailureReason: g.FailureReason,
+				Attempt: g.Attempt, CreatedAt: g.CreatedAt, UpdatedAt: g.UpdatedAt,
+			})
+			if id := g.Source.SourceAssetID; id != "" {
+				assets[id] = true
+			}
+		}
+		rows, err = tx.QueryContext(ctx, `SELECT invocation_id FROM k12_image_task_invocations
+			WHERE agent_name=? AND work_record_id=? AND operation='work_feedback' ORDER BY operation_key,attempt`, agent, item.WorkID)
+		if err != nil {
+			return nil, err
+		}
+		ids = nil
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+		if err := rowsDone(rows); err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			inv, err := getImageTaskInvocation(ctx, tx, agent, id)
+			if err != nil {
+				return nil, err
+			}
+			inv.ProviderRequestKey = ""
+			item.Invocations = append(item.Invocations, inv)
+		}
+		ids = nil
+		for id := range assets {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			asset, err := scanPageAsset(tx.QueryRowContext(ctx, `SELECT `+pageAssetColumns+` FROM k12_page_assets WHERE agent_name=? AND page_asset_id=?`, agent, id))
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			item.PageAssets = append(item.PageAssets, asset)
+		}
+	}
+	if err := ValidateCreativeWorksArchiveV7(agent, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func ValidateCreativeWorksArchiveV7(agent string, items []CreativeWorkArchiveV7) error {
+	seen := map[string]bool{}
+	for _, item := range items {
+		if item.AgentName != agent || item.WorkID == "" || item.InitialID == "" || item.RowVersion < 0 || seen[item.WorkID] {
+			return fmt.Errorf("invalid current creative archive identity")
+		}
+		seen[item.WorkID] = true
+		ids := map[string]bool{}
+		for _, g := range item.Generations {
+			if g.ID == "" || ids[g.ID] || g.Number < 1 || g.CommandKey == "" || g.RequestDigest == "" {
+				return fmt.Errorf("invalid archived creative generation")
+			}
+			ids[g.ID] = true
+			switch g.Status {
+			case k12.WorkFeedbackQueued, k12.WorkFeedbackRunning, k12.WorkFeedbackSucceeded, k12.WorkFeedbackFailed:
+			default:
+				return fmt.Errorf("invalid archived creative generation status")
+			}
+			if g.Source.WorkType != k12.WorkTypeWriting && g.Source.WorkType != k12.WorkTypeArt {
+				return fmt.Errorf("invalid archived creative source")
+			}
+			if g.Source.OCRVersion > 0 {
+				sum := sha256.Sum256([]byte(g.Source.ContentMarkdown))
+				if g.Source.ContentConfirmedAt <= 0 || "sha256:"+hex.EncodeToString(sum[:]) != g.Source.OCRDigest {
+					return fmt.Errorf("invalid archived creative OCR digest")
+				}
+			}
+		}
+		if !ids[item.InitialID] || (item.LatestID != "" && !ids[item.LatestID]) {
+			return fmt.Errorf("archived creative generation pointer is missing")
+		}
+		for _, inv := range item.Invocations {
+			if inv.AgentName != agent || inv.WorkRecordID != item.WorkID || inv.Operation != k12.ImageTaskOperationWorkFeedback || inv.DispatchID != "" || inv.IntakeID != "" || inv.ProviderRequestKey != "" {
+				return fmt.Errorf("invalid archived creative invocation scope")
+			}
+			identity := inv
+			identity.Status = k12.ImageTaskInvocationPrepared
+			if err := validateImageTaskInvocation(identity); err != nil {
+				return err
+			}
+			switch inv.Status {
+			case k12.ImageTaskInvocationPrepared, k12.ImageTaskInvocationSent, k12.ImageTaskInvocationSucceeded, k12.ImageTaskInvocationFailed, k12.ImageTaskInvocationOutcomeUnknown, k12.ImageTaskInvocationReconciled:
+			default:
+				return fmt.Errorf("invalid archived creative invocation status")
+			}
+			matched := false
+			for id := range ids {
+				if inv.OperationKey == "work:"+item.WorkID+":version:"+id+":feedback" {
+					matched = true
+				}
+			}
+			if !matched {
+				return fmt.Errorf("archived creative invocation generation is missing")
+			}
+			if inv.ResultJSON != "" {
+				var result struct {
+					Feedback   string
+					SkillStamp string
+				}
+				decoder := json.NewDecoder(strings.NewReader(inv.ResultJSON))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&result); err != nil || result.Feedback == "" {
+					return fmt.Errorf("invalid archived creative invocation result")
+				}
+			}
+		}
+		for _, asset := range item.PageAssets {
+			if asset.AgentName != agent {
+				return fmt.Errorf("invalid archived creative page asset owner")
+			}
+			if _, err := normalizePageAssetIdentity(asset); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ImportCreativeWorksArchiveV7Tx 只还原已归档事实，不经过创建或重试入口。
+func (s *Store) ImportCreativeWorksArchiveV7Tx(ctx context.Context, tx *sql.Tx, agent string, items []CreativeWorkArchiveV7) error {
+	if tx == nil {
+		return fmt.Errorf("current creative restore transaction is required")
+	}
+	if err := ValidateCreativeWorksArchiveV7(agent, items); err != nil {
+		return err
+	}
+	for _, item := range items {
+		var owner, initialID string
+		var rowVersion int
+		if err := tx.QueryRowContext(ctx, `SELECT agent_name,initial_feedback_generation_id,row_version FROM k12_creative_works WHERE record_id=?`, item.WorkID).Scan(&owner, &initialID, &rowVersion); err != nil {
+			return err
+		}
+		if owner != agent {
+			return records.ErrScopeNotFound
+		}
+		if initialID != "" && initialID != item.InitialID {
+			return ErrCurrentCommandConflict
+		}
+		for _, g := range item.Generations {
+			existing, err := getWorkFeedbackGenerationVia(ctx, tx, agent, g.ID)
+			if err != nil && !errors.Is(err, records.ErrNotFound) {
+				return err
+			}
+			if err == nil {
+				if existing.WorkID != item.WorkID || existing.GenerationNo != g.Number || existing.CommandKey != g.CommandKey || existing.RequestDigest != g.RequestDigest || existing.Source != g.Source {
+					return ErrCurrentCommandConflict
+				}
+				if existing.Status == k12.WorkFeedbackSucceeded || (g.Status != k12.WorkFeedbackSucceeded && existing.UpdatedAt >= g.UpdatedAt) {
+					continue
+				}
+			}
+			source, _ := json.Marshal(g.Source)
+			feedback, projection := "", ""
+			if g.Feedback != nil {
+				raw, err := json.Marshal(g.Feedback)
+				if err != nil {
+					return err
+				}
+				feedback = string(raw)
+				projection = g.Feedback.ProjectionMarkdown
+			}
+			result, err := tx.ExecContext(ctx, `INSERT INTO k12_work_feedback_generations(generation_id,work_id,agent_name,generation_no,command_key,request_digest,status,feedback_type,source_snapshot_json,feedback_json,projection_markdown,failure_reason,attempt,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+				ON CONFLICT(generation_id) DO UPDATE SET status=excluded.status,feedback_json=excluded.feedback_json,projection_markdown=excluded.projection_markdown,failure_reason=excluded.failure_reason,attempt=excluded.attempt,updated_at=excluded.updated_at WHERE agent_name=excluded.agent_name AND work_id=excluded.work_id`, g.ID, item.WorkID, agent, g.Number, g.CommandKey, g.RequestDigest, g.Status, g.Source.WorkType, string(source), feedback, projection, g.FailureReason, g.Attempt, g.CreatedAt, g.UpdatedAt)
+			if err != nil {
+				return err
+			}
+			if count, err := result.RowsAffected(); err != nil {
+				return err
+			} else if count != 1 {
+				return records.ErrScopeNotFound
+			}
+		}
+		for _, inv := range item.Invocations {
+			var existingID, existingOwner string
+			err := tx.QueryRowContext(ctx, `SELECT invocation_id,agent_name FROM k12_image_task_invocations WHERE invocation_id=? OR (agent_name=? AND operation_key=? AND attempt=?)`, inv.InvocationID, agent, inv.OperationKey, inv.Attempt).Scan(&existingID, &existingOwner)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil {
+				if existingOwner != agent {
+					return records.ErrScopeNotFound
+				}
+				existing, err := getImageTaskInvocation(ctx, tx, agent, existingID)
+				if err != nil {
+					return err
+				}
+				if existing.WorkRecordID != item.WorkID || existing.OperationKey != inv.OperationKey || existing.Attempt != inv.Attempt || existing.RequestDigest != inv.RequestDigest || existing.RouteSnapshot != inv.RouteSnapshot {
+					return ErrImageTaskConflict
+				}
+				// 已发出的调用不能被旧备份降级成 prepared；仅合并更确定的结果。
+				if existing.Status != k12.ImageTaskInvocationPrepared &&
+					!(inv.Status == k12.ImageTaskInvocationSucceeded && existing.Status != k12.ImageTaskInvocationSucceeded) &&
+					!(existing.Status == k12.ImageTaskInvocationSent && (inv.Status == k12.ImageTaskInvocationOutcomeUnknown || inv.Status == k12.ImageTaskInvocationFailed)) {
+					continue
+				}
+				inv.InvocationID = existingID
+			}
+			route, _ := json.Marshal(inv.RouteSnapshot)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO k12_image_task_invocations(invocation_id,agent_name,work_record_id,operation,operation_key,request_digest,route_snapshot_json,status,attempt,provider_request_key,result_digest,result_json,error_kind,retry_safe,started_at,finished_at,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,?,?,'',?,?,?,?,?,?,?,?,?)
+				ON CONFLICT(invocation_id) DO UPDATE SET status=excluded.status,result_digest=excluded.result_digest,result_json=excluded.result_json,error_kind=excluded.error_kind,retry_safe=excluded.retry_safe,started_at=excluded.started_at,finished_at=excluded.finished_at,updated_at=excluded.updated_at,deadline_at=excluded.deadline_at`, inv.InvocationID, agent, item.WorkID, inv.Operation, inv.OperationKey, inv.RequestDigest, string(route), inv.Status, inv.Attempt, inv.ResultDigest, inv.ResultJSON, inv.ErrorKind, boolInt(inv.RetrySafe), inv.StartedAt, inv.FinishedAt, inv.CreatedAt, inv.UpdatedAt, inv.DeadlineAt); err != nil {
+				return err
+			}
+		}
+		for _, asset := range item.PageAssets {
+			existing, err := scanPageAsset(tx.QueryRowContext(ctx, `SELECT `+pageAssetColumns+` FROM k12_page_assets WHERE agent_name=? AND page_asset_id=?`, agent, asset.PageAssetID))
+			if err == nil {
+				if !pageAssetIdentityEqual(existing, asset) {
+					return ErrPageAssetConflict
+				}
+				continue
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO k12_page_assets(owner_scope,page_asset_id,agent_name,content_digest,media_type,size_bytes,pixel_width,pixel_height,orientation_policy,orientation_policy_version,transform_chain_json,storage_state,ready_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, asset.OwnerScope, asset.PageAssetID, agent, asset.ContentDigest, asset.MediaType, asset.SizeBytes, asset.PixelWidth, asset.PixelHeight, asset.OrientationPolicy, asset.OrientationPolicyVersion, asset.TransformChainJSON, asset.StorageState, asset.ReadyAt, asset.LastError, asset.CreatedAt, asset.UpdatedAt); err != nil {
+				return err
+			}
+		}
+		if initialID != "" && rowVersion >= item.RowVersion {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE k12_creative_works SET initial_feedback_generation_id=?,latest_feedback_generation_id=?,feedback_state=?,row_version=?,deleted_at=?,deleted_by=?,delete_command_key=?,delete_receipt_json=? WHERE record_id=? AND agent_name=?`, item.InitialID, item.LatestID, item.FeedbackState, item.RowVersion, item.DeletedAt, item.DeletedBy, item.DeleteCommandKey, item.DeleteReceiptJSON, item.WorkID, agent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // CreateAccumulationWithDerivedMetadata atomically writes canonical content,
 // validated server-derived metadata and each provenance record. source_ref is
@@ -651,6 +990,7 @@ func (s *Store) MarkWorkFeedbackGenerationRunning(
 func (s *Store) PrepareWorkFeedbackGeneration(
 	ctx context.Context,
 	agentName, workID, commandKey, requestDigest string,
+	nowAt ...int64,
 ) (k12.WorkFeedbackGeneration, bool, error) {
 	if agentName == "" || workID == "" || commandKey == "" || requestDigest == "" {
 		return k12.WorkFeedbackGeneration{}, false, ErrCurrentCommandConflict
@@ -673,6 +1013,13 @@ func (s *Store) PrepareWorkFeedbackGeneration(
 	}
 	if deletedAt.Valid {
 		return k12.WorkFeedbackGeneration{}, false, records.ErrNotFound
+	}
+	expiryNow := nowUnix()
+	if len(nowAt) > 0 {
+		expiryNow = nowAt[0]
+	}
+	if _, err := expirePreparedWorkFeedbackGenerations(ctx, tx, agentName, workID, expiryNow); err != nil {
+		return k12.WorkFeedbackGeneration{}, false, err
 	}
 	if initialID == "" {
 		source, err := legacyCreativeWorkSourceSnapshot(ctx, tx, agentName, workID)
@@ -810,6 +1157,81 @@ WHERE work_id=? AND agent_name=? AND command_key=?`,
 		return k12.WorkFeedbackGeneration{}, false, err
 	}
 	return next, true, nil
+}
+
+// ExpirePreparedWorkFeedbackGenerations 原子收敛未发送的过期点评与代次，保留成功的 latest。
+func (s *Store) ExpirePreparedWorkFeedbackGenerations(
+	ctx context.Context, agentName, workID string, now int64,
+) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	count, err := expirePreparedWorkFeedbackGenerations(ctx, tx, agentName, workID, now)
+	if err != nil {
+		return 0, err
+	}
+	return count, tx.Commit()
+}
+
+func expirePreparedWorkFeedbackGenerations(
+	ctx context.Context, tx *sql.Tx, agentName, workID string, now int64,
+) (int, error) {
+	rows, err := tx.QueryContext(ctx, `UPDATE k12_image_task_invocations AS i
+		SET status='failed',error_kind='interactive_deadline_exceeded',retry_safe=1,
+		    finished_at=?,updated_at=?
+		WHERE i.agent_name=? AND i.work_record_id=? AND i.operation='work_feedback'
+		  AND i.status='prepared' AND i.deadline_at>0 AND i.deadline_at<=?
+		  AND i.started_at=0 AND i.provider_request_key=''
+		  AND NOT EXISTS (SELECT 1 FROM k12_image_task_invocations newer
+		      WHERE newer.agent_name=i.agent_name AND newer.operation_key=i.operation_key
+		        AND newer.attempt>i.attempt)
+		  AND EXISTS (SELECT 1 FROM k12_work_feedback_generations g
+		      WHERE g.agent_name=i.agent_name AND g.work_id=i.work_record_id
+		        AND g.status IN ('queued','running')
+		        AND i.operation_key='work:'||g.work_id||':version:'||g.generation_id||':feedback')
+		RETURNING operation_key`, now, now, agentName, workID, now)
+	if err != nil {
+		return 0, err
+	}
+	var operationKeys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		operationKeys = append(operationKeys, key)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, key := range operationKeys {
+		if _, err := tx.ExecContext(ctx, `UPDATE k12_work_feedback_generations
+			SET status='failed',failure_reason='interactive_deadline_exceeded',updated_at=?
+			WHERE agent_name=? AND work_id=? AND status IN ('queued','running')
+			  AND 'work:'||work_id||':version:'||generation_id||':feedback'=?`,
+			now, agentName, workID, key); err != nil {
+			return 0, err
+		}
+	}
+	if len(operationKeys) > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE k12_creative_works
+			SET feedback_state='failed',row_version=row_version+1
+			WHERE agent_name=? AND record_id=? AND deleted_at IS NULL
+			  AND latest_feedback_generation_id='' AND feedback_state IN ('queued','running')
+			  AND initial_feedback_generation_id IN (SELECT generation_id
+			      FROM k12_work_feedback_generations WHERE agent_name=? AND work_id=? AND status='failed')`,
+			agentName, workID, agentName, workID); err != nil {
+			return 0, err
+		}
+	}
+	return len(operationKeys), nil
 }
 
 func legacyCreativeWorkSourceSnapshot(

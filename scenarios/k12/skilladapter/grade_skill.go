@@ -110,13 +110,16 @@ func renderGradeContent(res usecase.GradeResult) string {
 		return fmt.Sprintf("这道题孩子还没作答，先把解法和答案讲清楚：\n%s\n给家长的引导：让孩子照着思路自己再做一遍。", res.Solution)
 	}
 	var b strings.Builder
+	if strings.TrimSpace(res.Solution) != "" {
+		fmt.Fprintf(&b, "Parent reference — answer and complete solution:\n%s\n\n", res.Solution)
+	}
 	// 判定统一 Verdict 五值（§4.5 布尔删除）：agree=答对。
 	if res.Outcome.Verdict == usecase.VerdictAgree {
 		b.WriteString("答对了。可以追问一句他的思路，防止蒙对。")
 		return b.String()
 	}
 	fmt.Fprintf(&b, "第一个错步：%s\n错因：%s\n", res.Outcome.WrongStep, res.Outcome.ErrorCause)
-	b.WriteString("给家长的引导：让孩子自己回看这一步，别直接给正确答案。")
+	b.WriteString("Parent teaching method: use the complete reference above, explain the first incorrect step, and ask the child to explain and check that step.")
 	if res.RecordCreated {
 		fmt.Fprintf(&b, "\n（✓ 已记入错题本 · 知识点【%s】· 错因【%s】）", res.Outcome.KnowledgePoint, res.Outcome.ErrorCause)
 	}

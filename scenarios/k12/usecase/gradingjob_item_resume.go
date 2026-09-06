@@ -428,12 +428,12 @@ func (o *GradingOrchestrator) assessDurablePhotoItem(
 		SourceSession: req.SourceSession, Problem: q.Question, StudentAnswer: q.StudentAnswer,
 		KnowledgePoints: photoGradeKnowledgePoints(q),
 	}
+	if mode == PhotoModeGrade && q.AnswerState == AnswerStateBlank {
+		// 页级仍是批改卷，清晰空白条目仅复用求解链，不产生学生批改事实。
+		mode = PhotoModeSolve
+	}
 	if mode == PhotoModeGrade {
 		switch q.AnswerState {
-		case AnswerStateBlank:
-			item.Status = PhotoUnanswered
-			return commitGradingAssessmentItem(ctx, deps, job, q, item, "", "", "",
-				k12storage.GradingAssessmentEffects{})
 		case AnswerStateUnclear:
 			item.Status = PhotoAnswerUnclear
 			item.Warning = "检测到学生笔迹，但未能可靠读出；请家长补录后再批改"

@@ -56,6 +56,18 @@ func TestGradingFinalizerFreezesAnnotatedPageAssetBeforeFinalArtifactCommit(t *t
 		ResultSurface:  PhotoSurfaceAnnotatedHomework,
 		AnnotatedImage: &RenderedPhoto{Data: annotated, MIME: "image/png"},
 	}
+	pendingJob := fixture.job
+	pendingJob.Fields.ConfirmationState = k12.GradingConfirmationPending
+	if dispatchID, err := gradingFinalImageTaskDispatchID(pendingJob); err != nil ||
+		dispatchID != prepared.Dispatch.DispatchID {
+		t.Fatalf("pending confirmation must retain immutable source identity: dispatch=%q err=%v", dispatchID, err)
+	}
+	var pendingArtifact k12.GradingFinalArtifact
+	if err := fixture.orchestrator.freezeGradingFinalAnnotatedAsset(
+		ctx, fixture.run, pendingJob, &pendingArtifact,
+	); err == nil || pendingArtifact.HasAnnotatedAsset() {
+		t.Fatalf("pending page must not freeze a final annotated asset: artifact=%+v err=%v", pendingArtifact, err)
+	}
 	if _, err := fixture.orchestrator.deps.Records.MarkModelInvocationSucceededWithResult(
 		ctx,
 		fixture.invocation.AgentName,

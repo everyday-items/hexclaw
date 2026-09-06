@@ -7,26 +7,22 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
 )
 
-// 深度对话编排（PRD §3.3.4 渐进提示三阶段 + §3.3.4-6 情绪守门）。
-//
-// 架构：这是**领域行为**（"该给第几阶段的提示 / 要不要先安抚"），是确定性状态机，落在
-// 场景包 usecase，不塞进 engine/solve（评审 P0-2：给 engine 解耦，K12 领域行为不回灌内核）。
-// 本层只产出**分阶段指令**（PromptHint）+ 守门标志，交给上游把指令注入 LLM 系统提示生成
-// 面向家长的话术；阶段三的完整讲解另经 Solver 验算链取得可信解（不给未验证答案）。
+// 辅导编排始终面向家长提供完整参考；渐进提示只描述家长对孩子的讲题方法。
+// 情绪信号补充安抚建议，不阻断家长获得经 Solver 验算链取得的可信解。
 
-// TutorStage 渐进提示阶段（PRD §3.3.4-4）。
+// TutorStage 保留历史请求阶段值；新响应统一提供完整家长参考。
 type TutorStage int
 
 const (
-	StageHint1 TutorStage = 1 // 方向提示：1~2 条方向性提示，不含具体数字/算式
-	StageHint2 TutorStage = 2 // 具体提示：更具体，含批改（家长报了孩子作答时）
+	StageHint1 TutorStage = 1 // 兼容历史方向提示请求
+	StageHint2 TutorStage = 2 // 兼容历史方法提示请求
 	StageFull  TutorStage = 3 // 完整讲解：分步讲解 + 关键步标注 + 变式题
 )
 
 // TutorTurnRequest 一轮辅导输入信号（确定性驱动阶段推进 + 情绪守门）。
 type TutorTurnRequest struct {
 	AgentName     string     // 归属实例（T2.4：阶段三讲解完成时据此 + 题目定位错题推进 explained）
-	PriorStage    TutorStage // 上一轮阶段（0 = 尚未开始，起于阶段一）
+	PriorStage    TutorStage // 历史请求阶段，不再作为答案可见性门槛
 	ParentMessage string     // 家长本轮消息（检测升级/情绪/孩子作答意图）
 	StudentAnswer string     // 家长转述的孩子作答（非空 → 至少进阶段二批改）
 }
@@ -34,87 +30,34 @@ type TutorTurnRequest struct {
 // TutorDirective 一轮辅导的编排结论（喂给上游注入 LLM 提示）。
 type TutorDirective struct {
 	Stage      TutorStage `json:"stage"`
-	Comfort    bool       `json:"comfort"`     // 情绪守门命中：先安抚、暂停解题推进
+	Comfort    bool       `json:"comfort"`     // 情绪信号命中：补充安抚建议
 	EmotionCue string     `json:"emotion_cue"` // 命中的情绪信号词（可空）
 	Escalated  bool       `json:"escalated"`   // 本轮较上轮是否升级
 	PromptHint string     `json:"prompt_hint"` // 分阶段（或安抚）行为指令，注入系统提示
 }
 
-// 情绪信号词（PRD §3.3.4-6：孩子哭了/生气/烦了 → 切安抚，暂停解题推进）。
+// 情绪信号用于生成家长可采用的安抚建议。
 var emotionCues = []string{
 	"哭了", "哭", "生气", "发火", "发脾气", "闹脾气", "烦了", "不耐烦", "急了",
 	"不想学", "崩溃", "摔", "闹", "急哭", "委屈", "沮丧",
 }
 
-// 直接要完整讲解的信号（跳到阶段三）。
-var fullRequestCues = []string{
-	"直接讲", "完整讲解", "看讲解", "讲一遍", "给答案", "直接说答案", "别提示了", "直接看",
-}
-
-// 请求更具体提示 / 表示不会（阶段 +1）。
-var advanceCues = []string{
-	"不会", "不懂", "没懂", "还不会", "还是不会", "再提示", "多提示", "更具体", "提示多点",
-}
-
-// PlanTutorTurn 是渐进提示 + 情绪守门的确定性核心。纯函数，无 I/O，完全可单测。
+// PlanTutorTurn 自动提供完整家长参考，不要求逐轮解锁答案。
 func PlanTutorTurn(req TutorTurnRequest) TutorDirective {
-	msg := req.ParentMessage
-
-	// 情绪守门优先：命中即切安抚，**不推进阶段**（暂停解题推进，PRD §3.3.4-6）。
-	if cue := firstHit(msg, emotionCues); cue != "" {
-		stage := req.PriorStage
-		if stage == 0 {
-			stage = StageHint1
-		}
-		return TutorDirective{
-			Stage:      stage,
-			Comfort:    true,
-			EmotionCue: cue,
-			PromptHint: "孩子情绪不好了，先别急着讲题：共情安抚孩子的感受，肯定他已经付出的努力，把题目拆成更小的步骤、降低难度，等孩子平静下来再继续。这一轮不推进解题。",
-		}
+	directive := TutorDirective{
+		Stage:      StageFull,
+		Escalated:  req.PriorStage != 0 && req.PriorStage < StageFull,
+		PromptHint: "向家长提供正确答案、完整解法和讲题方法：分步骤写清楚、标注关键步。讲法包括 1~2 条方向性提示、关键方法或第一步怎么起，以及孩子卡住时怎样拆小步骤；给出家长可以直接使用的追问和检查方法。需要巩固时，沿既有验算链提供一道同知识点的变式题。按当前年级讲解，清晰题目自动解答并验算；只澄清无法辨认或相互矛盾的原题事实，不编造学生作答。内容简洁明确，不输出禁答提示或教学原则声明。",
 	}
-
-	prior := req.PriorStage
-	if prior == 0 {
-		prior = StageHint1
+	if strings.TrimSpace(req.StudentAnswer) != "" {
+		directive.PromptHint += " 家长报了孩子的作答：先独立解出正确答案再逐步对比；孩子对了就肯定并追问一句思路，防止蒙对；错了就指出第一个出错的步骤和错因，给出完整订正参考，以及家长可用的引导话术。"
 	}
-	stage := prior
-	switch {
-	case firstHit(msg, fullRequestCues) != "":
-		stage = StageFull
-	case req.StudentAnswer != "": // 家长报了孩子作答 → 进入批改（至少阶段二）
-		if stage < StageHint2 {
-			stage = StageHint2
-		}
-	case firstHit(msg, advanceCues) != "":
-		if stage < StageFull {
-			stage++
-		}
+	if cue := firstHit(req.ParentMessage, emotionCues); cue != "" {
+		directive.Comfort = true
+		directive.EmotionCue = cue
+		directive.PromptHint += " 孩子情绪不好时，给家长具体的安抚建议：共情孩子的感受，肯定已经付出的努力，把题目拆成更小的步骤、降低难度，等孩子平静下来再讲。"
 	}
-
-	escalated := req.PriorStage != 0 && stage > req.PriorStage
-	return TutorDirective{
-		Stage:      stage,
-		Escalated:  escalated,
-		PromptHint: stagePromptHint(stage, req.StudentAnswer != ""),
-	}
-}
-
-// stagePromptHint 返回某阶段注入 LLM 的行为指令（PRD §3.3.4-4 三阶段口径）。
-func stagePromptHint(stage TutorStage, hasStudentAnswer bool) string {
-	switch stage {
-	case StageHint1:
-		return "只给 1~2 条方向性提示，不要出现具体数字或算式，结尾鼓励孩子先自己动手试一试。默认不直接给答案。"
-	case StageHint2:
-		if hasStudentAnswer {
-			return "家长报了孩子的作答：先独立解出正确答案再逐步对比；孩子对了就肯定并追问一句思路（防蒙对），错了就指出第一个出错的步骤和错因，但**不要**直接给出正确答案，给家长一句引导话术让孩子自己发现。"
-		}
-		return "给更具体一点的提示（可以点到关键方法或第一步怎么起），但仍**不要**直接给出完整答案，留一步让孩子自己走。"
-	case StageFull:
-		return "现在给完整分步讲解：分步骤写清楚、标注关键步，讲完再留一道同知识点的变式题让孩子巩固。"
-	default:
-		return ""
-	}
+	return directive
 }
 
 // firstHit 返回 s 中命中的第一个关键词（按 cues 顺序）；无命中返回空串。
@@ -127,23 +70,21 @@ func firstHit(s string, cues []string) string {
 	return ""
 }
 
-// TutorTurnResult 辅导一轮的产物：编排指令 +（阶段三）验算过的完整解。
+// TutorTurnResult 辅导一轮的产物：家长讲题指令与验算过的完整解。
 type TutorTurnResult struct {
 	Directive TutorDirective
-	Solution  string        // 仅阶段三填：经 Solver 验算链的完整解
-	Evidence  SolveEvidence // 验算证据（阶段三）
+	Solution  string        // 经 Solver 验算链的完整解
+	Evidence  SolveEvidence // 验算证据
 }
 
-// TutorTurn 计算本轮编排；阶段三且给了题目时，调 Solver 验算链取可信完整解
-// （渐进提示不给未验证答案；阶段一二只出指令，由上游 LLM 生成话术）。
+// TutorTurn 在有题目时自动调用 Solver 取得完整解，不以提示阶段或情绪作为门槛。
 func (d Deps) TutorTurn(ctx context.Context, req TutorTurnRequest, problem, grade string) (TutorTurnResult, error) {
 	if err := validateGradeInput(grade); err != nil {
 		return TutorTurnResult{}, err
 	}
 	dir := PlanTutorTurn(req)
 	res := TutorTurnResult{Directive: dir}
-	// 仅在进入完整讲解且未被情绪守门暂停、且有题目时，取验算过的解。
-	if dir.Stage == StageFull && !dir.Comfort && strings.TrimSpace(problem) != "" && d.Solver != nil {
+	if strings.TrimSpace(problem) != "" && d.Solver != nil {
 		sr, err := d.Solver.Solve(ctx, problem, grade, d.constraintFor(ctx, grade))
 		if err != nil {
 			return res, err

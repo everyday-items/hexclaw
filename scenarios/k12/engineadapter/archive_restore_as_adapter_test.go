@@ -21,6 +21,14 @@ func TestArchiveRestoreAsMigratesPackedAssetsAndRollbackRemovesOnlyCreatedTarget
 	ctx := context.Background()
 	registerRestoreTarget(t, f)
 	bak, sourceBytes := archiveForRestoreAsWithAsset(t)
+	current, err := k12.NewCreativeWorkRecord("target-child", "", k12.CreativeWorkFields{WorkType: k12.WorkTypeWriting, DisplayName: "目标原作文"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, _, err := f.records.CreateCreativeWorkWithInitialGeneration(ctx, current, "target-current-before-restore", "target-current-source", k12.CreativeWorkSourceSnapshot{WorkType: k12.WorkTypeWriting, ContentMarkdown: "迁移前的原文"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	d := usecase.Deps{ArchiveMigrator: f.restore, Now: func() int64 { return 500 }}
 	result, err := d.RestoreAs(ctx, usecase.RestoreAsRequest{
@@ -58,6 +66,10 @@ func TestArchiveRestoreAsMigratesPackedAssetsAndRollbackRemovesOnlyCreatedTarget
 	}
 	if _, err := assetstore.PathFromID(targetRefs[0]); err == nil {
 		t.Fatalf("rollback left migration-created target asset %q", targetRefs[0])
+	}
+	restored, err := f.records.GetWorkFeedbackGeneration(ctx, "target-child", generation.GenerationID)
+	if err != nil || restored.Source != generation.Source {
+		t.Fatalf("rollback lost preexisting current work source: err=%v", err)
 	}
 	// Immutable source payload remains recoverable even after target cleanup.
 	var archiveJSON string

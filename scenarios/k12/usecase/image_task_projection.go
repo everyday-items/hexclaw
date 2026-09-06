@@ -110,8 +110,9 @@ func (o *GradingOrchestrator) ImageTaskHomeworkProjection(
 	if stage == k12.GradingStageAwaitingConfirmation &&
 		job.Fields.ConfirmationState == k12.GradingConfirmationPending &&
 		job.Fields.BudgetSnapshot.IsFrozen() && automaticPhotoConfirmationSource(job.Fields.SourceKind) {
-		if run, loadErr := o.ensureRun(ctx, jobID); loadErr == nil && run.req.TaskIntent == PhotoTaskBlankWorksheet {
-			clear := clearWorksheetQuestionIDs(questions)
+		if run, loadErr := o.ensureRun(ctx, jobID); loadErr == nil &&
+			(run.req.TaskIntent == PhotoTaskBlankWorksheet || run.req.TaskIntent == PhotoTaskCompletedHomework) {
+			clear := clearWorksheetQuestionIDs(questions, run.req.TaskIntent)
 			published := make(map[string]int)
 			for _, item := range durableProjection.ProgressiveSnapshot.ProblemProgress {
 				published[item.ProblemID] = item.PublishedRevision

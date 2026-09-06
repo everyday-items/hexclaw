@@ -2,6 +2,7 @@ package curriculum
 
 import (
 	"context"
+	"sort"
 	"testing"
 )
 
@@ -20,6 +21,9 @@ func TestCurriculum_ForwardLookup(t *testing.T) {
 		t.Fatalf("词表应≥30 条, got %d", c.Size())
 	}
 	allowed, _ := c.Allowed(context.Background(), "五年级上")
+	if !sort.StringsAreSorted(allowed) {
+		t.Error("已学知识点必须按确定顺序输出，避免相同输入的请求摘要漂移")
+	}
 	// 五年级上已学：小数乘法/简易方程（首学 ≤ 五上）
 	if !has(allowed, "小数乘法") || !has(allowed, "简易方程") {
 		t.Errorf("五年级上应含小数乘法+简易方程")

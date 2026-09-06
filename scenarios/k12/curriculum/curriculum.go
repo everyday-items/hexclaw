@@ -10,6 +10,7 @@ package curriculum
 
 import (
 	"context"
+	"sort"
 
 	"github.com/hexagon-codes/hexclaw/scenario"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -71,6 +72,7 @@ func (c *Curriculum) Allowed(_ context.Context, grade string) ([]string, error) 
 			out = append(out, kp)
 		}
 	}
+	sort.Strings(out)
 	return out, nil
 }
 

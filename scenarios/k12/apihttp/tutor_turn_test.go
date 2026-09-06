@@ -4,18 +4,18 @@ import (
 	"testing"
 )
 
-func TestTutorTurn_Stage1NoSolution(t *testing.T) {
+func TestTutorTurn_FirstTurnHasSolution(t *testing.T) {
 	h := newServer(t)
 	rec, out := do(t, h, "POST", "/tutor-turn",
 		`{"agent":"mingming","prior_stage":0,"parent_message":"这道题怎么讲","problem":"3.8×3","grade":"五年级上"}`)
 	if rec.Code != 200 {
 		t.Fatalf("状态 %d", rec.Code)
 	}
-	if int(out["stage"].(float64)) != 1 {
-		t.Errorf("首轮应阶段一, got %v", out["stage"])
+	if int(out["stage"].(float64)) != 3 {
+		t.Errorf("首轮应完整家长参考, got %v", out["stage"])
 	}
-	if s, _ := out["solution"].(string); s != "" {
-		t.Errorf("阶段一不应给解, got %q", s)
+	if s, _ := out["solution"].(string); s == "" {
+		t.Error("首轮应自动给出完整解")
 	}
 }
 

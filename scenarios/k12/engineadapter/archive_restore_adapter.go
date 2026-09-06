@@ -63,6 +63,9 @@ func (a *ArchiveRestoreAdapter) RestoreHexbak(ctx context.Context, bak *usecase.
 			if err := a.records.ImportAgentRecordsTx(ctx, tx, bak.AgentName, bak.Records); err != nil {
 				return fmt.Errorf("merge hexbak records: %w", err)
 			}
+			if err := a.records.ImportCreativeWorksArchiveV7Tx(ctx, tx, bak.AgentName, bak.CurrentCreativeWorks); err != nil {
+				return fmt.Errorf("restore current creative works: %w", err)
+			}
 			if err := a.records.ImportProblemAttemptSnapshotsTx(
 				ctx, tx, bak.AgentName, bak.ProblemAttempts,
 			); err != nil {

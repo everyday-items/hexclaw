@@ -190,10 +190,13 @@ func (d Deps) attachAIFeedback(ctx context.Context, agentName, recordID, feedbac
 	last.Feedback = feedback
 	last.FeedbackSource = k12.FeedbackSourceAI
 	last.FeedbackSkill = skillStamp
-	structured := buildStructuredWorkFeedback(
+	structured, err := buildStructuredWorkFeedback(
 		v.Fields.WorkType, *last, feedback, k12.FeedbackSourceAI, skillStamp,
 	)
-	if err := structured.Validate(); err != nil {
+	if err == nil {
+		err = structured.Validate()
+	}
+	if err != nil {
 		return CreativeWorkView{}, fmt.Errorf("%w: 结构化作品点评非法: %v", ErrInvalidInput, err)
 	}
 	// Persist the deterministic canonical projection, never the provider's raw
@@ -207,7 +210,7 @@ func (d Deps) attachAIFeedback(ctx context.Context, agentName, recordID, feedbac
 	return d.GetCreativeWork(ctx, agentName, recordID)
 }
 
-func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersion, feedback, source, methodRef string) k12.WorkFeedback {
+func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersion, feedback, source, methodRef string) (k12.WorkFeedback, error) {
 	refs := make([]string, 0, 2)
 	if version.OCRJobID != "" && version.OCRVersion > 0 && version.OCRConfirmedDigest != "" {
 		refs = append(refs, fmt.Sprintf("ocr-confirmed:%s:v%d:sha256:%s",
@@ -228,26 +231,130 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	}
 	clauses := make([]feedbackClause, 0, 8)
 	inSuggestionSection := false
+	artSection, artItem := "", 0
+	strictFeedback := (workType == k12.WorkTypeArt || workType == k12.WorkTypeWriting) && source == k12.FeedbackSourceAI
+	artSections := make(map[string]bool, 4)
+	var affirmationLines, guidanceLines, practiceLines, experimentLines []string
+	hasGuidanceContent := false
+	experimentTitle := ""
 	for _, line := range strings.Split(strings.TrimSpace(feedback), "\n") {
 		rawLine := strings.TrimSpace(line)
 		normalizedLine := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(k12.NormalizeWorkFeedbackAtom(rawLine), "："), ":"))
 		isHeading := strings.HasPrefix(rawLine, "#")
+		// 新AI输出按固定语义标题映射；旧手录路径继续使用原解析。
+		if strictFeedback {
+			if rawLine == "" {
+				if workType == k12.WorkTypeWriting && artSection == "guidance" {
+					guidanceLines = append(guidanceLines, "")
+				}
+				continue
+			}
+			if isHeading {
+				if workType == k12.WorkTypeWriting && artSection == "guidance" && strings.HasPrefix(rawLine, "### ") {
+					guidanceLines = append(guidanceLines, line)
+					continue
+				}
+				switch rawLine {
+				case "## 可见证据":
+					artSection = "observation"
+				case "## 先这样肯定":
+					artSection = "affirmation"
+				case "## 家长可以这样问或讲":
+					artSection = "guidance"
+				case "## 下一次只试一个点":
+					artSection = "practice"
+				default:
+					return k12.WorkFeedback{}, fmt.Errorf("work feedback contains an unexpected section heading")
+				}
+				if artSections[artSection] {
+					return k12.WorkFeedback{}, fmt.Errorf("work feedback contains a duplicate section")
+				}
+				artSections[artSection] = true
+				continue
+			}
+			normalizedLine = k12.NormalizeWorkFeedbackAtom(rawLine)
+			if normalizedLine == "" {
+				continue
+			}
+			switch artSection {
+			case "observation":
+				clauses = append(clauses, feedbackClause{text: normalizedLine})
+			case "affirmation":
+				affirmationLines = append(affirmationLines, normalizedLine)
+			case "guidance":
+				hasGuidanceContent = true
+				if workType == k12.WorkTypeWriting {
+					guidanceLines = append(guidanceLines, line)
+				} else {
+					guidanceLines = append(guidanceLines, normalizedLine)
+				}
+			case "practice":
+				practiceLines = append(practiceLines, normalizedLine)
+			default:
+				return k12.WorkFeedback{}, fmt.Errorf("work feedback contains content outside its sections")
+			}
+			continue
+		}
 		if isHeading {
 			if strings.Contains(normalizedLine, "建议") ||
 				strings.Contains(normalizedLine, "下一步") ||
-				strings.Contains(normalizedLine, "小任务") {
+				strings.Contains(normalizedLine, "小任务") ||
+				strings.Contains(normalizedLine, "下次可以试试") {
 				inSuggestionSection = true
 			} else {
 				inSuggestionSection = false
+			}
+			if workType == k12.WorkTypeArt {
+				artSection, artItem = "", 0
+				switch {
+				case inSuggestionSection:
+					artSection = "suggestion"
+				case strings.Contains(normalizedLine, "值得保留"), strings.Contains(normalizedLine, "亮点"), strings.Contains(normalizedLine, "先这样肯定"):
+					artSection = "affirmation"
+				}
 			}
 			continue
 		}
 		switch normalizedLine {
 		case "观察与依据", "观察", "我在画里看到", "我在画里看到……", "我在画里看到...":
 			inSuggestionSection = false
+			artSection, artItem = "", 0
 			continue
 		case "下一步建议", "建议", "下次可以试试", "下次可以试试的小实验":
 			inSuggestionSection = true
+			if workType == k12.WorkTypeArt {
+				artSection, artItem = "suggestion", 0
+			}
+			continue
+		}
+		// 保留明确亮点和第一项完整小实验，不把其内部句子误当三个独立角色或可见事实。
+		if workType == k12.WorkTypeArt && artSection != "" {
+			if normalizedLine == "" {
+				continue
+			}
+			numberSuffix := strings.TrimLeft(rawLine, "0123456789")
+			numbered := len(numberSuffix) < len(rawLine) &&
+				(strings.HasPrefix(numberSuffix, ". ") || strings.HasPrefix(numberSuffix, "、") || strings.HasPrefix(numberSuffix, ") "))
+			strongTitle := strings.HasPrefix(rawLine, "**") && strings.HasSuffix(rawLine, "**") && strings.Count(rawLine, "**") == 2
+			itemBoundary := numbered || strongTitle
+			if itemBoundary {
+				artItem++
+			}
+			if artItem <= 1 {
+				if artSection == "affirmation" {
+					affirmationLines = append(affirmationLines, normalizedLine)
+				} else {
+					experimentLines = append(experimentLines, normalizedLine)
+					switch {
+					case itemBoundary:
+						experimentTitle = normalizedLine
+					case strings.Contains(normalizedLine, "分钟练习"), strings.HasPrefix(normalizedLine, "练习："), len(practiceLines) > 0:
+						practiceLines = append(practiceLines, normalizedLine)
+					default:
+						guidanceLines = append(guidanceLines, normalizedLine)
+					}
+				}
+			}
 			continue
 		}
 		for _, clause := range strings.FieldsFunc(rawLine, func(r rune) bool {
@@ -263,6 +370,9 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 				clauses = append(clauses, feedbackClause{text: normalized, suggestionSection: inSuggestionSection})
 			}
 		}
+	}
+	if strictFeedback && (len(artSections) != 4 || len(clauses) == 0 || len(affirmationLines) == 0 || !hasGuidanceContent || len(practiceLines) == 0) {
+		return k12.WorkFeedback{}, fmt.Errorf("work feedback requires four nonempty sections")
 	}
 	isScaffold := func(value string) bool {
 		normalized := k12.NormalizeWorkFeedbackAtom(value)
@@ -291,7 +401,7 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		}
 		return false
 	}
-	limitations := "仅依据本版本提交的孩子原文进行观察，不评价能力高低，也不代写全文。"
+	limitations := "观察依据为孩子原稿；修改示范与参考稿供家长辅导使用。"
 	if workType == k12.WorkTypeArt {
 		limitations = "仅依据本版本提交的可见画面进行观察，不评分、不排名，也不替孩子重画。"
 	}
@@ -299,6 +409,10 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	suggestions := make([]string, 0, 3)
 	for _, item := range clauses {
 		clause := k12.NormalizeWorkFeedbackAtom(item.text)
+		if strictFeedback {
+			observationEvidence = append(observationEvidence, clause)
+			continue
+		}
 		if clause == "" || isScaffold(clause) {
 			continue
 		}
@@ -325,7 +439,7 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 				}
 			}
 		}
-	} else {
+	} else if !strictFeedback {
 		// BUG-20260726-003: a detailed provider response can contain many valid
 		// short observations. Joining every item after the second into one row
 		// made that row exceed the canonical 500-rune atom limit and rejected
@@ -415,6 +529,24 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 			Evidence:  evidence,
 		})
 	}
+	affirmation := strings.Join(affirmationLines, " ")
+	parentGuidance := strings.Join(guidanceLines, " ")
+	nextStep := strings.TrimSpace(experimentTitle + " " + strings.Join(practiceLines, " "))
+	if strictFeedback {
+		if workType == k12.WorkTypeWriting {
+			parentGuidance = strings.TrimSpace(strings.Join(guidanceLines, "\n"))
+			suggestions = []string{nextStep}
+		} else {
+			suggestions = []string{strings.TrimSpace(parentGuidance + " " + nextStep)}
+		}
+	}
+	if len(experimentLines) > 0 {
+		completeExperiment := strings.Join(experimentLines, " ")
+		suggestions = []string{completeExperiment}
+		if len(practiceLines) == 0 {
+			nextStep, parentGuidance = completeExperiment, ""
+		}
+	}
 	if len(suggestions) == 0 {
 		suggestions = append(suggestions, "和孩子一起回看这条观察，并由孩子选择一处小改动后提交新版本。")
 	}
@@ -440,10 +572,13 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 		},
 		Limitations:        limitations,
 		Suggestions:        suggestions,
+		Affirmation:        affirmation,
+		ParentGuidance:     parentGuidance,
+		NextStep:           nextStep,
 		ProjectionMarkdown: "",
 	}
 	structured.ProjectionMarkdown = k12.ProjectWorkFeedbackMarkdown(structured)
-	return structured
+	return structured, nil
 }
 
 // SubmitRevision 只保留旧调用者的拒绝边界；当前作品每次保存都创建独立作品。

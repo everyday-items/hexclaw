@@ -35,13 +35,13 @@ func (s *ReviewSkill) Name() string      { return "k12_review" }
 func (s *ReviewSkill) Match(string) bool { return false } // 只经 LLM 工具调用，不走关键词快路
 
 func (s *ReviewSkill) Description() string {
-	return "取出孩子错题本里到期该复习的错题，给家长今天的陪练方案（含最薄弱知识点 + 引导话术，守答案遮罩不直接给答案）。"
+	return "取出孩子到期复习项，给家长已有正确答案、薄弱知识点与陪练讲法。缺少完整解法时继续调用解题能力，不要求家长自己做题。"
 }
 
 func (s *ReviewSkill) ToolDefinition() llm.ToolDefinition {
 	return llm.NewToolDefinition("k12_review",
 		"Fetch the child's DUE mistakes from the mistake book and produce today's review plan for the parent. "+
-			"Returns the due-review queue (problem / knowledge-point / last error-cause), the weakest knowledge point, and coaching tips (answer-masking: never hand the child the answer). "+
+			"Returns the due-review queue, available canonical answers, the weakest knowledge point, and parent coaching tips. Provide the parent with the correct answers and complete solutions; use the solving tool for missing solutions rather than asking the parent to solve them. "+
 			"Use when a parent asks to review or practice the child's past mistakes. The child instance is resolved automatically — do NOT pass an agent id.",
 		&llm.Schema{Type: "object"})
 }
@@ -75,7 +75,7 @@ func (s *ReviewSkill) Execute(ctx context.Context, args map[string]any) (*skill.
 	}, nil
 }
 
-// renderReviewContent 面向家长/LLM 的陪练方案文本。守答案遮罩：给引导话术，不直接报答案。
+// renderReviewContent 给家长已有答案和陪练方法，不把孩子的练习方式当作答案可见性门槛。
 func renderReviewContent(items []usecase.ReviewItem) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "今天有 %d 个复习项该陪孩子练了", len(items))
@@ -99,12 +99,15 @@ func renderReviewContent(items []usecase.ReviewItem) string {
 			b.WriteString("）")
 		}
 		b.WriteString("\n")
+		if answer := strings.TrimSpace(it.Fields.CanonicalAnswer); answer != "" {
+			fmt.Fprintf(&b, "   Parent reference answer: %s\n", answer)
+		}
 	}
 	if len(items) > reviewListMax {
 		fmt.Fprintf(&b, "……还有 %d 道，先过这几道，别一次堆太多。\n", len(items)-reviewListMax)
 	}
 
-	b.WriteString("\n陪练建议：让孩子先自己重做，别急着提醒；做完再对，卡住了先用问题引导（比如「这一步为什么这样算」），别直接报答案。做对了就标记掌握，错题本会自动帮你排下次复习。")
+	b.WriteString("\n陪练建议：家长先看正确答案和完整解法，再按题意、方法、计算、检查的顺序给孩子讲。已有答案直接提供，缺少完整解法时由 AI 继续解题验算，不要求家长先做题。孩子的真实重做结果交由系统处理，不凭讲解或主观确认标记掌握。")
 
 	return b.String()
 }

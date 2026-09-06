@@ -152,7 +152,7 @@ func TestBuildTutoringTipsUsesConfirmedServerFactsAndExactlyThreeSections(t *tes
 	if len(tips.Problems) != 2 || tips.Problems[0].ProblemID != "problem-1" || tips.Problems[1].ProblemID != "problem-2" {
 		t.Fatalf("canonical exact-set lost: %+v", tips.Problems)
 	}
-	wantTitles := []string{"这页在练什么", "小明要留意", "每道题怎么带（不直接给答案）"}
+	wantTitles := []string{"这页在练什么", "小明要留意", "每道题的答案与讲法"}
 	if len(tips.Sections) != len(wantTitles) {
 		t.Fatalf("sections=%d want exactly %d: %+v", len(tips.Sections), len(wantTitles), tips.Sections)
 	}

@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
 
@@ -216,7 +218,15 @@ func validatePreparedDelivery(prepared PreparedTextDelivery) error {
 func (d Deps) ResolveDeliveryTargets(
 	ctx context.Context,
 	agentName string,
-) ([]ResolvedDeliveryTarget, error) {
+) (resolved []ResolvedDeliveryTarget, resolveErr error) {
+	startedAt := time.Now()
+	slog.Info("K12 delivery target resolution started", "agent_id", agentName,
+		"transport_available", d.Delivery != nil)
+	defer func() {
+		slog.Info("K12 delivery target resolution finished", "agent_id", agentName,
+			"targets_count", len(resolved), "elapsed_ms", time.Since(startedAt).Milliseconds(),
+			"no_active_direct_bindings", errors.Is(resolveErr, ErrNoActiveDirectBindings), "error", resolveErr)
+	}()
 	if d.Delivery == nil {
 		return nil, ErrDeliveryUnavailable
 	}
@@ -225,6 +235,8 @@ func (d Deps) ResolveDeliveryTargets(
 		return nil, ErrDeliveryUnavailable
 	}
 	targets, err := batchTransport.ResolveTextTargets(ctx, strings.TrimSpace(agentName))
+	slog.Info("K12 delivery targets resolved", "agent_id", agentName,
+		"targets_count", len(targets), "targets", targets, "error", err)
 	if err != nil {
 		return nil, err
 	}
@@ -623,7 +635,15 @@ func (d Deps) prepareDeliveryBatchResources(
 			failures = append(failures, fmt.Sprintf("part %d media preparation is unavailable", receipt.BatchOrdinal))
 			continue
 		}
+		resourceStartedAt := time.Now()
+		slog.Info("K12 delivery resource preparation started", "agent_id", receipt.AgentName,
+			"batch_id", batch.BatchID, "delivery_id", receipt.DeliveryID, "part_kind", receipt.PartKind,
+			"platform", receipt.Target.Platform, "instance_id", receipt.Target.InstanceID)
 		resourceID, err := preparer.PrepareDeliveryPartResource(ctx, receipt)
+		slog.Info("K12 delivery resource preparation finished", "agent_id", receipt.AgentName,
+			"batch_id", batch.BatchID, "delivery_id", receipt.DeliveryID,
+			"resource_available", strings.TrimSpace(resourceID) != "",
+			"elapsed_ms", time.Since(resourceStartedAt).Milliseconds(), "error", err)
 		resourceID = strings.TrimSpace(resourceID)
 		if err != nil || resourceID == "" {
 			detail := "media preparation returned no resource id"
@@ -661,7 +681,14 @@ func (d Deps) prepareDeliveryBatchResources(
 func (d Deps) sendDeliveryBatch(
 	ctx context.Context,
 	batch k12.DeliveryBatch,
-) (k12.DeliveryBatch, error) {
+) (result k12.DeliveryBatch, batchErr error) {
+	startedAt := time.Now()
+	slog.Info("K12 delivery batch started", "agent_id", batch.AgentName, "batch_id", batch.BatchID,
+		"object_kind", batch.ObjectKind, "object_id", batch.ObjectID, "receipts_count", len(batch.Receipts))
+	defer func() {
+		slog.Info("K12 delivery batch finished", "agent_id", batch.AgentName, "batch_id", batch.BatchID,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(), "receipts_count", len(result.Receipts), "error", batchErr)
+	}()
 	var err error
 	if _, _, err = creativeDeliveryEnvelopeGroups(batch); err != nil {
 		return batch, err
@@ -1259,7 +1286,14 @@ func (d Deps) sendPreparedDeliveryEnvelope(
 	ctx context.Context,
 	batch k12.DeliveryBatch,
 	receipts []k12.DeliveryReceipt,
-) ([]k12.DeliveryReceipt, error) {
+) (result []k12.DeliveryReceipt, deliveryErr error) {
+	startedAt := time.Now()
+	slog.Info("K12 delivery envelope started", "agent_id", batch.AgentName, "batch_id", batch.BatchID,
+		"delivery_ids", deliveryReceiptIDs(receipts))
+	defer func() {
+		slog.Info("K12 delivery envelope finished", "agent_id", batch.AgentName, "batch_id", batch.BatchID,
+			"delivery_ids", deliveryReceiptIDs(receipts), "elapsed_ms", time.Since(startedAt).Milliseconds(), "error", deliveryErr)
+	}()
 	transport, ok := d.Delivery.(DeliveryEnvelopeTransport)
 	if !ok {
 		return receipts, fmt.Errorf("%w: creative delivery envelope transport unavailable", ErrDeliveryUnavailable)
@@ -1283,7 +1317,14 @@ func (d Deps) sendPreparedDeliveryEnvelope(
 	if !began {
 		return started, nil
 	}
+	providerStartedAt := time.Now()
+	slog.Info("K12 delivery envelope provider started", "agent_id", batch.AgentName,
+		"batch_id", batch.BatchID, "delivery_ids", deliveryReceiptIDs(started))
 	ack, sendErr := transport.SendPreparedEnvelope(ctx, started)
+	slog.Info("K12 delivery envelope provider finished", "agent_id", batch.AgentName,
+		"batch_id", batch.BatchID, "delivery_ids", deliveryReceiptIDs(started),
+		"elapsed_ms", time.Since(providerStartedAt).Milliseconds(), "status", ack.Status,
+		"external_message_id", ack.ExternalMessageID, "detail", ack.Detail, "error", sendErr)
 	return d.persistDeliveryEnvelopeSendOutcome(context.WithoutCancel(ctx), started, ack, sendErr)
 }
 
@@ -1352,7 +1393,13 @@ func (d Deps) queryPreparedDeliveryEnvelope(
 	if strings.TrimSpace(first.ExternalMessageID) == "" {
 		return receipts, fmt.Errorf("%w: creative delivery envelope has no query id", ErrDeliveryQueryUnavailable)
 	}
+	queryStartedAt := time.Now()
+	slog.Info("K12 delivery envelope query started", "agent_id", first.AgentName,
+		"delivery_ids", deliveryReceiptIDs(receipts), "external_message_id", first.ExternalMessageID)
 	ack, queryErr := transport.QueryPreparedEnvelope(ctx, receipts)
+	slog.Info("K12 delivery envelope query finished", "agent_id", first.AgentName,
+		"delivery_ids", deliveryReceiptIDs(receipts), "elapsed_ms", time.Since(queryStartedAt).Milliseconds(),
+		"status", ack.Status, "external_message_id", ack.ExternalMessageID, "detail", ack.Detail, "error", queryErr)
 	if ack.ExternalMessageID == "" {
 		ack.ExternalMessageID = first.ExternalMessageID
 	}
@@ -1408,7 +1455,15 @@ func (d Deps) creativeDeliveryEnvelopeForReceipt(
 	return nil, false, fmt.Errorf("%w: creative delivery envelope group is missing", records.ErrIllegalTransition)
 }
 
-func (d Deps) sendPreparedDelivery(ctx context.Context, receipt k12.DeliveryReceipt) (k12.DeliveryReceipt, error) {
+func (d Deps) sendPreparedDelivery(ctx context.Context, receipt k12.DeliveryReceipt) (result k12.DeliveryReceipt, deliveryErr error) {
+	startedAt := time.Now()
+	slog.Info("K12 delivery part started", "agent_id", receipt.AgentName, "delivery_id", receipt.DeliveryID,
+		"part_kind", receipt.PartKind, "platform", receipt.Target.Platform, "instance_id", receipt.Target.InstanceID)
+	defer func() {
+		slog.Info("K12 delivery part finished", "agent_id", receipt.AgentName, "delivery_id", receipt.DeliveryID,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(), "status", result.Status,
+			"external_message_id", result.ExternalMessageID, "error", deliveryErr)
+	}()
 	if receipt.PartKind == messagecontent.PartArtifact && strings.TrimSpace(receipt.PreparedResourceID) == "" {
 		return receipt, fmt.Errorf("%w: artifact part has no prepared provider resource", records.ErrIllegalTransition)
 	}
@@ -1419,7 +1474,13 @@ func (d Deps) sendPreparedDelivery(ctx context.Context, receipt k12.DeliveryRece
 	if !began {
 		return started, nil
 	}
+	providerStartedAt := time.Now()
+	slog.Info("K12 delivery part provider started", "agent_id", receipt.AgentName,
+		"delivery_id", receipt.DeliveryID)
 	ack, sendErr := d.Delivery.SendPrepared(ctx, started)
+	slog.Info("K12 delivery part provider finished", "agent_id", receipt.AgentName,
+		"delivery_id", receipt.DeliveryID, "elapsed_ms", time.Since(providerStartedAt).Milliseconds(),
+		"status", ack.Status, "external_message_id", ack.ExternalMessageID, "detail", ack.Detail, "error", sendErr)
 	return d.persistDeliverySendOutcome(context.WithoutCancel(ctx), started, ack, sendErr)
 }
 
@@ -1504,7 +1565,13 @@ func (d Deps) QueryDeliveryReceipt(ctx context.Context, agentName, deliveryID st
 	if strings.TrimSpace(receipt.ExternalMessageID) == "" {
 		return receipt, fmt.Errorf("%w: 平台没有返回查询编号，禁止盲目重发", ErrDeliveryQueryUnavailable)
 	}
+	queryStartedAt := time.Now()
+	slog.Info("K12 delivery part query started", "agent_id", receipt.AgentName,
+		"delivery_id", receipt.DeliveryID, "external_message_id", receipt.ExternalMessageID)
 	ack, queryErr := d.Delivery.QueryPrepared(ctx, receipt)
+	slog.Info("K12 delivery part query finished", "agent_id", receipt.AgentName,
+		"delivery_id", receipt.DeliveryID, "elapsed_ms", time.Since(queryStartedAt).Milliseconds(),
+		"status", ack.Status, "external_message_id", ack.ExternalMessageID, "detail", ack.Detail, "error", queryErr)
 	if ack.ExternalMessageID == "" {
 		ack.ExternalMessageID = receipt.ExternalMessageID
 	}

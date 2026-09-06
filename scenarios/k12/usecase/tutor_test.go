@@ -6,27 +6,27 @@ import (
 	"testing"
 )
 
-func TestPlanTutorTurn_StartsAtStage1(t *testing.T) {
+func TestPlanTutorTurn_StartsWithFullParentReference(t *testing.T) {
 	d := PlanTutorTurn(TutorTurnRequest{})
-	if d.Stage != StageHint1 || d.Comfort || d.Escalated {
-		t.Fatalf("首轮应阶段一、无守门、无升级, got %+v", d)
+	if d.Stage != StageFull || d.Comfort || d.Escalated {
+		t.Fatalf("首轮应完整家长参考、无安抚、无升级, got %+v", d)
 	}
-	if !strings.Contains(d.PromptHint, "方向") {
-		t.Errorf("阶段一指令应含方向性提示: %q", d.PromptHint)
+	if !strings.Contains(d.PromptHint, "正确答案") || !strings.Contains(d.PromptHint, "家长") {
+		t.Errorf("指令应给家长答案与讲法: %q", d.PromptHint)
 	}
 }
 
 func TestPlanTutorTurn_AdvanceOnNotUnderstand(t *testing.T) {
 	d := PlanTutorTurn(TutorTurnRequest{PriorStage: StageHint1, ParentMessage: "他还是不会"})
-	if d.Stage != StageHint2 || !d.Escalated {
-		t.Fatalf("不会应升到阶段二: %+v", d)
+	if d.Stage != StageFull || !d.Escalated {
+		t.Fatalf("无需家长逐轮解锁完整讲法: %+v", d)
 	}
 }
 
 func TestPlanTutorTurn_StudentAnswerEntersGrading(t *testing.T) {
 	d := PlanTutorTurn(TutorTurnRequest{PriorStage: StageHint1, StudentAnswer: "11.6"})
-	if d.Stage != StageHint2 {
-		t.Fatalf("报了作答应进阶段二批改: %+v", d)
+	if d.Stage != StageFull {
+		t.Fatalf("报了作答也应给完整家长参考: %+v", d)
 	}
 	if !strings.Contains(d.PromptHint, "第一个出错") {
 		t.Errorf("阶段二含作答应走批改指令: %q", d.PromptHint)
@@ -38,19 +38,19 @@ func TestPlanTutorTurn_FullRequestJumpsToStage3(t *testing.T) {
 	if d.Stage != StageFull || !d.Escalated {
 		t.Fatalf("直接讲应跳阶段三: %+v", d)
 	}
-	if !strings.Contains(d.PromptHint, "变式题") {
-		t.Errorf("阶段三应留变式题: %q", d.PromptHint)
+	if !strings.Contains(d.PromptHint, "完整") || !strings.Contains(d.PromptHint, "家长") {
+		t.Errorf("完整讲解应面向家长: %q", d.PromptHint)
 	}
 }
 
-func TestPlanTutorTurn_EmotionGateHoldsStage(t *testing.T) {
-	// 情绪命中 → 守门，不推进阶段（即便同时说"不会"）。
+func TestPlanTutorTurn_EmotionKeepsFullParentReference(t *testing.T) {
+	// 安抚孩子与提供家长备课参考可以同时完成。
 	d := PlanTutorTurn(TutorTurnRequest{PriorStage: StageHint2, ParentMessage: "他不会，急哭了"})
 	if !d.Comfort {
 		t.Fatalf("情绪应触发守门: %+v", d)
 	}
-	if d.Stage != StageHint2 {
-		t.Errorf("守门应保持原阶段（暂停推进）, got %d", d.Stage)
+	if d.Stage != StageFull {
+		t.Errorf("安抚不能挡住家长完整参考, got %d", d.Stage)
 	}
 	if d.EmotionCue == "" || !strings.Contains(d.PromptHint, "安抚") {
 		t.Errorf("守门指令应含安抚: cue=%q hint=%q", d.EmotionCue, d.PromptHint)
@@ -80,19 +80,19 @@ func TestTutorTurn_Stage3CallsSolver(t *testing.T) {
 		t.Errorf("阶段三应带验算解, got %q", res.Solution)
 	}
 
-	// 阶段一：不调 Solver（不给未验证答案）。
+	// 首轮自动完成解题，不让家长先答几轮才拿到答案。
 	res1, err := d.TutorTurn(ctx, TutorTurnRequest{}, "3.8×3", "五年级上")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res1.Solution != "" {
-		t.Errorf("阶段一不应给解, got %q", res1.Solution)
+	if res1.Solution != "解：11.4" {
+		t.Errorf("首轮应给完整解, got %q", res1.Solution)
 	}
 }
 
-func TestTutorTurn_EmotionGateSkipsSolver(t *testing.T) {
+func TestTutorTurn_EmotionDoesNotSkipSolver(t *testing.T) {
 	d, _ := newPipeline(t, fakeSolver{solution: "解：11.4"}, fakeGrader{}, &fakeInsights{})
-	// 即使阶段被推到三，情绪守门也不给答案（暂停解题）。
+	// 孩子暂停练习不应剥夺家长的已验证参考答案。
 	res, err := d.TutorTurn(context.Background(),
 		TutorTurnRequest{PriorStage: StageFull, ParentMessage: "他哭了"}, "3.8×3", "五年级上")
 	if err != nil {
@@ -101,7 +101,7 @@ func TestTutorTurn_EmotionGateSkipsSolver(t *testing.T) {
 	if !res.Directive.Comfort {
 		t.Fatal("应守门")
 	}
-	if res.Solution != "" {
-		t.Errorf("守门轮不应给解, got %q", res.Solution)
+	if res.Solution != "解：11.4" {
+		t.Errorf("安抚轮也应给家长完整解, got %q", res.Solution)
 	}
 }

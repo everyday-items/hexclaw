@@ -250,14 +250,22 @@ func newProblemSourceRecognitionHarness(
 	planVersion int,
 	recognizer Recognizer,
 	suffix string,
+	models ...string,
 ) problemSourceRecognitionHarness {
 	t.Helper()
 	const nowUnix int64 = 2_000_000_000
-	policy := k12.ApprovedRecognizingRequestPolicy()
+	model := k12.RecognizingPolicyModel
+	if len(models) > 0 {
+		model = models[0]
+	}
+	policy := k12.ModelRequestPolicySnapshot{}
+	if model == k12.RecognizingPolicyModel {
+		policy = k12.ApprovedRecognizingRequestPolicy()
+	}
 	route := k12.GradingModelSnapshot{
 		Provider:                 "hexclaw-gpt",
-		Model:                    k12.RecognizingPolicyModel,
-		Route:                    "hexclaw-gpt/" + k12.RecognizingPolicyModel,
+		Model:                    model,
+		Route:                    "hexclaw-gpt/" + model,
 		Capability:               "vision",
 		RecognizingRequestPolicy: policy,
 	}
@@ -329,9 +337,7 @@ func newProblemSourceRecognitionHarness(
 	}
 }
 
-// REG-K12-RECOGNITION-DURABILITY-BUDGET-20260808-001：区域选择与重拍动作
-// 继承所属 Job 已冻结的 V2 契约。进入来源识别器边界前，不可变头部、清单授权、
-// DD-036 策略和头部摘要必须全部存在。
+// 区域选择与重拍继承 Job 的 V2 契约；非 Sol 模型有持久头部和清单授权，不携带 Sol 参数。
 func TestREGK12RecognitionDurabilityBudget20260808001ProblemSourcePublishesV2BeforeRecognizer(
 	t *testing.T,
 ) {
@@ -341,6 +347,7 @@ func TestREGK12RecognitionDurabilityBudget20260808001ProblemSourcePublishesV2Bef
 		k12.RecognitionPlanVersionV2,
 		probe,
 		"v2-entry",
+		"gpt-5.6-luna",
 	)
 	probe.records = fixture.orchestrator.deps.Records
 	probe.work = fixture.work
@@ -360,7 +367,7 @@ func TestREGK12RecognitionDurabilityBudget20260808001ProblemSourcePublishesV2Bef
 	wantPolicy := k12.NormalizeModelRequestPolicySnapshot(
 		fixture.job.Fields.ModelSnapshot.RecognizingRequestPolicy,
 	)
-	if probe.calls != 1 || !probe.policyEnabled || probe.policy != wantPolicy ||
+	if probe.calls != 1 || probe.policyEnabled != !wantPolicy.IsZero() || probe.policy != wantPolicy ||
 		!probe.headerEnabled || probe.headerDigest == "" {
 		t.Fatalf(
 			"source V2 entry calls=%d policy_enabled=%v policy=%+v header_enabled=%v header=%q",

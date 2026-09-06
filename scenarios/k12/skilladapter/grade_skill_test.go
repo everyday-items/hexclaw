@@ -68,6 +68,9 @@ func TestGradeSkill_ScopesToRoutedAgentAndLogsMistake(t *testing.T) {
 	if !strings.Contains(res.Content, "第一个错步") || !strings.Contains(res.Content, "已记入错题本") {
 		t.Errorf("批改内容应含错步 + 入库提示: %q", res.Content)
 	}
+	if !strings.Contains(res.Content, "解：11.4") || strings.Contains(res.Content, "别直接给正确答案") {
+		t.Errorf("家长批改结果必须保留完整解法: %q", res.Content)
+	}
 	if res.Metadata["k12_record_created"] != "true" {
 		t.Errorf("应入库, meta=%v", res.Metadata)
 	}
@@ -88,6 +91,9 @@ func TestGradeSkill_CorrectAnswerNoMistake(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "答对") {
 		t.Errorf("答对应无入库, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "解：11.4") {
+		t.Errorf("答对也应保留家长参考解法: %q", res.Content)
 	}
 	recs, _ := deps.Records.ListByScope(context.Background(), "mingming", k12.CollectionMistakes, "")
 	if len(recs) != 0 {

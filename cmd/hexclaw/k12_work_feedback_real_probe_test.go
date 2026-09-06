@@ -132,7 +132,7 @@ func TestK12WorkFeedback_RealModel(t *testing.T) {
 		resp, err := provider.Complete(cctx, hexagon.CompletionRequest{
 			Messages: []hexagon.Message{
 				{Role: hexagon.RoleSystem, Content: "你是小学写作辅导老师，给孩子作文做形成性点评。红线：只点评不打分——禁止输出任何分数、等第、评级、排名；" +
-					"不代写——禁止给范文、禁止改写或重写全文。点评框架与输出格式按用户消息里的技能指引执行；语气鼓励、具体、可执行。"},
+					"提供家长参考改句与完整参考稿，说明先讲什么、怎样追问、卡住时如何引导和检查理解；不覆盖孩子原稿，不编造孩子经历。点评框架与输出格式按用户消息里的技能指引执行；语气鼓励、具体、可执行。"},
 				{Role: hexagon.RoleUser, Content: task},
 			},
 			MaxTokens:   1536,

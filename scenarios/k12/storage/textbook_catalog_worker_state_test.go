@@ -173,14 +173,23 @@ func TestREGTextbookCatalog_AcceptsCompletedPageFactsFromPriorIngestLease(t *tes
 func TestREGTextbookCatalog_ReopensOnlySourceEvidenceTerminalAfterFactsComplete(t *testing.T) {
 	store, _, _ := seedTextbookCatalogMaterialization(t)
 	db := store.DB()
+	if err := store.RecoverTextbookCatalogJobs(context.Background(), time.UnixMilli(9_000), 8); err != nil {
+		t.Fatalf("pin complete source snapshot: %v", err)
+	}
 	if _, err := db.Exec(`UPDATE kb_knowledge_jobs
 		SET lease_epoch=2 WHERE job_id='catalog-ingest'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE k12_textbook_catalog_jobs
-		SET state='failed_terminal',failure_code='source_evidence_incomplete',
-		    ingest_job_id='catalog-ingest',source_plan_digest='',last_error='识别失败'
-		WHERE job_id='catalog-job'`); err != nil {
+	// 构造旧合同已冻结的完整来源，不能以空 source plan 绕过不可变快照触发器。
+	if _, err := db.Exec(`INSERT OR REPLACE INTO k12_textbook_catalog_jobs
+		(job_id,manifest_id,owner_id,document_id,document_generation,source_digest,
+		 state,attempt,request_digest,result_digest,last_error,created_at,updated_at,
+		 ingest_job_id,source_plan_digest,extractor_contract,failure_code)
+		SELECT job_id,manifest_id,owner_id,document_id,document_generation,source_digest,
+		 'failed_terminal',4,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+		 '','识别失败',created_at,updated_at,
+		 ingest_job_id,source_plan_digest,'checkpoint-toc-footer-v2','catalog_evidence_incomplete'
+		FROM k12_textbook_catalog_jobs WHERE job_id='catalog-job'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE k12_textbook_manifests
@@ -189,12 +198,13 @@ func TestREGTextbookCatalog_ReopensOnlySourceEvidenceTerminalAfterFactsComplete(
 		t.Fatal(err)
 	}
 	if err := store.RecoverTextbookCatalogJobs(context.Background(), time.UnixMilli(10_000), 8); err != nil {
-		t.Fatalf("recover source-evidence terminal: %v", err)
+		t.Fatalf("recover prior extractor terminal: %v", err)
 	}
-	var state, manifestState, ingestJobID, sourcePlanDigest string
-	if err := db.QueryRow(`SELECT state,ingest_job_id,source_plan_digest
+	var state, manifestState, ingestJobID, sourcePlanDigest, extractorContract string
+	var attempt int
+	if err := db.QueryRow(`SELECT state,ingest_job_id,source_plan_digest,extractor_contract,attempt
 		FROM k12_textbook_catalog_jobs WHERE job_id='catalog-job'`).Scan(
-		&state, &ingestJobID, &sourcePlanDigest,
+		&state, &ingestJobID, &sourcePlanDigest, &extractorContract, &attempt,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +213,7 @@ func TestREGTextbookCatalog_ReopensOnlySourceEvidenceTerminalAfterFactsComplete(
 		t.Fatal(err)
 	}
 	if state != "queued" || manifestState != "extracting" || ingestJobID != "catalog-ingest" ||
-		len(sourcePlanDigest) != 64 {
+		len(sourcePlanDigest) != 64 || extractorContract != k12storage.TextbookCatalogExtractorContract || attempt != 0 {
 		t.Fatalf("reopened source-evidence terminal job=%s manifest=%s ingest=%s plan=%q",
 			state, manifestState, ingestJobID, sourcePlanDigest)
 	}

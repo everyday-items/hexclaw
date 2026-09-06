@@ -141,7 +141,7 @@ func TestCreativeWorkFeedbackCoordinatorQuiesceAgentTerminalizesSentInvocation(t
 func TestCreativeWorkFeedbackCoordinatorAutomaticallyCompletesInitialGeneration(t *testing.T) {
 	d := newDataDeps(t)
 	solver := &fakeWorkFeedbackSolver{
-		feedback: "「桂花落在青石板上」画面清楚；家长可以问孩子闻到了什么；下次只补一个声音细节。",
+		feedback: "## 可见证据\n原稿写到桂花落在青石板上。\n## 先这样肯定\n桂花落在青石板上，画面具体。\n## 家长可以这样问或讲\n先问孩子桂花落下时听到了什么，卡住时让孩子回忆周围的声音，再说明新加细节让画面有什么变化。\n## 下一次只试一个点\n只补一个实际听到的声音细节，并解释为什么保留它。",
 	}
 	d.Solver = solver
 	routeCalls := 0
@@ -159,8 +159,11 @@ func TestCreativeWorkFeedbackCoordinatorAutomaticallyCompletesInitialGeneration(
 		t.Fatalf("create current work: created=%v err=%v", created, err)
 	}
 
+	callerDeadline := time.Now().Add(3 * time.Second)
+	baseCtx, cancelBase := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancelBase()
 	coordinator := &usecase.CreativeWorkFeedbackCoordinator{
-		Deps: &d, Records: d.Records, BaseContext: context.Background(),
+		Deps: &d, Records: d.Records, BaseContext: baseCtx,
 	}
 	if !coordinator.StartAsync("xiaoming", generationID) {
 		t.Fatal("first schedule must be accepted")
@@ -199,6 +202,11 @@ func TestCreativeWorkFeedbackCoordinatorAutomaticallyCompletesInitialGeneration(
 	if invocation.Status != k12.ImageTaskInvocationSucceeded ||
 		invocation.RouteSnapshot != currentFeedbackRoute() {
 		t.Fatalf("direct text route/invocation not frozen: %+v", invocation)
+	}
+	providerDeadline, hasDeadline := solver.lastCtx.Deadline()
+	if !hasDeadline || providerDeadline.Unix() != invocation.DeadlineAt ||
+		invocation.DeadlineAt != callerDeadline.Unix() {
+		t.Fatalf("worker ignored its shorter caller deadline: provider=%v invocation=%+v", providerDeadline, invocation)
 	}
 }
 

@@ -322,6 +322,24 @@ func (d Deps) advanceGradingOutcomeUnknown(ctx context.Context, v GradingJobView
 	}
 	switch v.Record.Status {
 	case k12.GradingStageRecognizing, k12.GradingStageLocating, k12.GradingStageAssessing:
+	case k12.GradingStageAwaitingConfirmation:
+		if in.FailureKind != "item_invocation_outcome_unknown" {
+			return GradingJobView{}, errGradingStageConflict("awaiting confirmation requires an unknown item invocation")
+		}
+		invocations, err := d.Records.ListGradingItemInvocations(ctx, v.Record.AgentName, v.Record.RecordID)
+		if err != nil {
+			return GradingJobView{}, err
+		}
+		hasUnknownInvocation := false
+		for _, invocation := range invocations {
+			if invocation.Status == k12.ModelInvocationSent || invocation.Status == k12.ModelInvocationOutcomeUnknown {
+				hasUnknownInvocation = true
+				break
+			}
+		}
+		if !hasUnknownInvocation {
+			return GradingJobView{}, errGradingStageConflict("awaiting confirmation has no unresolved item invocation")
+		}
 	default:
 		return GradingJobView{}, errGradingStageConflict("阶段 %s 无 outcome_unknown 转移", v.Record.Status)
 	}

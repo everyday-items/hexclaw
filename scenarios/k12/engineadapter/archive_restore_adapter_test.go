@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	stdimage "image"
 	"path/filepath"
 	"testing"
 	"time"
@@ -39,6 +40,94 @@ func TestArchiveRestoreAdapterRestoresV3PackedAssetContent(t *testing.T) {
 	got, _, err := assetstore.Read(owner, file)
 	if err != nil || !bytes.Equal(got, image) {
 		t.Fatalf("restored asset=%q err=%v", got, err)
+	}
+	ctx := context.Background()
+	_, mediaType, digest, err := assetstore.Describe("mingming", image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dimensions, _, err := stdimage.DecodeConfig(bytes.NewReader(image))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, _, err := f.records.PreparePageAsset(ctx, k12storage.PageAssetMetadata{
+		OwnerScope: "guardian", AgentName: "mingming", PageAssetID: refs[0], ContentDigest: digest,
+		MediaType: mediaType, SizeBytes: int64(len(image)), PixelWidth: dimensions.Width, PixelHeight: dimensions.Height,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err = f.records.MarkPageAssetReady(ctx, metadata.OwnerScope, "mingming", refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := k12.NewCreativeWorkRecord("mingming", "", k12.CreativeWorkFields{WorkType: k12.WorkTypeArt, DisplayName: "当前作品"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, _, err := f.records.CreateCreativeWorkWithInitialGeneration(ctx, work, "backup-current", "current-source", k12.CreativeWorkSourceSnapshot{WorkType: k12.WorkTypeArt, SourceAssetID: refs[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, _, err := f.records.PrepareImageTaskInvocation(ctx, k12.ImageTaskInvocation{
+		InvocationID: "backup-current-invocation", AgentName: "mingming", WorkRecordID: work.RecordID,
+		Operation: k12.ImageTaskOperationWorkFeedback, OperationKey: "work:" + work.RecordID + ":version:" + generation.GenerationID + ":feedback",
+		RequestDigest: "current-feedback", Attempt: 1,
+		RouteSnapshot: k12.ImageTaskRouteSnapshot{Provider: "hexclaw-gpt", Model: "gpt-5.6-sol", Route: "hexclaw-gpt/gpt-5.6-sol", Capability: "vision", SelectionSource: "explicit", PolicyVersion: "image-task-routing-v1", PromptVersion: "work-feedback-v1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := usecase.Deps{Records: f.records}
+	older, err := d.Backup(ctx, "mingming")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := f.records.ClaimImageTaskInvocationSend(ctx, "mingming", inv.InvocationID, "private-request-key", time.Now().Unix()); err != nil || !claimed {
+		t.Fatalf("claim=%v err=%v", claimed, err)
+	}
+	if err := f.records.FailWorkFeedbackInvocation(ctx, "mingming", inv.InvocationID, "transport_unknown", true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.restore.RestoreHexbak(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := f.records.GetLatestWorkFeedbackInvocation(ctx, "mingming", work.RecordID, inv.OperationKey)
+	if err != nil || latest.Status != k12.ImageTaskInvocationOutcomeUnknown || latest.RetrySafe {
+		t.Fatalf("older backup downgraded unknown invocation: status=%s retry=%v err=%v", latest.Status, latest.RetrySafe, err)
+	}
+	archived, err := d.Backup(ctx, "mingming")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived.CurrentCreativeWorks) != 1 || archived.CurrentCreativeWorks[0].Invocations[0].ProviderRequestKey != "" {
+		t.Fatal("current invocation missing or private request key escaped archive")
+	}
+	fresh := newArchiveRestoreFixture(t)
+	var creativeRecords []*records.AgentRecord
+	for _, record := range archived.Records {
+		if record.Collection == k12.CollectionCreativeWork {
+			creativeRecords = append(creativeRecords, record)
+		}
+	}
+	archived.Records = creativeRecords
+	if err := usecase.SealHexbak(archived); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.restore.RestoreHexbak(ctx, archived); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := fresh.records.GetWorkFeedbackGeneration(ctx, "mingming", generation.GenerationID)
+	if err != nil || restored.Source.SourceAssetID != refs[0] {
+		t.Fatalf("current source was not restored: err=%v", err)
+	}
+	restoredAsset, err := fresh.records.GetReadyPageAsset(ctx, metadata.OwnerScope, "mingming", refs[0])
+	if err != nil || restoredAsset != metadata {
+		t.Fatalf("current ready image metadata was not restored exactly: err=%v", err)
+	}
+	latest, err = fresh.records.GetLatestWorkFeedbackInvocation(ctx, "mingming", work.RecordID, inv.OperationKey)
+	if err != nil || latest.Status != k12.ImageTaskInvocationOutcomeUnknown || latest.RetrySafe {
+		t.Fatalf("fresh restore must keep unknown parked: status=%s err=%v", latest.Status, err)
 	}
 }
 

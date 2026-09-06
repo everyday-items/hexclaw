@@ -52,9 +52,8 @@ func TestReviewSkill_ReturnsDuePlan(t *testing.T) {
 	if !strings.Contains(res.Content, "3.8×3") || !strings.Contains(res.Content, "陪练建议") {
 		t.Errorf("陪练方案应含到期题 + 引导话术: %q", res.Content)
 	}
-	// 守答案遮罩：话术里明确"别直接报答案"。
-	if !strings.Contains(res.Content, "别直接报答案") {
-		t.Errorf("应含答案遮罩话术: %q", res.Content)
+	if !strings.Contains(res.Content, "家长") || strings.Contains(res.Content, "别直接报答案") {
+		t.Errorf("陪练方案不得挡住家长答案: %q", res.Content)
 	}
 	if res.Metadata["k12_due_count"] != "2" {
 		t.Errorf("到期数应为 2, meta=%v", res.Metadata)

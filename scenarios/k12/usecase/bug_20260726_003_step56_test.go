@@ -14,7 +14,7 @@ import (
 )
 
 func buildStep56WritingFeedback(raw string) k12.WorkFeedback {
-	return buildStructuredWorkFeedback(
+	feedback, err := buildStructuredWorkFeedback(
 		k12.WorkTypeWriting,
 		k12.CreativeWorkVersion{
 			VersionID:     "step56-version",
@@ -24,6 +24,10 @@ func buildStep56WritingFeedback(raw string) k12.WorkFeedback {
 		k12.FeedbackSourceAI,
 		"writing-feedback@step56",
 	)
+	if err != nil {
+		panic(err)
+	}
+	return feedback
 }
 
 func assertStep56FeedbackAtoms(t *testing.T, feedback k12.WorkFeedback) {

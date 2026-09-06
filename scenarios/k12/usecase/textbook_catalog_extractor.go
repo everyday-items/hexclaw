@@ -46,7 +46,7 @@ var (
 	textbookVolumePattern       = regexp.MustCompile(`([一二三四五六]年级)\s*(上册|下册)`)
 	textbookApprovalYearPattern = regexp.MustCompile(`([12][0-9]{3})\s*年\s*经国家教材委员会专家委员会审核通过`)
 	textbookEditionYearPattern  = regexp.MustCompile(`（\s*([12][0-9]{3})\s*年版\s*）`)
-	textbookTOCMajorPattern     = regexp.MustCompile(`^\s*([1-9][0-9]*)\s+(.+?)\s+([1-9][0-9]*)\s*$`)
+	textbookTOCMajorPattern     = regexp.MustCompile(`^\s*([1-9][0-9]*)\.?\s+(.+?)\s+([1-9][0-9]*)\s*$`)
 	textbookTOCChinesePattern   = regexp.MustCompile(`^\s*([一二三四五六七八九])\s+(.+?)\s+([1-9][0-9]*)\s*$`)
 	textbookTOCChildPattern     = regexp.MustCompile(`^\s{2,}(\S.*?)\s+([1-9][0-9]*)\s*$`)
 )
@@ -235,16 +235,9 @@ func (TextbookCatalogCheckpointExtractor) Extract(
 	if strings.EqualFold(filepath.Ext(title), ".pdf") {
 		title = strings.TrimSuffix(title, filepath.Ext(title))
 	}
-	fullTextEvidence := normalizeTextbookEvidence(fullText)
-	titleEvidence := normalizeTextbookEvidence(title)
-	titleConfirmed := strings.Contains(fullTextEvidence, titleEvidence)
-	if !titleConfirmed {
-		// 上传名可带封面不会逐字重复的固定版本前缀，核心年级与册次仍须命中正文。
-		titleCore := strings.TrimPrefix(strings.TrimPrefix(titleEvidence, "人教版"), "小学")
-		titleConfirmed = titleCore != "" && strings.Contains(fullTextEvidence, titleCore)
-	}
-	if title == "" || !titleConfirmed {
-		return fail("trusted document title is not confirmed by page text")
+	// 上传名仅作显示标签；教材版本、目录和页码仍取持久页面证据。
+	if title == "" {
+		return fail("document title is missing")
 	}
 
 	if tocStart+1 >= firstAnchorPDF {
@@ -358,6 +351,10 @@ func parseTextbookTOC(pages []k12storage.TextbookCatalogSourcePage) ([]extracted
 				}
 				pageFrom, _ := strconv.Atoi(majorMatch[3])
 				title := strings.TrimSpace(majorMatch[2])
+				// OCR 可保留 Markdown 粗体包装；只去掉成对包装，不改目录文字。
+				if len(title) >= 4 && strings.HasPrefix(title, "**") && strings.HasSuffix(title, "**") {
+					title = strings.TrimSpace(title[2 : len(title)-2])
+				}
 				if title == "" || ordinal != len(units)+1 {
 					return nil, fmt.Errorf("TOC unit sequence is ambiguous")
 				}

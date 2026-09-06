@@ -130,6 +130,10 @@ func (f *fakeK12ImageTaskFacade) StartAsync(agentName, dispatchID string) bool {
 	return !f.rejectStart && dispatchID == "dispatch-1"
 }
 
+func (*fakeK12ImageTaskFacade) Retry(context.Context, string, string, int) (k12usecase.ImageTaskView, error) {
+	return k12usecase.ImageTaskView{}, errors.New("unexpected retry")
+}
+
 func (f *fakeK12ImageTaskFacade) Get(
 	_ context.Context,
 	agentName, dispatchID string,

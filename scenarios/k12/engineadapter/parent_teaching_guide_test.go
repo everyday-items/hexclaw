@@ -90,6 +90,7 @@ func TestSolveAdapterGenerateParentTeachingGuideConsumesBundledPedagogyAndMathSk
 	}
 	for _, anchor := range []string{
 		"k12-pedagogy", "最近发展区", "家长是中间人",
+		"正确答案、完整解法和讲题方法",
 		"math-tutor", "波利亚", "理解题目", "回顾检验",
 	} {
 		if !strings.Contains(gotPrompt, anchor) {
@@ -105,10 +106,10 @@ func TestSolveAdapterGenerateParentTeachingGuideConsumesBundledSubjectSkill(t *t
 		anchors []string
 	}{
 		{subject: "数学", skill: "math-tutor", anchors: []string{"波利亚四步", "理解题目", "回顾检验"}},
-		{subject: "语文", skill: "chinese-tutor", anchors: []string{"共写不代写", "分点作答", "从原文找依据"}},
-		{subject: "英语", skill: "english-tutor", anchors: []string{"用法先于规则", "只鼓励不打击", "不代写"}},
+		{subject: "语文", skill: "chinese-tutor", anchors: []string{"朗读教学", "分点作答", "从原文找依据"}},
+		{subject: "英语", skill: "english-tutor", anchors: []string{"用法先于规则", "只鼓励不打击", "完整修改示范"}},
 		{subject: "科学", skill: "science-tutor", anchors: []string{"结论来自证据", "5E 教学模式", "不编造实验结果"}},
-		{subject: "信息科技", skill: "information-technology-tutor", anchors: []string{"PRIMM 教学法", "运行结果以系统沙箱回传为准", "不代写完整程序"}},
+		{subject: "信息科技", skill: "information-technology-tutor", anchors: []string{"PRIMM 教学法", "运行结果以系统沙箱回传为准", "完整参考程序"}},
 	}
 
 	for _, tt := range tests {

@@ -495,12 +495,13 @@ func TestWorkFeedbackInvocationInheritsDispatchDeadlineAndExpiresByPromotedOwner
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.CreateCreativeWorkWithInitialGeneration(
+	generation, _, err := store.CreateCreativeWorkWithInitialGeneration(
 		ctx, work, "auto:feedback-owner", "sha256:feedback-owner-work",
 		k12.CreativeWorkSourceSnapshot{
 			WorkType: k12.WorkTypeWriting, ContentMarkdown: "画面证据",
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE k12_creative_work_intakes
@@ -513,15 +514,28 @@ func TestWorkFeedbackInvocationInheritsDispatchDeadlineAndExpiresByPromotedOwner
 		InvocationID: "invocation-feedback-deadline-owner-work",
 		AgentName:    "mingming", WorkRecordID: work.RecordID,
 		Operation:     k12.ImageTaskOperationWorkFeedback,
-		OperationKey:  "work:" + work.RecordID + ":version:v1:feedback",
+		OperationKey:  "work:" + work.RecordID + ":version:" + generation.GenerationID + ":feedback",
 		RequestDigest: "sha256:feedback-deadline-owner",
 		RouteSnapshot: testImageRoute(), Status: k12.ImageTaskInvocationPrepared,
-		Attempt: 1, CreatedAt: 202, UpdatedAt: 202,
+		Attempt: 1, CreatedAt: 202, UpdatedAt: 202, DeadlineAt: routed.AutomaticDeadlineAt,
 	}
 	feedback, created, err := store.PrepareImageTaskInvocation(ctx, feedback)
 	if err != nil || !created || feedback.DeadlineAt != routed.AutomaticDeadlineAt {
 		t.Fatalf("prepare feedback deadline: created=%v invocation=%+v err=%v",
 			created, feedback, err)
+	}
+	manual := feedback
+	manual.InvocationID = "invocation-feedback-independent"
+	manual.OperationKey = "work:" + work.RecordID + ":version:manual-generation:feedback"
+	manual.DeadlineAt = 502
+	manual, created, err = store.PrepareImageTaskInvocation(ctx, manual)
+	if err != nil || !created || manual.DeadlineAt != 502 {
+		t.Fatalf("independent feedback inherited the source window: created=%v invocation=%+v err=%v", created, manual, err)
+	}
+	manual.DeadlineAt = 900
+	manual, created, err = store.PrepareImageTaskInvocation(ctx, manual)
+	if err != nil || created || manual.DeadlineAt != 502 {
+		t.Fatalf("prepared feedback replay extended its deadline: created=%v invocation=%+v err=%v", created, manual, err)
 	}
 	failedDispatch, failedInvocation, changed, err := store.ExpireImageTaskInvocation(
 		ctx, "mingming", routed.DispatchID, feedback.InvocationID, 400,
@@ -531,5 +545,9 @@ func TestWorkFeedbackInvocationInheritsDispatchDeadlineAndExpiresByPromotedOwner
 		!failedInvocation.RetrySafe {
 		t.Fatalf("expire prepared feedback: changed=%v dispatch=%+v invocation=%+v err=%v",
 			changed, failedDispatch, failedInvocation, err)
+	}
+	generation, err = store.GetWorkFeedbackGeneration(ctx, "mingming", generation.GenerationID)
+	if err != nil || generation.Status != k12.WorkFeedbackFailed {
+		t.Fatalf("automatic expiry left an active generation: %+v err=%v", generation, err)
 	}
 }

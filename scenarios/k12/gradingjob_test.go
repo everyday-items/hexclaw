@@ -21,6 +21,9 @@ func hasEdge(tr map[string][]string, from, to string) bool {
 // TestGradingJobSchemaLegalEdges §6.7 状态机图的每条合法边都必须声明。
 func TestGradingJobSchemaLegalEdges(t *testing.T) {
 	tr := GradingJobSchema().Transitions
+	if !hasEdge(tr, GradingStageAwaitingConfirmation, GradingStageOutcomeUnknown) {
+		t.Error("局部题调用结果未知时必须保留 outcome_unknown 停点")
+	}
 	legal := [][2]string{
 		{GradingStageQueued, GradingStageNormalizing},
 		{GradingStageQueued, GradingStageAssessing}, // 规则 6：修正重批·检查点已预置捷径

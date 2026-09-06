@@ -63,7 +63,7 @@ var _ usecase.WorkFeedbackGenerator = (*SolveAdapter)(nil)
 
 // GenerateWorkFeedback 实现 usecase.WorkFeedbackGenerator（PRD §3.10 / INV-011）：
 // 写作 = 好句摘出 + 一处具体建议，走纯文本生成闭包；美术 = 观察描述式点评，走视觉闭包
-// （原图随请求发给视觉模型，观察只依据可见证据）。只点评不打分不代写——红线在提示词与
+// （原图随请求发给视觉模型，观察只依据可见证据）。原稿与家长参考分开、保留评分边界——约束在提示词与
 // 用例层双重钉死（生成端约束 + 入库端拒绝）。未注入闭包/原图缺失时诚实报错，
 // 绝不回退 solve 全链（点评不是解题，跑验算链既慢又语义错位）。
 // 返回值带 SkillStamp：本次点评实际使用的方法论基座来源戳（盘上/内嵌/硬编码），随点评落库可追溯。
@@ -182,13 +182,13 @@ const workFeedbackStampBuiltin = "builtin"
 
 // 红线锚点（盘上版本完整性守卫，克制选择——只锁**红线级语义**，不锁正文措辞/结构，
 // skill 措辞可随 hub 自由演进）：
-//   - 写作：「零代写」（INV-011 写作侧核心：不替孩子写正文）+「不打分」（形成性反馈的根）。
+//   - 写作：「家长参考」（参考稿与孩子原稿分开）+「不打分」（形成性反馈的根）。
 //   - 美术：「不打分」（同上）+「不重画」（INV-011 美术侧核心：不替孩子重画/出示范）。
 //
 // 宽松 Contains 检查——锚点是红线小节的稳定词根，任何保留红线语义的改版都不会误伤；
 // 丢失锚点即视为盘上文件被改坏（或被恶意删红线），降级内嵌快照。
 var (
-	writingFeedbackRedlineAnchors = []string{"零代写", "不打分"}
+	writingFeedbackRedlineAnchors = []string{"家长参考", "不打分"}
 	artFeedbackRedlineAnchors     = []string{"不打分", "不重画", "不得先追问"}
 )
 
@@ -348,8 +348,7 @@ func stripSkillFrontmatter(text string) string {
 
 // buildWorkFeedbackPrompt 按作品类型构造点评提示词：按「盘上 marketplace → 内嵌快照 →
 // 硬编码」链解析作品反馈 skill 正文作方法论基座（写作→writing-feedback，美术→art-feedback）。
-// 硬编码红线段所有路径都无条件叠加（不打分/不代写/不重画——与 skill 内红线、usecase 层
-// INV-011 确定性拦截构成三道保险），红线随任务下发，不依赖模型默认行为。
+// 证据与评分边界在所有路径叠加，家长参考稿与孩子提交的作品保持区分。
 // 返回 skillStamp 标记本次实际使用的基座来源（随点评落库追溯）。
 func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillContentLoader) (subject, prompt, skillStamp string, err error) {
 	var b strings.Builder
@@ -359,7 +358,7 @@ func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillConten
 		subject = "语文"
 		if body, stamp, ok := resolveWorkFeedbackSkill(loader, writingFeedbackSkillName, writingFeedbackSkillFile, writingFeedbackRedlineAnchors); ok {
 			skillStamp = stamp
-			b.WriteString("以下是「语文写作反馈」技能的方法论基座，本次点评的评价框架、输出信封与红线全部遵此执行：\n\n")
+			b.WriteString("以下是「语文写作反馈」技能的方法论基座，本次点评遵循其中的专业方法、原文证据约束与红线；输出格式以文末四个固定二级标题为准，不采用技能中的输出信封：\n\n")
 			b.WriteString(body)
 			b.WriteString("\n\n——以下是本次点评任务——\n")
 			b.WriteString("对下面这篇孩子的作文按上述技能给形成性反馈。\n")
@@ -368,7 +367,7 @@ func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillConten
 			b.WriteString("1. 好句摘出：原样引用 1～2 个原文好句，各用一句话说明好在哪里；\n")
 			b.WriteString("2. 一处具体建议：只挑最值得改的一处，指出在原文哪里、怎么改，控制在两三句话。\n")
 		}
-		b.WriteString("红线：只点评不打分——禁止输出任何分数、等第、评级、排名；不代写——禁止给范文、禁止改写或重写全文。\n")
+		b.WriteString("给家长修改示范与完整参考稿，并说明先讲什么、怎样追问、卡住时如何引导、如何检查理解。原稿与参考稿分开，不编造孩子事实；不打分、不评级、不排名。直接给内容与讲法，不输出原则声明。\n")
 		if req.Title != "" {
 			b.WriteString("作文题目：" + req.Title + "\n")
 		}
@@ -379,6 +378,11 @@ func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillConten
 			return "", "", "", fmt.Errorf("work feedback: 写作点评需要作文原文（最新版本无文字内容）")
 		}
 		b.WriteString("作文原文：\n" + req.ContentMarkdown)
+		b.WriteString("\n最终呈现使用以下四个固定二级标题，按顺序完整输出，代替技能中的六段标题；保留技能的评价方法、原文证据与教学内容，只聚焦一处最值得讲的改法，不附长篇分析或原则声明：\n")
+		b.WriteString("## 可见证据\n简短总评并引用原稿依据，必要的基础规范只列明确位置与原句，不把讲法或参考稿混入观察。\n")
+		b.WriteString("## 先这样肯定\n只保留首项有据亮点，原样引用孩子的一句并具体说明好在哪里。\n")
+		b.WriteString("## 家长可以这样问或讲\n围绕一处重点给原句、修改理由、参考改句，以及先讲什么、怎样问、卡住如何引导和检查理解；再给完整家长参考稿，原稿未提供的经历不补成事实。保留多段正文与引用，内部小标题和参考稿标题只用三级标题，不新增二级标题。\n")
+		b.WriteString("## 下一次只试一个点\n给同一重点的一项可完成的修改动作及检查标准。除第三段的完整讲法与参考稿外，各段用简短正文，不再追加其他章节、开场或尾声。\n")
 	case k12.WorkTypeArt:
 		subject = "美术"
 		if body, stamp, ok := resolveWorkFeedbackSkill(loader, artFeedbackSkillName, artFeedbackSkillFile, artFeedbackRedlineAnchors); ok {
@@ -412,6 +416,11 @@ func buildWorkFeedbackPrompt(req usecase.WorkFeedbackRequest, loader SkillConten
 		if strings.TrimSpace(req.ContentMarkdown) != "" {
 			b.WriteString("画面文字说明：\n" + req.ContentMarkdown)
 		}
+		b.WriteString("\n最终输出只用以下四个固定标题，按顺序各写一个非空段落，不改标题、不加其他章节、开场或尾声：\n")
+		b.WriteString("## 可见证据\n挑画面中有依据的重点观察，逐项覆盖本次明确要求的元素，不把评价或练习混入观察。\n")
+		b.WriteString("## 先这样肯定\n只说首项具体亮点，联系画面证据和适龄发展，写成家长可直接念给孩子的话，不编造肯定。\n")
+		b.WriteString("## 家长可以这样问或讲\n围绕一个改进主题，具体说明先观察什么、怎样问、卡住如何引导；保留上述Skill的专业方法。\n")
+		b.WriteString("## 下一次只试一个点\n给同一主题的一项完整5～10分钟小练习，讲清做什么、怎样做、最后如何比较或检查；不追加第二项。缺少任务或意图时，相关限制只在第一段简短说明。\n")
 	default:
 		return "", "", "", fmt.Errorf("work feedback: 未知作品类型 %q", req.WorkType)
 	}

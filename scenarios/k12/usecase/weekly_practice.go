@@ -106,7 +106,7 @@ type UpdateProfileBundleRequest struct {
 }
 
 type profilePublisher interface {
-	PublishProfile(string, k12.ChildProfile) error
+	PublishProfile(string, k12.ProfileBundleResult) error
 }
 
 func (d Deps) GetProfileWithRevision(ctx context.Context, agentName string) (k12.WeeklyProfile, error) {
@@ -359,7 +359,7 @@ func (d Deps) UpdateProfileBundle(ctx context.Context, req UpdateProfileBundleRe
 		return k12.ProfileBundleResult{}, err
 	}
 	if publisher, ok := d.Profiles.(profilePublisher); ok {
-		if err := publisher.PublishProfile(req.AgentName, req.Profile); err != nil {
+		if err := publisher.PublishProfile(req.AgentName, result); err != nil {
 			return k12.ProfileBundleResult{}, err
 		}
 	}

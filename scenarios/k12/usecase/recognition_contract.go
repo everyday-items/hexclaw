@@ -43,8 +43,10 @@ const (
 const ocrConfidenceConfirmationThreshold = 0.90
 
 var (
-	latexFraction = regexp.MustCompile(`\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}`)
-	latexText     = regexp.MustCompile(`\\text\s*\{([^{}]*)\}`)
+	latexFraction           = regexp.MustCompile(`\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}`)
+	latexText               = regexp.MustCompile(`\\text\s*\{([^{}]*)\}`)
+	evidenceNewline         = regexp.MustCompile(`\\n\b`)
+	evidenceNumericFraction = regexp.MustCompile(`\b([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)\b`)
 )
 
 var ocrReasonOrder = []OCRRiskReason{
@@ -88,8 +90,8 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 			reasons[OCRRiskUnclearHandwriting] = struct{}{}
 		}
 	}
-	if evidenceTranscriptionsConflict(q.RawTranscription, q.EvidenceTranscriptions) ||
-		evidenceTranscriptionsConflict(q.AnswerRawTranscription, q.AnswerEvidenceTranscriptions) {
+	if evidenceTranscriptionsConflict(q.RawTranscription, q.EvidenceTranscriptions, q.AnswerRawTranscription) ||
+		evidenceTranscriptionsConflict(q.AnswerRawTranscription, q.AnswerEvidenceTranscriptions, "") {
 		reasons[OCRRiskEvidenceConflict] = struct{}{}
 	}
 	if q.RecognitionConfidence != nil && *q.RecognitionConfidence < ocrConfidenceConfirmationThreshold {
@@ -141,16 +143,42 @@ func distinctEvidenceCount(values []string) int {
 }
 
 // evidenceTranscriptionsConflict 区分同一多行作答的互补片段与真正互斥的独立读数。
-// 各片段按原顺序拼接后等于完整抄录时，它们共同构成一次证据，不是冲突。
-func evidenceTranscriptionsConflict(transcription string, values []string) bool {
-	if distinctEvidenceCount(values) <= 1 {
-		return false
-	}
+// 各片段按原顺序覆盖完整抄录时，它们共同构成一次证据；只允许首行前导等号
+// 和原文中单个连接运算符的间隙，不改写数值、片段顺序或片段内运算符。
+func evidenceTranscriptionsConflict(transcription string, values []string, answerTranscription string) bool {
 	normalize := func(value string) string {
+		// 仅在比较视图统一转义换行和数值分数；先保留分数边界，避免
+		// 空白归一后将带分数的整数部分并入分子，也不移除运算分组括号。
+		value = evidenceNewline.ReplaceAllString(value, "\n")
+		value = evidenceNumericFraction.ReplaceAllString(value, `\frac{$1}{$2}`)
 		value = strings.Join(strings.Fields(CanonicalPlainTextFallback(value)), "")
 		return strings.NewReplacer(
 			"。", "", "；", "", "，", "", "：", "", "、", "", ";", "", ":", "",
 		).Replace(value)
+	}
+	if answerTranscription != "" {
+		// 两个固定角色分别全量匹配原题和原作答，不能互作题干备选。
+		// 任何额外正文、重复角色或第三条证据都不属于该封套。
+		printed, handwritten := 0, 0
+		matches := len(values) == 2 && normalize(transcription) != "" && normalize(answerTranscription) != ""
+		for _, value := range values {
+			switch {
+			case strings.HasPrefix(value, "印刷体："):
+				printed++
+				matches = matches && normalize(strings.TrimPrefix(value, "印刷体：")) == normalize(transcription)
+			case strings.HasPrefix(value, "手写："):
+				handwritten++
+				matches = matches && normalize(strings.TrimPrefix(value, "手写：")) == normalize(answerTranscription)
+			default:
+				matches = false
+			}
+		}
+		if printed+handwritten > 0 {
+			return !matches || printed != 1 || handwritten != 1
+		}
+	}
+	if distinctEvidenceCount(values) <= 1 {
+		return false
 	}
 	parts := make([]string, 0, len(values))
 	for _, value := range values {
@@ -158,7 +186,36 @@ func evidenceTranscriptionsConflict(transcription string, values []string) bool 
 			parts = append(parts, value)
 		}
 	}
-	return normalize(transcription) == "" || strings.Join(parts, "") != normalize(transcription)
+	whole := normalize(transcription)
+	if whole == "" || len(parts) == 0 {
+		return true
+	}
+	trimLeadingEquals := func(value string) string {
+		if strings.HasPrefix(value, "＝") {
+			return strings.TrimPrefix(value, "＝")
+		}
+		return strings.TrimPrefix(value, "=")
+	}
+	whole = trimLeadingEquals(whole)
+	parts[0] = trimLeadingEquals(parts[0])
+	if strings.Join(parts, "") == whole {
+		return false
+	}
+	for i, part := range parts {
+		index := strings.Index(whole, part)
+		if part == "" || index < 0 || (i == 0 && index != 0) {
+			return true
+		}
+		if i > 0 {
+			switch whole[:index] {
+			case "+", "＋", "-", "－", "−", "×", "*", "÷", "/", "=", "＝":
+			default:
+				return true
+			}
+		}
+		whole = whole[index+len(part):]
+	}
+	return whole != ""
 }
 
 // CanonicalMarkdownValid 做不猜测语义的结构校验：UTF-8、花括号、\(...\)/\[...\]

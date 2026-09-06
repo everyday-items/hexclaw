@@ -55,6 +55,7 @@ func TestWorkFeedbackCanonicalContractAndStrictJSON(t *testing.T) {
 		},
 		Limitations:        "只依据已确认原文。",
 		Suggestions:        []string{"由孩子补充一个听觉细节。"},
+		ParentGuidance:     "### 家长参考稿\n\n" + strings.Repeat("柳枝像绿色的丝带，随风轻轻摆动。\n\n", 40) + "先比较形状，再让孩子解释相似处。",
 		ProjectionMarkdown: "### 观察\n\n- 使用了可见的比喻句。",
 	}
 	if err := feedback.Validate(); err != nil {
@@ -155,6 +156,9 @@ func TestProjectWorkFeedbackMarkdownUsesApprovedParentFacingFourPartProjection(t
 		Limitations: "只依据当前原图中可见内容，不猜测创作意图。",
 		Suggestions: []string{"保留主体位置，再加强最亮与最暗处的差别。"},
 	}
+	if err := json.Unmarshal([]byte(`{"affirmation":"主角非常清楚。","parent_guidance":"画下一张之前，可以先观察自己举手时肩膀、手肘和手腕分别朝哪里。","next_step":"5分钟练习：对着镜子做三个不同的挥手动作，只用圆圈和线条画小人骨架。"}`), &feedback); err != nil {
+		t.Fatal(err)
+	}
 
 	got := ProjectWorkFeedbackMarkdown(feedback)
 	for _, want := range []string{
@@ -163,7 +167,9 @@ func TestProjectWorkFeedbackMarkdownUsesApprovedParentFacingFourPartProjection(t
 		"## 先这样肯定",
 		"## 家长可以这样问或讲",
 		"## 下一次只试一个点",
-		"保留主体位置，再加强最亮与最暗处的差别。",
+		"主角非常清楚。",
+		"肩膀、手肘和手腕分别朝哪里",
+		"对着镜子做三个不同的挥手动作",
 		"只依据当前原图中可见内容，不猜测创作意图。",
 	} {
 		if !strings.Contains(got, want) {
@@ -171,6 +177,9 @@ func TestProjectWorkFeedbackMarkdownUsesApprovedParentFacingFourPartProjection(t
 		}
 	}
 	assertApprovedWorkFeedbackProjection(t, got, feedback.Limitations)
+	if strings.Count(got, "主体位于画面中央。") != 1 || strings.Contains(got, "画面里你最想保留的是哪一处") {
+		t.Fatalf("projection duplicated evidence or replaced concrete guidance: %q", got)
+	}
 	for _, retiredHeading := range []string{"## 观察与依据", "## 下一步建议", "## 能力与证据限制"} {
 		if strings.Contains(got, retiredHeading) {
 			t.Fatalf("retired projection heading %q must not remain: %q", retiredHeading, got)

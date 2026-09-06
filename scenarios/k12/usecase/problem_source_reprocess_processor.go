@@ -466,11 +466,22 @@ func (o *GradingOrchestrator) processProblemSourceReprocess(
 		)
 	}
 
-	// Source work and the canonical GradingJob runner share every mutable
-	// assessment/finalization ledger. Holding the same per-Job mutex prevents
-	// startup recovery from racing this worker into duplicate parents/artifacts.
+	// 与主批改链共用原 Job 锁；局部清晰题在锁外调用模型时先等待，
+	// 避免恢复中的源重处理与冻结执行集并发修改同一输入和产物。
 	jobLock := o.jobLock(jobID)
-	jobLock.Lock()
+	for {
+		jobLock.Lock()
+		if run.clearAssessmentDone == nil {
+			break
+		}
+		done := run.clearAssessmentDone
+		jobLock.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	defer jobLock.Unlock()
 
 	job, err := o.deps.GetGradingJob(ctx, agentName, jobID)
@@ -490,7 +501,29 @@ func (o *GradingOrchestrator) processProblemSourceReprocess(
 	if job.Record.Status == k12.GradingStageCompleted {
 		return o.requireCurrentSourceReprocessFinalArtifact(ctx, job)
 	}
-	if job.Record.Status != k12.GradingStageAssessing {
+	if job.Record.Status == k12.GradingStageFailedRetryable && work.Action == "correct_text" {
+		invocations, err := o.deps.Records.ListGradingItemInvocations(ctx, agentName, jobID)
+		if err != nil {
+			return err
+		}
+		affectedProblemIDs := make(map[string]struct{}, len(work.AffectedProblemIDs))
+		for _, problemID := range work.AffectedProblemIDs {
+			affectedProblemIDs[strings.TrimSpace(problemID)] = struct{}{}
+		}
+		// 新输入摘要不能绕过同题的历史未决调用；组外调用不扩大局部重处理范围。
+		for _, invocation := range invocations {
+			if _, affected := affectedProblemIDs[invocation.ProblemID]; !affected {
+				continue
+			}
+			if invocation.Status == k12.ModelInvocationSent || invocation.Status == k12.ModelInvocationOutcomeUnknown {
+				return sourceReprocessNeedsConfirmation(
+					"grading_job_not_processable",
+					"source reprocess affected problem %s invocation %s status %s requires reconciliation",
+					invocation.ProblemID, invocation.InvocationID, invocation.Status,
+				)
+			}
+		}
+	} else if job.Record.Status != k12.GradingStageAssessing {
 		return sourceReprocessNeedsConfirmation(
 			"grading_job_not_processable",
 			"source reprocess grading job stage %s is not automatically processable",

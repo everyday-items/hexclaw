@@ -544,6 +544,12 @@ func TestManualArtworkWorkFeedbackRouteResolutionFailsClosed(t *testing.T) {
 				t.Fatalf("route failure reached provider/default resolver: provider=%d default=%d",
 					solver.calls, solver.routeCalls)
 			}
+			failed, err := coordinator.Get(context.Background(), input.AgentName, committed.Dispatch.DispatchID)
+			if err != nil || failed.CreativeWork == nil || failed.CreativeWork.GenerationState.Initial == nil ||
+				failed.CreativeWork.GenerationState.Initial.Status != k12.WorkFeedbackFailed ||
+				failed.CreativeFeedback != "feedback_failed" || !failed.CreativeFeedbackRetryable {
+				t.Fatalf("route failure left a phantom running generation: view=%+v err=%v", failed, err)
+			}
 		})
 	}
 }
@@ -1680,6 +1686,14 @@ func TestImageTaskCoordinatorWorkFeedbackRetryReusesFrozenRoute(t *testing.T) {
 		result.CreativeWork.GenerationState.Latest.Feedback == nil {
 		t.Fatalf("creative result missing canonical feedback: result=%+v err=%v", result, err)
 	}
+	feedbackDeps.WorkFeedbackRoute = func(context.Context, string) (k12.ImageTaskRouteSnapshot, error) {
+		return invocation.RouteSnapshot, nil
+	}
+	regenerated, err := feedbackDeps.GenerateWorkFeedbackCommand(context.Background(), "mingming", workID, "independent-regeneration")
+	if err != nil || regenerated.GenerationState.Latest == nil ||
+		regenerated.GenerationState.Latest.GenerationNo != 2 || solver.calls != 3 {
+		t.Fatalf("independent regeneration inherited expired automatic window: view=%+v calls=%d err=%v", regenerated, solver.calls, err)
+	}
 }
 
 func TestImageTaskCoordinatorNeverBlindResendsSentWorkFeedback(t *testing.T) {
@@ -1691,23 +1705,16 @@ func TestImageTaskCoordinatorNeverBlindResendsSentWorkFeedback(t *testing.T) {
 	coordinator, _ := newImageTaskCoordinatorForTest(t, classifier)
 	feedbackDeps := coordinator.WorkFeedback.(*Deps)
 	solver := feedbackDeps.Solver.(*imageTaskFeedbackSolver)
-	solver.panicAfterSend = true
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected simulated feedback crash")
-			}
-		}()
-		prepared, _, err := coordinator.Create(context.Background(), testCreateImageTaskInput())
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, _ = coordinator.Run(
-			context.Background(), "mingming", prepared.Dispatch.DispatchID,
-		)
-	}()
+	solver.err = context.DeadlineExceeded
+	prepared, _, err := coordinator.Create(context.Background(), testCreateImageTaskInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = coordinator.Run(context.Background(), "mingming", prepared.Dispatch.DispatchID); err == nil {
+		t.Fatal("expected feedback deadline failure")
+	}
 
-	solver.panicAfterSend = false
+	solver.err = nil
 	before := solver.calls
 	replayed, created, err := coordinator.Create(
 		context.Background(), testCreateImageTaskInput(),
@@ -1716,9 +1723,13 @@ func TestImageTaskCoordinatorNeverBlindResendsSentWorkFeedback(t *testing.T) {
 		t.Fatalf("replay: created=%v err=%v", created, err)
 	}
 	if solver.calls != before ||
-		replayed.CreativeFeedback != "feedback_pending" ||
+		replayed.CreativeFeedback != "feedback_failed" ||
+		replayed.CreativeFeedbackRetryable ||
+		replayed.CreativeWork == nil ||
+		replayed.CreativeWork.GenerationState.Initial == nil ||
+		replayed.CreativeWork.GenerationState.Initial.Status != k12.WorkFeedbackFailed ||
 		replayed.feedbackInvocation == nil ||
-		replayed.feedbackInvocation.Status != k12.ImageTaskInvocationSent {
+		replayed.feedbackInvocation.Status != k12.ImageTaskInvocationOutcomeUnknown {
 		t.Fatalf("sent feedback was blindly resent or leaked wrong state: calls=%d->%d view=%+v",
 			before, solver.calls, replayed)
 	}

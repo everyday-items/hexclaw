@@ -79,10 +79,16 @@ func feedbackGenerationDTO(
 	dto.Feedback = &workFeedbackDTO{
 		FeedbackID: fact.FeedbackID, FeedbackType: fact.FeedbackType,
 		EvidenceRefs: fact.EvidenceRefs, VisibleEvidence: visible,
-		Affirmation: suggestion(0), ParentGuidance: suggestion(1),
-		NextStep: suggestion(2), SourceSnapshot: fact.SourceSnapshot,
+		Affirmation: fact.Affirmation, ParentGuidance: fact.ParentGuidance,
+		NextStep: fact.NextStep, SourceSnapshot: fact.SourceSnapshot,
 		Limitations:        fact.Limitations,
 		ProjectionMarkdown: fact.ProjectionMarkdown,
+	}
+	if fact.Affirmation == "" && fact.ParentGuidance == "" && fact.NextStep == "" {
+		// 仅为缺少语义字段的旧记录保留原 DTO 读取兼容。
+		dto.Feedback.Affirmation = suggestion(0)
+		dto.Feedback.ParentGuidance = suggestion(1)
+		dto.Feedback.NextStep = suggestion(2)
 	}
 	return dto
 }

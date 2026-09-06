@@ -13,9 +13,7 @@ import (
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/usecase"
 )
 
-// ParentTeachingGuideGenerateFunc is a dedicated single-completion seam for a
-// parent guide. It is not shared with tutoring tips, whose contract explicitly
-// forbids exercise answers.
+// ParentTeachingGuideGenerateFunc 根据已验证解生成给家长的完整逐题讲法。
 type ParentTeachingGuideGenerateFunc func(
 	ctx context.Context,
 	subject, prompt, grade string,
@@ -55,10 +53,10 @@ var parentTeachingPedagogySkill = parentTeachingSkillSpec{
 
 var parentTeachingSubjectSkills = map[string]parentTeachingSkillSpec{
 	"数学":   {name: "math-tutor", file: "skills/math-tutor.md", anchors: []string{"波利亚四步", "理解题目", "回顾检验"}},
-	"语文":   {name: "chinese-tutor", file: "skills/chinese-tutor.md", anchors: []string{"共写不代写", "分点作答", "从原文找依据"}},
-	"英语":   {name: "english-tutor", file: "skills/english-tutor.md", anchors: []string{"用法先于规则", "只鼓励不打击", "不代写"}},
+	"语文":   {name: "chinese-tutor", file: "skills/chinese-tutor.md", anchors: []string{"朗读教学", "分点作答", "从原文找依据"}},
+	"英语":   {name: "english-tutor", file: "skills/english-tutor.md", anchors: []string{"用法先于规则", "只鼓励不打击", "完整修改示范"}},
 	"科学":   {name: "science-tutor", file: "skills/science-tutor.md", anchors: []string{"结论来自证据", "5E 教学模式", "不编造实验结果"}},
-	"信息科技": {name: "information-technology-tutor", file: "skills/information-technology-tutor.md", anchors: []string{"PRIMM 教学法", "运行结果以系统沙箱回传为准", "不代写完整程序"}},
+	"信息科技": {name: "information-technology-tutor", file: "skills/information-technology-tutor.md", anchors: []string{"PRIMM 教学法", "运行结果以系统沙箱回传为准", "完整参考程序"}},
 }
 
 var _ usecase.ParentTeachingGuideGenerator = (*SolveAdapter)(nil)
@@ -90,7 +88,7 @@ func (a *SolveAdapter) GenerateParentTeachingGuide(
 		promptBuilder.WriteString(methodology)
 		promptBuilder.WriteString("\n\n——以下是本题冻结事实与输出合同——\n")
 	}
-	promptBuilder.WriteString(`请只针对下面这一道题生成家长可照着使用的辅导指南。本请求是给家长备课，可包含已经冻结的答案与完整方法；家长对孩子的讲题顺序仍须先让孩子复述和思考，再给最小提示，让孩子独立计算，最后回看验算。
+	promptBuilder.WriteString(`请只针对下面这一道题生成家长可照着使用的辅导指南。一次提供正确答案、完整解法和讲题方法，把学科 Skill 的方法落实到具体的讲解、追问、卡点引导和理解检查；内容简洁明确。
 verified_solution 是已验算的完整解答，是答案和完整方法的唯一依据，不得改写为其他答案或方法。
 answer 只能填写 verified_solution 中明确出现的简短最终答案，禁止把整段解答塞入 answer；full_solution_steps 按 verified_solution 的解题顺序填写必要步骤，服务端还会用可信原文确定性分段后覆盖核对。
 student_answer、wrong_step、error_cause 是已经冻结的孩子作答与批改事实，只用于生成本题讲解顺序和易错提醒，不得改写或否定这些事实。

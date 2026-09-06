@@ -159,9 +159,15 @@ func TestWorkFeedbackInitialRetryReusesGenerationAndFailedRegenerationPreservesL
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.FailWorkFeedbackGeneration(
-		context.Background(), "mingming", initial.GenerationID, "provider_down",
-	); err != nil {
+	if _, err := store.MarkWorkFeedbackGenerationRunning(context.Background(), "mingming", initial.GenerationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.PrepareImageTaskInvocation(context.Background(), k12.ImageTaskInvocation{
+		InvocationID: "expired-initial-work-feedback", AgentName: "mingming", WorkRecordID: rec.RecordID,
+		Operation:     k12.ImageTaskOperationWorkFeedback,
+		OperationKey:  "work:" + rec.RecordID + ":version:" + initial.GenerationID + ":feedback",
+		RequestDigest: "sha256:req", RouteSnapshot: testImageRoute(), Attempt: 1, DeadlineAt: 1,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	retried, created, err := store.PrepareWorkFeedbackGeneration(
@@ -199,10 +205,66 @@ func TestWorkFeedbackInitialRetryReusesGenerationAndFailedRegenerationPreservesL
 	if err != nil || !created || second.GenerationNo != 2 {
 		t.Fatalf("prepare regeneration: created=%v generation=%+v err=%v", created, second, err)
 	}
-	if _, err := store.FailWorkFeedbackGeneration(
-		context.Background(), "mingming", second.GenerationID, "provider_down",
-	); err != nil {
+	if _, err := store.MarkWorkFeedbackGenerationRunning(context.Background(), "mingming", second.GenerationID); err != nil {
 		t.Fatal(err)
+	}
+	expired, _, err := store.PrepareImageTaskInvocation(context.Background(), k12.ImageTaskInvocation{
+		InvocationID: "expired-work-feedback", AgentName: "mingming", WorkRecordID: rec.RecordID,
+		Operation:     k12.ImageTaskOperationWorkFeedback,
+		OperationKey:  "work:" + rec.RecordID + ":version:" + second.GenerationID + ":feedback",
+		RequestDigest: "sha256:regenerate-1", RouteSnapshot: testImageRoute(),
+		Attempt: 1, DeadlineAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, created, err := store.PrepareWorkFeedbackGeneration(
+		context.Background(), "mingming", rec.RecordID, "regenerate-after-expiry", "sha256:third",
+	)
+	if err != nil || !created || third.GenerationNo != 3 {
+		t.Fatalf("expired prepared generation blocked a new command: created=%v generation=%+v err=%v", created, third, err)
+	}
+	second, err = store.GetWorkFeedbackGeneration(context.Background(), "mingming", second.GenerationID)
+	if err != nil || second.Status != k12.WorkFeedbackFailed {
+		t.Fatalf("expired generation did not converge: %+v err=%v", second, err)
+	}
+	expired, err = store.GetImageTaskInvocation(context.Background(), "mingming", expired.InvocationID)
+	if err != nil || expired.Status != k12.ImageTaskInvocationFailed || !expired.RetrySafe || expired.StartedAt != 0 {
+		t.Fatalf("expired unsent invocation did not converge safely: %+v err=%v", expired, err)
+	}
+	replay, created, err := store.PrepareWorkFeedbackGeneration(context.Background(), "mingming", rec.RecordID,
+		"regenerate-after-expiry", "sha256:third")
+	if err != nil || created || replay.GenerationID != third.GenerationID {
+		t.Fatalf("same command was not idempotent: created=%v generation=%+v err=%v", created, replay, err)
+	}
+	sent, _, err := store.PrepareImageTaskInvocation(context.Background(), k12.ImageTaskInvocation{
+		InvocationID: "sent-work-feedback", AgentName: "mingming", WorkRecordID: rec.RecordID,
+		Operation:     k12.ImageTaskOperationWorkFeedback,
+		OperationKey:  "work:" + rec.RecordID + ":version:" + third.GenerationID + ":feedback",
+		RequestDigest: "sha256:third", RouteSnapshot: testImageRoute(), Attempt: 1, DeadlineAt: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := store.ClaimImageTaskInvocationSend(context.Background(), "mingming", sent.InvocationID, "provider-sent", 0); err != nil || !claimed {
+		t.Fatalf("claim sent guard: claimed=%v err=%v", claimed, err)
+	}
+	if _, _, err := store.PrepareWorkFeedbackGeneration(context.Background(), "mingming", rec.RecordID, "must-not-resend", "sha256:fourth"); !errors.Is(err, records.ErrVersionConflict) {
+		t.Fatalf("sent generation must remain parked: %v", err)
+	}
+	sent, err = store.GetImageTaskInvocation(context.Background(), "mingming", sent.InvocationID)
+	if err != nil || sent.Status != k12.ImageTaskInvocationSent {
+		t.Fatalf("sent invocation was changed by prepared expiry: %+v err=%v", sent, err)
+	}
+	if err := store.FailWorkFeedbackInvocation(context.Background(), "mingming", sent.InvocationID, "outcome_unknown", true, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.PrepareWorkFeedbackGeneration(context.Background(), "mingming", rec.RecordID, "must-not-resend-unknown", "sha256:fourth"); !errors.Is(err, records.ErrVersionConflict) {
+		t.Fatalf("unknown generation must remain parked: %v", err)
+	}
+	sent, err = store.GetImageTaskInvocation(context.Background(), "mingming", sent.InvocationID)
+	if err != nil || sent.Status != k12.ImageTaskInvocationOutcomeUnknown || sent.RetrySafe {
+		t.Fatalf("unknown invocation was changed by prepared expiry: %+v err=%v", sent, err)
 	}
 	state, err := store.GetCreativeWorkGenerationState(
 		context.Background(), "mingming", rec.RecordID,

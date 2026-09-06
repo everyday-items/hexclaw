@@ -10,6 +10,7 @@ import (
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12/assetstore"
+	k12storage "github.com/hexagon-codes/hexclaw/scenarios/k12/storage"
 )
 
 var ErrHexbakAssetManifest = errors.New("hexbak asset manifest invalid")
@@ -32,6 +33,26 @@ func PackHexbakAssets(agent string, recs []*records.AgentRecord) ([]HexbakAsset,
 		return nil, err
 	}
 	return packHexbakAssetIDs(agent, refs)
+}
+
+func PackHexbakCurrentCreativeAssets(agent string, works []k12storage.CreativeWorkArchiveV7) ([]HexbakAsset, error) {
+	seen := map[string]bool{}
+	for _, work := range works {
+		if work.AgentName != agent {
+			return nil, fmt.Errorf("current creative asset owner mismatch")
+		}
+		for _, generation := range work.Generations {
+			if id := generation.Source.SourceAssetID; id != "" {
+				seen[id] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return packHexbakAssetIDs(agent, ids)
 }
 
 func packHexbakAssetIDs(agent string, refs []string) ([]HexbakAsset, error) {
@@ -157,6 +178,14 @@ func ValidateHexbakAssets(bak *Hexbak) error {
 			return fmt.Errorf("%w: referenced asset %q 未打包", ErrHexbakAssetManifest, id)
 		}
 	}
+	for _, work := range bak.CurrentCreativeWorks {
+		for _, metadata := range work.PageAssets {
+			asset, ok := entries[metadata.PageAssetID]
+			if !ok || metadata.ContentDigest != asset.SHA256 || metadata.MediaType != asset.MIME || metadata.SizeBytes != int64(len(asset.Data)) {
+				return fmt.Errorf("%w: current creative page metadata does not match packed content", ErrHexbakAssetManifest)
+			}
+		}
+	}
 	return nil
 }
 
@@ -168,6 +197,24 @@ func referencedHexbakArchiveAssetIDs(bak *Hexbak) ([]string, error) {
 	seen := make(map[string]struct{}, len(recordRefs))
 	for _, id := range recordRefs {
 		seen[id] = struct{}{}
+	}
+	for _, work := range bak.CurrentCreativeWorks {
+		for _, generation := range work.Generations {
+			id := generation.Source.SourceAssetID
+			if id == "" {
+				continue
+			}
+			owner, _, err := assetstore.Parse(id)
+			if err != nil || owner != bak.AgentName {
+				return nil, fmt.Errorf("current creative asset owner mismatch")
+			}
+			seen[id] = struct{}{}
+		}
+		for _, asset := range work.PageAssets {
+			if _, ok := seen[asset.PageAssetID]; !ok {
+				return nil, fmt.Errorf("unreferenced current creative page asset")
+			}
+		}
 	}
 	if bak.Version >= 5 {
 		problemRefs, err := ReferencedHexbakProblemAssetIDs(bak.AgentName, bak.ProblemAttempts)

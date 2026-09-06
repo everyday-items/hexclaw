@@ -173,6 +173,54 @@ func MigrateHexbakOwner(source *Hexbak, targetAgent string) (*Hexbak, error) {
 	}
 	migrated.Assets = assets
 	assetMapping := creativeWorkOCRAssetMapping(source, migrated)
+	for i := range migrated.CurrentCreativeWorks {
+		work := &migrated.CurrentCreativeWorks[i]
+		work.AgentName = targetAgent
+		generationIDs := map[string]string{}
+		for _, g := range work.Generations {
+			sum := sha256.Sum256([]byte(targetAgent + "\x00" + g.ID))
+			generationIDs[g.ID] = "cwgen-" + hex.EncodeToString(sum[:16])
+		}
+		work.InitialID = generationIDs[work.InitialID]
+		if work.LatestID != "" {
+			work.LatestID = generationIDs[work.LatestID]
+		}
+		for j := range work.Generations {
+			g := &work.Generations[j]
+			g.ID = generationIDs[g.ID]
+			if id := g.Source.SourceAssetID; id != "" {
+				g.Source.SourceAssetID = assetMapping[id]
+			}
+			if g.Feedback != nil {
+				raw, _ := json.Marshal(g.Feedback)
+				text := string(raw)
+				for from, to := range assetMapping {
+					text = strings.ReplaceAll(text, from, to)
+					text = strings.ReplaceAll(text, "asset-ref:sha256:"+digestString(from), "asset-ref:sha256:"+digestString(to))
+				}
+				for from, to := range generationIDs {
+					text = strings.ReplaceAll(text, from, to)
+				}
+				if err := json.Unmarshal([]byte(text), &g.Feedback); err != nil {
+					return nil, err
+				}
+			}
+		}
+		for j := range work.Invocations {
+			inv := &work.Invocations[j]
+			inv.AgentName = targetAgent
+			sum := sha256.Sum256([]byte(targetAgent + "\x00" + inv.InvocationID))
+			inv.InvocationID = "cwinv-" + hex.EncodeToString(sum[:16])
+			for from, to := range generationIDs {
+				inv.OperationKey = strings.ReplaceAll(inv.OperationKey, ":version:"+from+":", ":version:"+to+":")
+			}
+		}
+		for j := range work.PageAssets {
+			asset := &work.PageAssets[j]
+			asset.AgentName = targetAgent
+			asset.PageAssetID = assetMapping[asset.PageAssetID]
+		}
+	}
 	migrated.ProblemAttempts, err = migrateHexbakProblemAttempts(
 		source.ProblemAttempts, targetAgent, assetMapping,
 	)
@@ -266,6 +314,11 @@ func cloneHexbak(bak *Hexbak) *Hexbak {
 		out.Assets[i].Data = append([]byte(nil), item.Data...)
 	}
 	out.CreativeWorkOCR = append([]k12.CreativeWorkOCRArchiveEvidence(nil), bak.CreativeWorkOCR...)
+	if bak.CurrentCreativeWorks != nil {
+		raw, _ := json.Marshal(bak.CurrentCreativeWorks)
+		out.CurrentCreativeWorks = nil
+		_ = json.Unmarshal(raw, &out.CurrentCreativeWorks)
+	}
 	out.ProblemAttempts = cloneProblemAttemptSnapshots(bak.ProblemAttempts)
 	if bak.ProblemSource != nil {
 		cloned := k12storageCloneProblemSourceArchive(*bak.ProblemSource)

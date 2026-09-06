@@ -44,9 +44,8 @@ func NewProfileAdapter(rw agentReadWriter, store agentPersister) *ProfileAdapter
 
 var _ usecase.ProfileStore = (*ProfileAdapter)(nil)
 
-// PublishProfile updates only the in-memory router after a profile-bundle
-// transaction has already committed agents.metadata in the shared SQLite DB.
-func (a *ProfileAdapter) PublishProfile(agentName string, p k12.ChildProfile) error {
+// PublishProfile 仅将档案事务已提交的配置与档案发布到内存路由，不重复持久化。
+func (a *ProfileAdapter) PublishProfile(agentName string, result k12.ProfileBundleResult) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	cfg, ok := a.rw.GetAgent(agentName)
@@ -54,7 +53,18 @@ func (a *ProfileAdapter) PublishProfile(agentName string, p k12.ChildProfile) er
 		return fmt.Errorf("profile: 实例 %q 不存在", agentName)
 	}
 	updated := *cfg
-	updated.Metadata = k12.ApplyProfileToMeta(cfg.Metadata, p)
+	if committed := result.AgentConfig; committed != nil {
+		updated.DisplayName = committed.DisplayName
+		updated.Description = committed.Description
+		updated.SystemPrompt = committed.SystemPrompt
+		updated.Provider = committed.Provider
+		updated.Model = committed.Model
+		updated.Skills = append([]string(nil), committed.Skills...)
+	}
+	updated.Metadata = k12.ApplyProfileToMeta(cfg.Metadata, k12.ChildProfile{
+		ChildName: result.Profile.ChildName, GradeTerm: result.Profile.GradeTerm,
+		SubjectTextbooks: result.Profile.SubjectTextbooks, TextbookEdition: result.Profile.TextbookEdition,
+	})
 	return a.rw.UpdateAgent(updated)
 }
 

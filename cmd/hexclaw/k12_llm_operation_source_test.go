@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -85,6 +86,27 @@ func TestK12ProductionLLMClosuresMarkEveryCompleteAsNonIdempotent(t *testing.T) 
 		if completeCalls != 1 {
 			t.Errorf("%s provider.Complete calls = %d, want 1", name.Name, completeCalls)
 		}
+		if name.Name == "practiceGenFn" {
+			body := string(source[fn.Body.Pos()-1 : fn.Body.End()-1])
+			for _, want := range []string{"logger.FromContext(cctx)", "模型请求开始", "模型请求结束", "context_deadline", "remaining_ms", "user_bytes", "system_bytes", "prompt_bytes", "max_tokens", "temperature", "output_bytes", "elapsed_ms"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("practice generation inner log missing %s", want)
+				}
+			}
+		}
+		if name.Name == "workFeedbackGenFn" {
+			body := string(source[fn.Body.Pos()-1 : fn.Body.End()-1])
+			if !strings.Contains(body, "if _, hasDeadline := cctx.Deadline(); !hasDeadline {") ||
+				strings.Count(body, "context.WithTimeout(") != 1 ||
+				!strings.Contains(body, "context.WithTimeout(cctx, 60*time.Second)") {
+				t.Error("work feedback must inherit the parent deadline and use 60 seconds only without one")
+			}
+			for _, want := range []string{"logger.FromContext(cctx)", "模型请求开始", "模型请求结束", "context_deadline", "remaining_ms", "prompt_bytes", "max_tokens", "temperature", "output_bytes", "elapsed_ms"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("work feedback inner log missing %s", want)
+				}
+			}
+		}
 		required[name.Name] = true
 		return false
 	})
@@ -132,7 +154,16 @@ func TestK12ProjectionTextClosuresShareFrozenRouteResolver(t *testing.T) {
 		}
 		resolverCalls := 0
 		modelFields := 0
+		parentWritingReference := name.Name != "workFeedbackGenFn"
 		ast.Inspect(fn.Body, func(inner ast.Node) bool {
+			if literal, ok := inner.(*ast.BasicLit); ok && name.Name == "workFeedbackGenFn" {
+				if strings.Contains(literal.Value, "家长参考") {
+					parentWritingReference = true
+				}
+				if strings.Contains(literal.Value, "禁止给范文") || strings.Contains(literal.Value, "禁止改写或重写全文") {
+					t.Error("work feedback system instruction blocks the parent reference")
+				}
+			}
 			if call, ok := inner.(*ast.CallExpr); ok {
 				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "resolveK12FrozenTextCompletionRoute" {
 					resolverCalls++
@@ -164,6 +195,9 @@ func TestK12ProjectionTextClosuresShareFrozenRouteResolver(t *testing.T) {
 		}
 		if modelFields != 1 {
 			t.Errorf("%s CompletionRequest.Model=model fields=%d, want 1", name.Name, modelFields)
+		}
+		if !parentWritingReference {
+			t.Error("work feedback system instruction is missing the parent reference")
 		}
 		required[name.Name] = true
 		return false

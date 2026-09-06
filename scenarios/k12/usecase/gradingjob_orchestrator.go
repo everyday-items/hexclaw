@@ -101,17 +101,24 @@ func (o *GradingOrchestrator) jobLock(jobID string) *sync.Mutex {
 	return l
 }
 
-// withProblemSourceActionJobFence linearizes a source-changing command with
-// the canonical grading runner and the source reprocess worker. All three use
-// the same per-Job mutex, so a command cannot commit a new immutable V72 head
-// after runAssessItems passed its pending-source gate but before/during a
-// provider operation in this process.
+// withProblemSourceActionJobFence 用同一 Job 锁串行化源变更和批改推进。
+// 局部清晰题调用在锁外执行时，先等待其冻结执行集结束再重取原锁，
+// 防止模型消费当前输入期间源命令提交另一不可变版本。
 func (o *GradingOrchestrator) withProblemSourceActionJobFence(
 	jobID string,
 	command func() error,
 ) error {
 	l := o.jobLock(strings.TrimSpace(jobID))
-	l.Lock()
+	for {
+		l.Lock()
+		run := o.lookup(strings.TrimSpace(jobID))
+		if run == nil || run.clearAssessmentDone == nil {
+			break
+		}
+		done := run.clearAssessmentDone
+		l.Unlock()
+		<-done
+	}
 	defer l.Unlock()
 	return command()
 }
@@ -153,6 +160,9 @@ type gradingRun struct {
 	textOnly bool
 	// questions recognizing 阶段产物（已 Normalize、BBox 已剥离）。
 	questions []RecognizedQuestion
+	// 局部清晰题执行期间仅允许集合外待确认事实更新；不持久化同步信息。
+	clearAssessmentQuestions map[string]bool
+	clearAssessmentDone      chan struct{}
 	// anchored locating 并行分支成功产物；nil = 未定位（缺席或失败）。
 	anchored []RecognizedQuestion
 	// anchorFailed 锚点分支调用失败（区分「能力缺席」：影响 assessing 阶段的降级文案复现）。
@@ -423,10 +433,13 @@ func (o *GradingOrchestrator) RunGradingJob(ctx context.Context, jobID string) (
 	if err != nil {
 		return GradingJobView{}, err
 	}
-	l := o.jobLock(jobID)
-	l.Lock()
-	defer l.Unlock()
-	return o.runLoop(ctx, run, jobID)
+	var view GradingJobView
+	err = o.withProblemSourceActionJobFence(jobID, func() error {
+		var runErr error
+		view, runErr = o.runLoop(ctx, run, jobID)
+		return runErr
+	})
+	return view, err
 }
 
 // runLoop 持 Job 锁的推进循环（调用方必须已持 jobLock）。
@@ -481,7 +494,7 @@ func (o *GradingOrchestrator) runLoop(ctx context.Context, run *gradingRun, jobI
 				}
 			}
 			if automaticPhotoConfirmationSource(v.Fields.SourceKind) &&
-				run.req.TaskIntent == PhotoTaskBlankWorksheet &&
+				(run.req.TaskIntent == PhotoTaskBlankWorksheet || run.req.TaskIntent == PhotoTaskCompletedHomework) &&
 				v.Fields.ConfirmationState == k12.GradingConfirmationPending &&
 				v.Fields.BudgetSnapshot.IsFrozen() {
 				if err := o.assessClearWorksheetQuestions(ctx, run, v); err != nil {
@@ -525,12 +538,12 @@ func recognizedQuestionsRequireGuardianConfirmation(
 	return false
 }
 
-// 清晰题先冻结并复用既有逐题账本求解；疑问题及其公共题干依赖组不执行。
+// 清晰题先冻结并按页面意图复用既有逐题账本；疑问题及其公共题干依赖组不执行。
 // 后续整页确认保留这些输入版本和回执，不重复调用模型。
-func clearWorksheetQuestionIDs(questions []RecognizedQuestion) map[string]bool {
+func clearWorksheetQuestionIDs(questions []RecognizedQuestion, taskIntent PhotoTaskIntent) map[string]bool {
 	blocked := make(map[string]bool)
 	for _, q := range questions {
-		if recognizedQuestionRequiresGuardianConfirmation(q, PhotoTaskBlankWorksheet) {
+		if recognizedQuestionRequiresGuardianConfirmation(q, taskIntent) {
 			blocked[q.ProblemID] = true
 			if q.ParentProblemID != "" {
 				blocked[q.ParentProblemID] = true
@@ -547,7 +560,16 @@ func clearWorksheetQuestionIDs(questions []RecognizedQuestion) map[string]bool {
 }
 
 func (o *GradingOrchestrator) assessClearWorksheetQuestions(ctx context.Context, run *gradingRun, job GradingJobView) error {
-	clear := clearWorksheetQuestionIDs(run.questions)
+	var mode PhotoMode
+	switch run.req.TaskIntent {
+	case PhotoTaskCompletedHomework:
+		mode = PhotoModeGrade
+	case PhotoTaskBlankWorksheet:
+		mode = PhotoModeSolve
+	default:
+		return fmt.Errorf("%w: unsupported frozen photo task intent %q", ErrInvalidInput, run.req.TaskIntent)
+	}
+	clear := clearWorksheetQuestionIDs(run.questions, run.req.TaskIntent)
 	candidate := *run
 	candidate.questions = cloneRecognizedQuestions(run.questions)
 	for i := range candidate.questions {
@@ -573,11 +595,26 @@ func (o *GradingOrchestrator) assessClearWorksheetQuestions(ctx context.Context,
 	}
 	run.questions = candidate.questions
 	run.anchored = candidate.anchored
-	for _, q := range RecognizedQuestionsForAssessment(run.questions) {
+	questions := RecognizedQuestionsForAssessment(candidate.questions)
+	req := candidate.req
+	done := make(chan struct{})
+	run.clearAssessmentQuestions = clear
+	run.clearAssessmentDone = done
+	l := o.jobLock(job.Record.RecordID)
+	// 模型只消费冻结副本；确认可及时落库，源变更仍等待本段结束。
+	// 回位仅结束同步区间，不用旧副本覆盖已经保存的确认或锚点。
+	defer func() {
+		l.Lock()
+		run.clearAssessmentQuestions = nil
+		run.clearAssessmentDone = nil
+		close(done)
+	}()
+	l.Unlock()
+	for _, q := range questions {
 		if !clear[q.ProblemID] {
 			continue
 		}
-		if _, err := o.assessDurablePhotoItem(ctx, o.deps, job, run.req, PhotoModeSolve, q); err != nil {
+		if _, err := o.assessDurablePhotoItem(ctx, o.deps, job, req, mode, q); err != nil {
 			return err
 		}
 	}
@@ -661,7 +698,19 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 		return GradingJobView{}, err
 	}
 	l := o.jobLock(jobID)
-	l.Lock()
+	for {
+		l.Lock()
+		if run.clearAssessmentDone == nil {
+			break
+		}
+		done := run.clearAssessmentDone
+		l.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return GradingJobView{}, ctx.Err()
+		}
+	}
 	candidate := *run
 	candidate.questions = cloneRecognizedQuestions(run.questions)
 	candidate.anchored = cloneRecognizedQuestions(run.anchored)
@@ -833,19 +882,10 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			planVersionErr,
 		)
 	}
-	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 && policy.IsZero() {
-		return o.failModelInvocationBeforeSend(
-			ctx,
-			run,
-			jobID,
-			fmt.Errorf(
-				"%w: recognition plan v2 requires the frozen recognizing request policy",
-				ErrModelRequestPolicyInvalid,
-			),
-		)
-	}
+	// V2 持久调用链由识题计划决定，不能依赖仅 Sol 使用的请求参数策略。
+	usesDurableRecognition := recognitionPlanVersion == k12.RecognitionPlanVersionV2 || !policy.IsZero()
 	var invocation k12.ModelInvocation
-	if policy.IsZero() {
+	if !usesDurableRecognition {
 		invocation, err = o.beginModelInvocationWithPolicy(
 			ctx,
 			job,
@@ -1028,7 +1068,7 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			err,
 			ErrRecognitionPhysicalCallBeforeSend,
 		)
-		if !invocation.RequestPolicySnapshot.IsZero() &&
+		if usesDurableRecognition &&
 			physicalExecutor.localCallEntries.Load() == 0 {
 			definiteNoSend, observedOtherWorker, inspectErr :=
 				o.settleRecognitionFailureBeforeLocalPhysicalCall(
@@ -1058,18 +1098,15 @@ func (o *GradingOrchestrator) runRecognize(ctx context.Context, run *gradingRun,
 			}
 			beforePhysicalSend = definiteNoSend
 		}
-		if !beforePhysicalSend &&
-			!invocation.RequestPolicySnapshot.IsZero() {
+		if !beforePhysicalSend && usesDurableRecognition {
 			physicalStarted, inspectErr :=
 				o.recognitionPhysicalCallStarted(
 					context.WithoutCancel(ctx),
 					invocation,
 				)
 			if inspectErr == nil && !physicalStarted {
-				// Under the approved DD-036 policy every provider request must
-				// cross a durable child prepared→sent boundary first. Therefore
-				// an exact zero-child set proves this failure happened before
-				// any request could have reached the provider.
+				// 持久调用链中的 Provider 请求必须先跨过子项 prepared→sent 边界。
+				// 精确的零调用证据表明失败发生在 Provider 请求发送之前。
 				beforePhysicalSend = true
 			}
 		}

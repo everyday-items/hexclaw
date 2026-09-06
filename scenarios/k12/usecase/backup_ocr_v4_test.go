@@ -15,8 +15,8 @@ import (
 )
 
 func TestHexbakCurrentVersionIsV6ForProblemSourceProblemAttemptAndConfirmedCreativeWorkOCREvidence(t *testing.T) {
-	if HexbakVersion != 6 {
-		t.Fatalf("HexbakVersion=%d want 6 so source-action, Problem/Attempt and confirmed OCR evidence are checksum-covered", HexbakVersion)
+	if HexbakVersion != 7 {
+		t.Fatalf("HexbakVersion=%d want 7 for current creative work evidence", HexbakVersion)
 	}
 }
 
@@ -96,7 +96,7 @@ func TestMigrateHexbakOwnerUpgradesV3InlineOCREvidenceAndRewritesResolvableJobRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migrated.Version != 6 || len(migrated.CreativeWorkOCR) != 1 {
+	if migrated.Version != HexbakVersion || len(migrated.CreativeWorkOCR) != 1 {
 		t.Fatalf("migrated v3 archive=%+v want one current-version confirmed OCR evidence", migrated)
 	}
 	fields, err := k12.ParseCreativeWorkFields(migrated.Records[0].Fields)
@@ -189,6 +189,28 @@ func TestBackupV4PacksOnlyConfirmedOCREvidenceReferencedByCreativeWork(t *testin
 	if _, err := store.Put(ctx, work); err != nil {
 		t.Fatal(err)
 	}
+	current, err := k12.NewCreativeWorkRecord("mingming", "", k12.CreativeWorkFields{WorkType: k12.WorkTypeWriting, DisplayName: "当前作文", GradeTerm: "五年级上"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := k12.CreativeWorkSourceSnapshot{
+		WorkType: k12.WorkTypeWriting, SourceAssetID: assetID, ContentMarkdown: "当前确认作文",
+		OCRRaw: "当前OCR原文", OCRVersion: 1, OCRDigest: "sha256:" + digestText("当前确认作文"), ContentConfirmedAt: 30,
+	}
+	generation, _, err := store.CreateCreativeWorkWithInitialGeneration(ctx, current, "current-writing-backup", "current-writing-source", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedback, err := buildStructuredWorkFeedback(k12.WorkTypeWriting, k12.CreativeWorkVersion{
+		VersionID: generation.GenerationID, SourceAssetID: assetID, ContentMarkdown: source.ContentMarkdown,
+	}, "细节描写清楚，可以补充动作。", k12.FeedbackSourceAI, "writing-feedback@1.0.0/embedded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, err = store.CompleteWorkFeedbackGeneration(ctx, "mingming", generation.GenerationID, feedback)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	bak, err := d.Backup(ctx, "mingming")
 	if err != nil {
@@ -199,6 +221,16 @@ func TestBackupV4PacksOnlyConfirmedOCREvidenceReferencedByCreativeWork(t *testin
 	}
 	if err := VerifyHexbak(bak); err != nil {
 		t.Fatalf("backup v4 must verify: %v", err)
+	}
+	if len(bak.CurrentCreativeWorks) != 1 || bak.CurrentCreativeWorks[0].InitialID != generation.GenerationID || bak.CurrentCreativeWorks[0].Generations[0].Source != generation.Source {
+		t.Fatal("current frozen OCR source was not exported exactly")
+	}
+	if bak.CurrentCreativeWorks[0].LatestID != generation.GenerationID || bak.CurrentCreativeWorks[0].Generations[0].Feedback == nil || bak.CurrentCreativeWorks[0].Generations[0].Feedback.ProjectionMarkdown != feedback.ProjectionMarkdown {
+		t.Fatal("current canonical feedback and latest pointer were not exported")
+	}
+	bak.CurrentCreativeWorks[0].Generations[0].Source.OCRRaw = "tampered"
+	if err := VerifyHexbak(bak); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("current OCR must be checksum covered: %v", err)
 	}
 }
 
@@ -217,10 +249,13 @@ func v4CreativeWorkOCRArchive(t *testing.T, agent string) *Hexbak {
 		OCRVersion: 1, OCRConfirmedDigest: contentDigest, ContentConfirmedAt: 101,
 		Feedback: "这句话的比喻很清楚；建议补充柳枝随风移动的细节。",
 	}
-	structured := buildStructuredWorkFeedback(
+	structured, err := buildStructuredWorkFeedback(
 		k12.WorkTypeWriting, version, version.Feedback, k12.FeedbackSourceAI,
 		"writing-feedback@1.0.0/embedded",
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	version.StructuredFeedback = &structured
 	version.FeedbackSource = k12.FeedbackSourceAI
 	version.FeedbackSkill = "writing-feedback@1.0.0/embedded"

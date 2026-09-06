@@ -17,8 +17,8 @@ import (
 // v3 为 DD-025 restore-as 增加不可变 archive_id；v4 把作品已确认 OCR
 // canonical evidence 纳入 checksum；v5 纳入 V19 Problem/Attempt canonical
 // ledger 与其 page asset；v6 纳入 V50/V51/V72/V73 source-action durability
-// closure。v2-v5 校验字节契约继续兼容。
-const HexbakVersion = 6
+// closure；v7 纳入当前作品来源、点评与调用停点。v2-v6 校验字节契约继续兼容。
+const HexbakVersion = 7
 
 // ErrChecksumMismatch 恢复时校验和不符（归档损坏或载荷不一致）。
 var ErrChecksumMismatch = errors.New("hexbak checksum mismatch")
@@ -46,6 +46,8 @@ type Hexbak struct {
 	// metadata、可恢复队列与 V73 typed/physical lineage。原始 provider payload
 	// 不进入该投影；所有引用的 PageAsset bytes 仍通过 Assets 单一机制打包。
 	ProblemSource *k12storage.ProblemSourceArchiveV6 `json:"problem_source,omitempty"`
+	// CurrentCreativeWorks v7 覆盖当前作品来源、点评与调用停点；旧格式字段不变。
+	CurrentCreativeWorks []k12storage.CreativeWorkArchiveV7 `json:"current_creative_works,omitempty"`
 	// Profile 孩子档案（T2.6 全量导出 PRD §3.12.4-1：不止 records，还含档案）。可空（老归档/无档案）。
 	// 注：学情记忆 + 实例配置的导出需跨子系统新 port（Insights 目前只写不可导），属后续。
 	Profile  *k12.ChildProfile `json:"profile,omitempty"`
@@ -64,6 +66,10 @@ func (d Deps) Backup(ctx context.Context, agentName string) (*Hexbak, error) {
 	bak := &Hexbak{
 		Version: HexbakVersion, AgentName: agentName, ExportedAt: d.now(),
 		Records: recs,
+	}
+	bak.CurrentCreativeWorks, err = d.Records.ExportCreativeWorksArchiveV7(ctx, agentName)
+	if err != nil {
+		return nil, fmt.Errorf("export current creative works: %w", err)
 	}
 	// T2.6 全量导出：附孩子档案（有档案存储且档案存在时）。
 	if d.Profiles != nil {
@@ -100,7 +106,11 @@ func (d Deps) Backup(ctx context.Context, agentName string) (*Hexbak, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 打包 source-action PageAsset: %w", err)
 	}
-	bak.Assets, err = MergeHexbakAssets(recordAssets, problemAssets, problemSourceAssets)
+	currentAssets, err := PackHexbakCurrentCreativeAssets(agentName, bak.CurrentCreativeWorks)
+	if err != nil {
+		return nil, err
+	}
+	bak.Assets, err = MergeHexbakAssets(recordAssets, problemAssets, problemSourceAssets, currentAssets)
 	if err != nil {
 		return nil, fmt.Errorf("usecase: 合并档案资产: %w", err)
 	}
@@ -160,7 +170,7 @@ func (d Deps) Restore(ctx context.Context, bak *Hexbak) (int, error) {
 		// boundary; compensation cannot close a process-crash window.
 		if d.ArchiveRestorer == nil && (d.Profiles != nil || restoreBak.Profile != nil ||
 			len(restoreBak.CreativeWorkOCR) > 0 || len(restoreBak.ProblemAttempts) > 0 ||
-			restoreBak.ProblemSource != nil) {
+			restoreBak.ProblemSource != nil || len(restoreBak.CurrentCreativeWorks) > 0) {
 			return 0, fmt.Errorf("%w: 未配置 records/profile 原子恢复能力", ErrInvalidInput)
 		}
 		if d.ArchiveRestorer != nil {
@@ -172,7 +182,7 @@ func (d Deps) Restore(ctx context.Context, bak *Hexbak) (int, error) {
 					return len(restoreBak.Records), nil
 				}
 				if len(restoreBak.Assets) > 0 || len(restoreBak.CreativeWorkOCR) > 0 ||
-					len(restoreBak.ProblemAttempts) > 0 || restoreBak.ProblemSource != nil {
+					len(restoreBak.ProblemAttempts) > 0 || restoreBak.ProblemSource != nil || len(restoreBak.CurrentCreativeWorks) > 0 {
 					return 0, fmt.Errorf("%w: 未配置 v%d 内容文件/OCR/Problem-Attempt 原子恢复能力", ErrInvalidInput, restoreBak.Version)
 				}
 			}
@@ -195,6 +205,16 @@ func (d Deps) Restore(ctx context.Context, bak *Hexbak) (int, error) {
 func checksumHexbak(bak *Hexbak) (string, error) {
 	if bak == nil {
 		return "", fmt.Errorf("usecase: nil hexbak")
+	}
+	if bak.Version >= 7 {
+		copy := *bak
+		copy.Checksum = ""
+		raw, err := json.Marshal(copy)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(raw)
+		return hex.EncodeToString(sum[:]), nil
 	}
 	var payload any
 	if bak.Version == 2 {
@@ -271,6 +291,13 @@ func SealHexbak(bak *Hexbak) error {
 	}
 	if bak.Version == 0 {
 		bak.Version = HexbakVersion
+	}
+	if bak.Version >= 7 && bak.ArchiveID == "" {
+		seed, err := checksumHexbak(bak)
+		if err != nil {
+			return err
+		}
+		bak.ArchiveID = "hexbak-" + seed[:32]
 	}
 	if bak.Version >= 3 && bak.ArchiveID == "" {
 		var seed any
@@ -366,6 +393,24 @@ func VerifyHexbak(bak *Hexbak) error {
 	}
 	if sum != bak.Checksum {
 		return ErrChecksumMismatch
+	}
+	if bak.Version < 7 && len(bak.CurrentCreativeWorks) != 0 {
+		return fmt.Errorf("current creative archive is not covered by this version")
+	}
+	if err := k12storage.ValidateCreativeWorksArchiveV7(bak.AgentName, bak.CurrentCreativeWorks); err != nil {
+		return err
+	}
+	for _, work := range bak.CurrentCreativeWorks {
+		found := false
+		for _, rec := range bak.Records {
+			if rec != nil && rec.RecordID == work.WorkID && rec.AgentName == work.AgentName && rec.Collection == k12.CollectionCreativeWork {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("current creative archive root is missing")
+		}
 	}
 	if err := ValidateHexbakAssets(bak); err != nil {
 		return err

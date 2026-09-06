@@ -261,7 +261,7 @@ func GradingStageBudgetSeconds(stage string) int64 {
 // 规则 2：rendering 无 failed_* 出边——失败降级续跑 projecting，不进失败态。
 // 规则 5：rendering/projecting 无 cancelled 出边。
 // 规则 6：completed 无出边——修正 = confirmed_version+1 的新 Job。
-// 规则 7：awaiting_confirmation 无自动过期出边，仅 assessing（汇合）与 cancelled（显式取消）。
+// 人工等待不自动过期；局部题调用结果未知时沿 outcome_unknown 停点收敛。
 func GradingJobSchema() *records.RecordSchema {
 	return &records.RecordSchema{
 		Collection:    CollectionGradingJob,
@@ -289,6 +289,7 @@ func GradingJobSchema() *records.RecordSchema {
 			GradingStageAwaitingConfirmation: {
 				GradingStageAssessing, // 与 locating 汇合后进入（规则 1）
 				GradingStageCancelled,
+				GradingStageOutcomeUnknown,
 			},
 			GradingStageAssessing:       {GradingStageRendering, GradingStageCancelled, GradingStageOutcomeUnknown, GradingStageFailedRetryable},
 			GradingStageRendering:       {GradingStageProjecting},

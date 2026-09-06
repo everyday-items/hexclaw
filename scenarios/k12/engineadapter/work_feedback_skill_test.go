@@ -38,7 +38,7 @@ func artReq() usecase.WorkFeedbackRequest {
 
 // 硬编码红线段（三道保险的第二道，所有路径必须原样在场）。
 const (
-	writingHardRedline = "红线：只点评不打分——禁止输出任何分数、等第、评级、排名；不代写——禁止给范文、禁止改写或重写全文。"
+	writingHardRedline = "给家长修改示范与完整参考稿，并说明先讲什么、怎样追问、卡住时如何引导、如何检查理解。原稿与参考稿分开，不编造孩子事实；不打分、不评级、不排名。直接给内容与讲法，不输出原则声明。"
 	artHardRedline     = "红线：不打分、不评级、不排名、不做审美排名；不替孩子重画。"
 )
 
@@ -48,8 +48,8 @@ func diskSkillDoc(name, version, extraFrontmatter, body string) string {
 		"schema_version: 1\n---\n\n" + body
 }
 
-// validDiskWritingBody 携带写作红线锚点（零代写/不打分）的盘上演进版正文。
-const validDiskWritingBody = "# 盘上演进版写作反馈 v9\n新增的演进方法论段落。\n红线：零代写、不打分。"
+// validDiskWritingBody 携带家长参考与评分边界锚点的盘上演进版正文。
+const validDiskWritingBody = "# 盘上演进版写作反馈 v9\n新增的演进方法论段落。\n家长参考稿与原稿分开，不打分。"
 
 // validDiskArtBody 携带美术红线锚点（不打分/不重画/不得先追问）的盘上演进版正文。
 const validDiskArtBody = "# 盘上演进版美术反馈 v9\n新增的观察演进段落。\n红线：不打分、不重画、不得先追问。"
@@ -68,7 +68,7 @@ func TestBuildWorkFeedbackPrompt_DiskPreferredOverEmbedded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("盘上有效版本构造提示词失败: %v", err)
 		}
-		if !strings.Contains(prompt, "盘上演进版写作反馈 v9") {
+		if !strings.Contains(prompt, validDiskWritingBody) {
 			t.Error("提示词应注入盘上演进版正文")
 		}
 		if strings.Contains(prompt, "叶圣陶") {
@@ -86,6 +86,17 @@ func TestBuildWorkFeedbackPrompt_DiskPreferredOverEmbedded(t *testing.T) {
 		if !strings.Contains(prompt, "嗒嗒响") {
 			t.Error("作品证据缺失")
 		}
+		if strings.Contains(prompt, "评价框架、输出信封与红线全部遵此执行") {
+			t.Error("writing skill introduction must not require a competing output envelope")
+		}
+		if !strings.Contains(prompt, "专业方法、原文证据约束与红线") || !strings.Contains(prompt, "输出格式以文末四个固定二级标题为准") {
+			t.Error("writing skill introduction must preserve professional methods and evidence while deferring format to the final four headings")
+		}
+		for _, heading := range []string{"## 可见证据", "## 先这样肯定", "## 家长可以这样问或讲", "## 下一次只试一个点"} {
+			if !strings.Contains(prompt, heading) {
+				t.Errorf("writing output envelope is missing %q", heading)
+			}
+		}
 	})
 	t.Run("美术", func(t *testing.T) {
 		loader := func(name string) (string, error) {
@@ -98,7 +109,7 @@ func TestBuildWorkFeedbackPrompt_DiskPreferredOverEmbedded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("盘上有效版本构造提示词失败: %v", err)
 		}
-		if !strings.Contains(prompt, "盘上演进版美术反馈 v9") {
+		if !strings.Contains(prompt, validDiskArtBody) {
 			t.Error("提示词应注入盘上演进版正文")
 		}
 		if strings.Contains(prompt, "罗恩菲德") {
@@ -109,6 +120,11 @@ func TestBuildWorkFeedbackPrompt_DiskPreferredOverEmbedded(t *testing.T) {
 		}
 		if !strings.Contains(prompt, artHardRedline) {
 			t.Error("盘上路径丢失硬编码红线段")
+		}
+		for _, heading := range []string{"## 可见证据", "## 先这样肯定", "## 家长可以这样问或讲", "## 下一次只试一个点"} {
+			if !strings.Contains(prompt, heading) {
+				t.Errorf("art output envelope is missing %q", heading)
+			}
 		}
 	})
 }
@@ -124,8 +140,8 @@ func TestBuildWorkFeedbackPrompt_DiskUnavailable_FallsBackEmbedded(t *testing.T)
 	if !strings.Contains(prompt, "叶圣陶") {
 		t.Error("盘上缺失时应注入内嵌快照正文")
 	}
-	if stamp != "writing-feedback@1.0.0/embedded" {
-		t.Errorf("来源戳应为 writing-feedback@1.0.0/embedded，got %q", stamp)
+	if stamp != "writing-feedback@1.0.1/embedded" {
+		t.Errorf("来源戳应为 writing-feedback@1.0.1/embedded，got %q", stamp)
 	}
 	if !strings.Contains(prompt, writingHardRedline) {
 		t.Error("内嵌路径丢失硬编码红线段")
@@ -142,8 +158,8 @@ func TestBuildWorkFeedbackPrompt_DiskCorrupt_FallsBackEmbedded(t *testing.T) {
 	}{
 		{"空内容", "   \n  "},
 		{"只剩frontmatter", "---\nname: writing-feedback\nversion: \"9.9.9\"\n---\n\n   "},
-		{"缺零代写红线锚点", diskSkillDoc("writing-feedback", "9.9.9", "", "# 被改坏的正文\n红线：不打分。")},
-		{"缺不打分红线锚点", diskSkillDoc("writing-feedback", "9.9.9", "", "# 被改坏的正文\n红线：零代写。")},
+		{"缺家长参考锚点", diskSkillDoc("writing-feedback", "9.9.9", "", "# 被改坏的正文\n红线：不打分。")},
+		{"缺不打分红线锚点", diskSkillDoc("writing-feedback", "9.9.9", "", "# 被改坏的正文\n家长参考稿与原稿分开。")},
 		{"min_engine_version过高", diskSkillDoc("writing-feedback", "9.9.9",
 			"min_engine_version: \"99.0.0\"\n", validDiskWritingBody)},
 	}
@@ -160,7 +176,7 @@ func TestBuildWorkFeedbackPrompt_DiskCorrupt_FallsBackEmbedded(t *testing.T) {
 			if !strings.Contains(prompt, "叶圣陶") {
 				t.Error("盘上损坏时应降级注入内嵌快照正文")
 			}
-			if stamp != "writing-feedback@1.0.0/embedded" {
+			if stamp != "writing-feedback@1.0.1/embedded" {
 				t.Errorf("来源戳应落 embedded，got %q", stamp)
 			}
 			if !strings.Contains(prompt, writingHardRedline) {
@@ -237,7 +253,7 @@ func TestBuildWorkFeedbackPrompt_Writing_InjectsSkillBody(t *testing.T) {
 	if subject != "语文" {
 		t.Errorf("写作学科应为语文, got %q", subject)
 	}
-	if stamp != "writing-feedback@1.0.0/embedded" {
+	if stamp != "writing-feedback@1.0.1/embedded" {
 		t.Errorf("无 loader 时来源戳应为 embedded，got %q", stamp)
 	}
 	// skill 正文关键方法论句（来自 hub v0.0.7 writing-feedback.md 正文）。
@@ -246,7 +262,7 @@ func TestBuildWorkFeedbackPrompt_Writing_InjectsSkillBody(t *testing.T) {
 		"最值得改的 1～3 处", // 输出信封第 3 段：一次最多 3 处
 		"输出信封",        // 固定六段信封
 		"叶圣陶",         // 方法论根基
-		"零代写",         // skill 红线
+		"家长参考",        // 参考稿与孩子原稿分开
 	} {
 		if !strings.Contains(prompt, kw) {
 			t.Errorf("写作提示词缺 skill 正文关键句 %q", kw)

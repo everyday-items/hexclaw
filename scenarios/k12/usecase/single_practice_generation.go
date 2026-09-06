@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hexagon-codes/toolkit/util/idgen"
+	"github.com/hexagon-codes/toolkit/util/logger"
 
 	"github.com/hexagon-codes/hexclaw/records"
 	"github.com/hexagon-codes/hexclaw/scenarios/k12"
@@ -616,13 +619,13 @@ func singlePracticePrompt(request singlePracticeRequestSnapshot) string {
 		"same": "同等难度", "easier": "更简单", "harder": "更难",
 	}[request.Difficulty]
 	return fmt.Sprintf(
-		"生成一道%s的小学变式练习。保持来源知识点与方法，不复述原题，不泄露答案；教材边界=%s；年级=%s；来源题=%s；知识点=%s。严格输出 ## 问题 / ## 解答 / ## 答案 三段 Markdown。",
+		"生成一道%s的小学变式练习。保持来源知识点与方法，不复述原题，给家长答案和讲法；教材边界=%s；年级=%s；来源题=%s；知识点=%s。严格输出 ## 问题 / ## 解答 / ## 答案 三段 Markdown。",
 		difficultyCN, request.Textbook, request.Grade,
 		request.Question, request.KnowledgePoint,
 	)
 }
 
-type singlePracticeModelCall func() (SolveResult, error)
+type singlePracticeModelCall func(context.Context) (SolveResult, error)
 
 type singlePracticeOutputSaver func(string) (k12.PracticeGenerationJob, error)
 
@@ -639,6 +642,10 @@ func (d Deps) runSinglePracticeModelInvocation(
 	save singlePracticeOutputSaver,
 ) (SolveResult, k12.PracticeGenerationJob, bool, error) {
 	var zero SolveResult
+	prepareStartedAt := time.Now()
+	slog.Info("K12 single practice invocation preparation started", "agent_id", job.AgentName,
+		"job_id", job.GenerationJobID, "stage", stage, "attempt", attempt,
+		"provider", route.Provider, "model", route.Model, "checkpoint_bytes", len(checkpoint))
 	invocation, _, err := d.Records.PreparePracticeGenerationInvocation(
 		ctx,
 		k12.ModelInvocation{
@@ -656,6 +663,9 @@ func (d Deps) runSinglePracticeModelInvocation(
 			UpdatedAt: d.now(),
 		},
 	)
+	slog.Info("K12 single practice invocation preparation finished", "agent_id", job.AgentName,
+		"job_id", job.GenerationJobID, "stage", stage, "invocation_id", invocation.InvocationID,
+		"status", invocation.Status, "elapsed_ms", time.Since(prepareStartedAt).Milliseconds(), "error", err)
 	if err != nil {
 		return zero, job, false, err
 	}
@@ -728,10 +738,14 @@ func (d Deps) runSinglePracticeModelInvocation(
 			stage, invocation.InvocationID, invocation.Status,
 		)
 	case k12.ModelInvocationPrepared:
+		claimStartedAt := time.Now()
 		_, claimed, claimErr := d.Records.ClaimPracticeGenerationInvocationSend(
 			ctx, job.AgentName, invocation.InvocationID,
 			invocation.ProviderIdempotencyKey,
 		)
+		slog.Info("K12 single practice invocation claim finished", "agent_id", job.AgentName,
+			"job_id", job.GenerationJobID, "stage", stage, "invocation_id", invocation.InvocationID,
+			"claimed", claimed, "elapsed_ms", time.Since(claimStartedAt).Milliseconds(), "error", claimErr)
 		if claimErr != nil {
 			return zero, job, false, claimErr
 		}
@@ -748,7 +762,22 @@ func (d Deps) runSinglePracticeModelInvocation(
 		)
 	}
 
-	result, callErr := call()
+	callStartedAt := time.Now()
+	deadline, hasDeadline := ctx.Deadline()
+	slog.Info("K12 single practice model call started", "agent_id", job.AgentName,
+		"job_id", job.GenerationJobID, "stage", stage, "invocation_id", invocation.InvocationID,
+		"provider", route.Provider, "model", route.Model, "timeout_ms", route.TimeoutMS,
+		"context_has_deadline", hasDeadline, "context_deadline", deadline)
+	callCtx := logger.ContextWithLogger(ctx, logger.NewWithHandler(slog.Default().Handler()).With(
+		"agent_id", job.AgentName, "job_id", job.GenerationJobID,
+		"stage", stage, "invocation_id", invocation.InvocationID,
+	))
+	result, callErr := call(callCtx)
+	slog.Info("K12 single practice model call finished", "agent_id", job.AgentName,
+		"job_id", job.GenerationJobID, "stage", stage, "invocation_id", invocation.InvocationID,
+		"provider", route.Provider, "model", route.Model,
+		"elapsed_ms", time.Since(callStartedAt).Milliseconds(), "solution_bytes", len(result.Solution),
+		"evidence", result.Evidence, "context_error", ctx.Err(), "error", callErr)
 	if callErr != nil {
 		if errors.Is(callErr, k12.ErrModelCapabilityUnverified) {
 			_, ledgerErr := d.Records.MarkPracticeGenerationInvocationFailed(
@@ -776,7 +805,14 @@ func (d Deps) runSinglePracticeModelInvocation(
 	if err != nil {
 		return zero, job, false, err
 	}
+	checkpointStartedAt := time.Now()
+	slog.Info("K12 single practice output checkpoint started", "agent_id", job.AgentName,
+		"job_id", job.GenerationJobID, "stage", stage, "invocation_id", invocation.InvocationID,
+		"output_bytes", len(raw))
 	job, err = save(string(raw))
+	slog.Info("K12 single practice output checkpoint finished", "agent_id", invocation.AgentName,
+		"job_id", invocation.JobID, "stage", stage, "invocation_id", invocation.InvocationID,
+		"elapsed_ms", time.Since(checkpointStartedAt).Milliseconds(), "error", err)
 	if err != nil {
 		_, ledgerErr := d.Records.MarkPracticeGenerationInvocationOutcomeUnknown(
 			context.WithoutCancel(ctx), job.AgentName,
@@ -875,7 +911,7 @@ func (d Deps) ProcessSinglePracticeGeneration(
 				[]byte(k12.PracticeGenerationStageGenerate), []byte(prompt),
 			),
 			job.GenerationOutput, job.OutputAttempt,
-			func() (SolveResult, error) {
+			func(ctx context.Context) (SolveResult, error) {
 				return d.PracticeVariant.GeneratePracticeVariant(
 					ctx, request.Subject, prompt, request.Grade,
 				)
@@ -930,7 +966,7 @@ func (d Deps) ProcessSinglePracticeGeneration(
 				[]byte(k12.PracticeGenerationStageValidate), validationRequest,
 			),
 			job.ValidationOutput, job.ValidationAttempt,
-			func() (SolveResult, error) {
+			func(ctx context.Context) (SolveResult, error) {
 				return d.solveProblem(ctx, request.Subject, question, request.Grade)
 			},
 			func(raw string) (k12.PracticeGenerationJob, error) {

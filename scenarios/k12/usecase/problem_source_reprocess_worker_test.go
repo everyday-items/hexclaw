@@ -1159,6 +1159,26 @@ func TestGradingOrchestratorProblemSourceReprocessCorrectTextAssessesOnlyAffecte
 	run, job := confirmItemResumeJobWithoutRun(t, o, jobID)
 	affected := run.questions[0]
 	unaffected := run.questions[1]
+	unresolved := k12.GradingItemInvocation{
+		InvocationID: "source-worker-unaffected-unknown", AgentName: job.Record.AgentName,
+		JobID: jobID, ProblemID: unaffected.ProblemID, AttemptID: unaffected.AttemptID,
+		Operation: k12.GradingItemOperationGrade, OperationAttempt: 99,
+		RequestDigest: "sha256:unaffected-old-input",
+		RouteSnapshot: k12.GradingModelSnapshot{Provider: "test", Model: "test-model", Route: "default"},
+	}
+	if _, _, err := o.deps.Records.PrepareGradingItemInvocation(context.Background(), unresolved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.deps.Records.MarkGradingItemInvocationSent(context.Background(), job.Record.AgentName, unresolved.InvocationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(context.Background(), job.Record.AgentName, unresolved.InvocationID, "provider", "timeout"); err != nil {
+		t.Fatal(err)
+	}
+	job, err := o.deps.saveGradingJob(context.Background(), job, k12.GradingStageFailedRetryable)
+	if err != nil {
+		t.Fatal(err)
+	}
 	const currentDigest = "sha256:source-worker-correct-v2"
 	advanceProblemInputRevisionForSourceWorker(
 		t, o, job, affected, 2, currentDigest, "corrected affected",
@@ -1229,6 +1249,40 @@ func TestGradingOrchestratorProblemSourceReprocessCorrectTextAssessesOnlyAffecte
 			"exact-set replay touched unrelated provider: solver=%d grader=%d",
 			solver.callCount("unaffected"), grader.callCount("unaffected"),
 		)
+	}
+	storedUnknown, err := o.deps.Records.GetGradingItemInvocation(context.Background(), job.Record.AgentName, unresolved.InvocationID)
+	if err != nil || storedUnknown.Status != k12.ModelInvocationOutcomeUnknown {
+		t.Fatalf("unrelated unknown changed: invocation=%+v err=%v", storedUnknown, err)
+	}
+	storedJob, err := o.deps.GetGradingJob(context.Background(), job.Record.AgentName, jobID)
+	if err != nil || storedJob.Record.Status != k12.GradingStageFailedRetryable {
+		t.Fatalf("source reprocess changed page stage: job=%+v err=%v", storedJob, err)
+	}
+
+	unresolved.InvocationID = "source-worker-affected-old-unknown"
+	unresolved.ProblemID = affected.ProblemID
+	unresolved.AttemptID = affected.AttemptID
+	unresolved.RequestDigest = "sha256:affected-old-input"
+	if _, _, err := o.deps.Records.PrepareGradingItemInvocation(context.Background(), unresolved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.deps.Records.MarkGradingItemInvocationSent(context.Background(), job.Record.AgentName, unresolved.InvocationID); err != nil {
+		t.Fatal(err)
+	}
+	blocked := o.ProcessProblemSourceReprocess(context.Background(), work)
+	var confirmation *ProblemSourceReprocessNeedsConfirmationError
+	if !errors.As(blocked, &confirmation) || !strings.Contains(confirmation.Detail, unresolved.InvocationID) || !strings.Contains(confirmation.Detail, "sent") {
+		t.Fatalf("affected sent invocation was not preserved: err=%v confirmation=%+v", blocked, confirmation)
+	}
+	if _, err := o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(context.Background(), job.Record.AgentName, unresolved.InvocationID, "provider", "timeout"); err != nil {
+		t.Fatal(err)
+	}
+	blocked = o.ProcessProblemSourceReprocess(context.Background(), work)
+	if !errors.As(blocked, &confirmation) || !strings.Contains(confirmation.Detail, unresolved.InvocationID) || !strings.Contains(confirmation.Detail, "outcome_unknown") {
+		t.Fatalf("affected historical unknown was not preserved: err=%v confirmation=%+v", blocked, confirmation)
+	}
+	if solver.callCount("corrected affected") != 1 || grader.callCount("corrected affected") != 1 || solver.callCount("unaffected") != 0 || grader.callCount("unaffected") != 0 {
+		t.Fatal("unresolved affected invocation allowed another provider call")
 	}
 }
 

@@ -335,11 +335,8 @@ func (d Deps) assessPhotoItem(
 		SourceSession: req.SourceSession, Problem: q.Question, StudentAnswer: q.StudentAnswer,
 		KnowledgePoints: photoGradeKnowledgePoints(q),
 	}
-	if mode == PhotoModeGrade {
+	if mode == PhotoModeGrade && q.AnswerState != AnswerStateBlank {
 		switch q.AnswerState {
-		case AnswerStateBlank:
-			item.Status = PhotoUnanswered
-			return item, nil
 		case AnswerStateUnclear:
 			item.Status = PhotoAnswerUnclear
 			item.Warning = "检测到学生笔迹，但未能可靠读出；请家长补录后再批改"
@@ -662,7 +659,7 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		return strings.TrimSpace(b.String())
 	}
 
-	correct, processIssue, wrong, unanswered, unclear, pending := 0, 0, 0, 0, 0, 0
+	correct, processIssue, wrong, unanswered, solved, unclear, pending := 0, 0, 0, 0, 0, 0, 0
 	for _, item := range result.Items {
 		switch item.Status {
 		case PhotoCorrect:
@@ -673,6 +670,8 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 			wrong++
 		case PhotoUnanswered:
 			unanswered++
+		case PhotoBlankSolved:
+			solved++
 		case PhotoAnswerUnclear:
 			unclear++
 		default:
@@ -687,6 +686,9 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 	fmt.Fprintf(&b, "，**%d** 道需要订正", wrong)
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "，未作答 **%d** 题", unanswered)
+	}
+	if solved > 0 {
+		fmt.Fprintf(&b, "，已解答 **%d** 题", solved)
 	}
 	if unclear > 0 {
 		fmt.Fprintf(&b, "，作答待补录 **%d** 题", unclear)
@@ -770,6 +772,24 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 		}
 		b.WriteString("\n\n")
 	}
+	if solved > 0 {
+		fmt.Fprintf(&b, "### 已解答（%d）\n\n", solved)
+		for _, item := range result.Items {
+			if item.Status != PhotoBlankSolved {
+				continue
+			}
+			fmt.Fprintf(&b, "#### %s\n\n", photoQuestionHeading(item.Recognized, 240))
+			if item.ParentGuide != nil {
+				writeParentTeachingGuideMarkdown(&b, *item.ParentGuide)
+			} else {
+				b.WriteString(photoClip(item.Solve.Solution, 1200))
+			}
+			if item.Warning != "" {
+				fmt.Fprintf(&b, "\n\n> ⚠️ %s", item.Warning)
+			}
+			b.WriteString("\n\n")
+		}
+	}
 	if unanswered > 0 {
 		fmt.Fprintf(&b, "### ⏸ 未作答（%d）\n\n", unanswered)
 		for _, item := range result.Items {
@@ -777,7 +797,7 @@ func photoGradeMarkdown(result PhotoGradeResult) string {
 				fmt.Fprintf(&b, "- %s\n", photoQuestionHeading(item.Recognized, 240))
 			}
 		}
-		b.WriteString("\n> 本次已答卷批改不会直接泄露未作答题的答案。\n\n")
+		b.WriteString("\n")
 	}
 	if pending > 0 {
 		fmt.Fprintf(&b, "### ⚠️ 待核对（%d）\n\n", pending)

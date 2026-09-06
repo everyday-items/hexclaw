@@ -778,6 +778,21 @@ func (o *GradingOrchestrator) confirmRegisteredGradingJob(
 ) (GradingJobView, bool, error) {
 	l := o.jobLock(jobID)
 	l.Lock()
+	if run.clearAssessmentDone != nil {
+		if (strings.TrimSpace(in.Grade) != "" && strings.TrimSpace(in.Grade) != strings.TrimSpace(run.req.Grade)) ||
+			(strings.TrimSpace(in.Subject) != "" && strings.TrimSpace(in.Subject) != strings.TrimSpace(run.req.Subject)) {
+			l.Unlock()
+			return GradingJobView{}, true, errGradingStageConflict("grading context is frozen while clear items are running")
+		}
+		for _, correction := range in.Corrections {
+			index := gradingCorrectionIndex(run.questions, correction)
+			if index >= 0 && index < len(run.questions) &&
+				(run.questions[index].ConfirmedVersion != 0 || run.clearAssessmentQuestions[run.questions[index].ProblemID]) {
+				l.Unlock()
+				return GradingJobView{}, true, errGradingStageConflict("only pending items outside the frozen execution set can be confirmed")
+			}
+		}
+	}
 	// 先在副本上完成修正与风险校验。拒绝的命令不得污染内存或 run.json 中的冻结事实。
 	candidate := *run
 	candidate.req = run.req
@@ -1375,6 +1390,7 @@ func applyGradingCorrections(run *gradingRun, in ConfirmPhotoGradingInput) (map[
 				continue
 			}
 			q := &list[index]
+			rawQuestion, rawAnswer := q.RawTranscription, q.AnswerRawTranscription
 			canonicalChanged := false
 			canonicalQuestion := firstNonEmpty(c.CanonicalMarkdown, c.Question)
 			if strings.TrimSpace(canonicalQuestion) != "" && canonicalQuestion != q.CanonicalMarkdown {
@@ -1400,6 +1416,7 @@ func applyGradingCorrections(run *gradingRun, in ConfirmPhotoGradingInput) (map[
 				q.CanonicalVersion++
 			}
 			*q = NormalizeRecognizedQuestion(*q)
+			q.RawTranscription, q.AnswerRawTranscription = rawQuestion, rawAnswer
 			if c.Confirmed {
 				confirmed[q.ProblemID] = true
 			}
@@ -1473,7 +1490,9 @@ func applyProgressiveGradingConfirmation(run *gradingRun, in ConfirmPhotoGrading
 			!confirmed[q.ProblemID] {
 			awaitingSource = true
 		}
-		q.ConfirmedVersion++
+		if q.ConfirmedVersion == 0 || confirmed[q.ProblemID] {
+			q.ConfirmedVersion++
+		}
 		run.questions[i] = q
 	}
 	run.questions = FreezeRecognizedQuestionInputDigests(run.questions, run.req.Grade)

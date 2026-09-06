@@ -62,11 +62,9 @@ func (o *GradingOrchestrator) prepareProblemSourceRecognitionParent(
 	policy := k12.NormalizeModelRequestPolicySnapshot(
 		route.RecognizingRequestPolicy,
 	)
-	if recognitionPlanVersion == k12.RecognitionPlanVersionV2 &&
-		policy.IsZero() {
+	if err := k12.ValidateModelInvocationRequestPolicy(k12.GradingStageRecognizing, route, policy); err != nil {
 		return k12.ModelInvocation{}, fmt.Errorf(
-			"%w: source recognition plan v2 requires the frozen recognizing request policy",
-			ErrModelRequestPolicyInvalid,
+			"%w: %v", ErrModelRequestPolicyInvalid, err,
 		)
 	}
 	requestDigest, err := problemSourceRecognitionParentDigest(

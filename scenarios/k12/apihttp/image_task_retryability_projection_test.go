@@ -118,11 +118,11 @@ func TestPublicImageTaskProjectsCreativeFeedbackInvocationRetryability(t *testin
 		},
 		CreativeFeedback: "feedback_failed",
 	}
-	setCreativeFeedbackRetryabilityForProjectionTest(t, &view, true)
+	setCreativeFeedbackRetryabilityForProjectionTest(t, &view, false)
 
 	wire := publicImageTask(view)
-	if !wire.Retryable {
-		t.Fatal("public retryable=false, want work-feedback invocation retry_safe=true")
+	if wire.Retryable {
+		t.Fatal("public retryable=true, want failed work-feedback with retry_safe=false")
 	}
 	if wire.Progress.State != "feedback_failed" {
 		t.Fatalf("public progress state=%q, want feedback_failed", wire.Progress.State)
