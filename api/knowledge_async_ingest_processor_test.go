@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,8 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/ai-core/transport"
 	"github.com/hexagon-codes/hexagon/rag/splitter"
 	"github.com/hexagon-codes/hexclaw/knowledge"
+	"github.com/hexagon-codes/toolkit/util/logger"
 	_ "modernc.org/sqlite"
 )
 
@@ -26,23 +31,93 @@ func TestKnowledgeAsyncProcessorScannedPDFDoesNotPublishPartialOCR(t *testing.T)
 	requirePopplerForAsyncPDFTest(t)
 	t.Setenv("HEXCLAW_DOC_VLM_MAX_PAGES", "250")
 	t.Setenv("HEXCLAW_DOC_VLM_RENDER_DPI", "72")
+	t.Setenv("HEXCLAW_DOC_VLM_PAGE_TIMEOUT_SECONDS", "180")
 
+	_ = logger.Default()
+	var output bytes.Buffer
+	previousDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousDefault) })
+	var pageDeadlines []time.Time
 	calls := 0
-	manager := newAsyncProcessorTestManager(t, knowledge.CaptionerFunc(func(_ context.Context, _ []byte, _ string) (string, error) {
+	manager := newAsyncProcessorTestManager(t, knowledge.CaptionerWithReceiptFunc(func(ctx context.Context, _ []byte, _ string) (knowledge.CaptionResult, error) {
 		calls++
-		if calls == 2 {
-			return "", errors.New("injected page OCR failure")
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("OCR page context has no deadline")
 		}
-		return fmt.Sprintf("第 %d 页扫描正文", calls), nil
+		pageDeadlines = append(pageDeadlines, deadline)
+		if calls == 2 {
+			return knowledge.CaptionResult{}, &llm.ProviderError{
+				StatusCode: 408, Status: "408 Request Timeout", Cause: io.ErrUnexpectedEOF,
+			}
+		}
+		return testOCRCaptionResult(fmt.Sprintf("第 %d 页扫描正文", calls)), nil
 	}))
 	source := writeAsyncProcessorPDF(t, buildImageOnlyTestPDF(t, 5))
-
-	_, err := NewKnowledgeDocumentIngestProcessor(manager).Prepare(context.Background(), source)
-	if err == nil {
-		t.Fatal("一页 OCR 失败时不得用其余页面冒充完整索引")
+	pdfBytes, err := os.ReadFile(source.StoragePath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "failed_pages=[2]") {
-		t.Fatalf("失败结果必须明确记录缺页，err=%v", err)
+	digest := sha256.Sum256(pdfBytes)
+	source.JobID, source.DocumentID, source.OwnerID = "job-1", "doc-1", "owner"
+	source.SizeBytes, source.SHA256 = int64(len(pdfBytes)), hex.EncodeToString(digest[:])
+	parentCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	ctx := knowledge.WithVisionRouteSnapshot(parentCtx, knowledge.VisionRouteSnapshot{
+		ProviderInstanceID: "hexclaw-gpt", ProviderName: "hexclaw-gpt",
+		ProviderDisplayName: "HexClaw-GPT", Model: "gpt-5.6-sol", Capabilities: []string{"vision"},
+	})
+	progress := &durableOCRProgressProbe{memoryIngestPageProgress: &memoryIngestPageProgress{}}
+	processor := NewKnowledgeDocumentIngestProcessor(manager).(knowledge.ResumableDocumentIngestProcessor)
+	_, err = processor.PrepareResumable(ctx, source, progress)
+	if !errors.Is(err, knowledge.ErrOCRPageInvocationOutcomeUnknown) ||
+		!errors.Is(err, io.ErrUnexpectedEOF) || !strings.Contains(err.Error(), "ocr-integration-2") ||
+		!strings.Contains(err.Error(), "unexpected EOF") {
+		t.Fatalf("OCR failure must preserve invocation and original cause: err=%v", err)
+	}
+	if len(progress.pages) != 1 || calls != 2 {
+		t.Fatalf("partial OCR must stop without publishing: checkpoints=%d calls=%d", len(progress.pages), calls)
+	}
+	started, finished := 0, 0
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry["msg"] != "[knowledge] OCR page provider started" &&
+			entry["msg"] != "[knowledge] OCR page provider finished" {
+			continue
+		}
+		if entry["document_id"] != source.DocumentID || entry["job_id"] != source.JobID ||
+			entry["invocation_id"] == nil || entry["invocation_id"] == "" ||
+			entry["provider"] != "hexclaw-gpt" || entry["model"] != "gpt-5.6-sol" {
+			t.Fatalf("OCR collector correlation missing: %v", entry)
+		}
+		page := int(entry["page"].(float64))
+		if entry["msg"] == "[knowledge] OCR page provider started" {
+			started++
+			remaining, ok := entry["remaining_ms"].(float64)
+			if entry["deadline_unix_ms"] != float64(pageDeadlines[page-1].UnixMilli()) ||
+				!ok || remaining <= 0 || remaining > 60_000 || entry["timeout_ms"] != float64(180_000) {
+				t.Fatalf("OCR deadline must reflect shorter parent budget: %v", entry)
+			}
+		} else {
+			finished++
+			if _, ok := entry["elapsed_ms"].(float64); !ok {
+				t.Fatalf("OCR completion duration missing: %v", entry)
+			}
+			if page == 2 && (!strings.Contains(fmt.Sprint(entry["error"]), "unexpected EOF") ||
+				entry["accepted_evidence"] != "request_outcome_unknown") {
+				t.Fatalf("OCR failure cause missing: %v", entry)
+			}
+		}
+	}
+	if started != 2 || finished != 2 {
+		t.Fatalf("OCR nodes did not reach current slog handler: started=%d finished=%d", started, finished)
 	}
 }
 
@@ -266,14 +341,18 @@ func TestKnowledgeAsyncProcessorResumeSkipsCompletedVLMPageCheckpoints(t *testin
 	calls := 0
 	failThirdOnce := true
 	manager := newAsyncProcessorTestManager(t, knowledge.CaptionerWithReceiptFunc(func(
-		_ context.Context,
+		ctx context.Context,
 		_ []byte,
 		_ string,
 	) (knowledge.CaptionResult, error) {
 		calls++
+		if calls == 1 && (transport.OperationSafetyFromContext(ctx) != transport.OperationSafetyNonIdempotent ||
+			!transport.HasBeforeSendHook(ctx)) {
+			t.Error("durable OCR request lacks its before-send boundary or permits hidden transport replay")
+		}
 		if failThirdOnce && calls == 3 {
 			failThirdOnce = false
-			return knowledge.CaptionResult{}, errors.New("injected transient VLM failure")
+			return knowledge.CaptionResult{}, &llm.ProviderError{StatusCode: 429, Status: "429 Too Many Requests"}
 		}
 		return testOCRCaptionResult(fmt.Sprintf("第 %d 次 VLM 调用的正文", calls)), nil
 	}))
@@ -282,21 +361,39 @@ func TestKnowledgeAsyncProcessorResumeSkipsCompletedVLMPageCheckpoints(t *testin
 	if !ok {
 		t.Fatal("knowledge processor does not implement resumable protocol")
 	}
-	progress := &memoryIngestPageProgress{}
+	progress := &durableOCRProgressProbe{memoryIngestPageProgress: &memoryIngestPageProgress{}}
+	pdfBytes, err := os.ReadFile(source.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(pdfBytes)
+	source.JobID, source.DocumentID, source.OwnerID = "job-1", "doc-1", "owner"
+	source.SizeBytes, source.SHA256 = int64(len(pdfBytes)), hex.EncodeToString(digest[:])
+	ctx := knowledge.WithVisionRouteSnapshot(context.Background(), knowledge.VisionRouteSnapshot{
+		ProviderInstanceID: "hexclaw-gpt", ProviderName: "hexclaw-gpt",
+		ProviderDisplayName: "HexClaw-GPT", Model: "gpt-5.6-sol", Capabilities: []string{"vision"},
+	})
 
-	if _, err := processor.PrepareResumable(context.Background(), source, progress); err == nil ||
+	if _, err := processor.PrepareResumable(ctx, source, progress); err == nil ||
 		!strings.Contains(err.Error(), "failed_pages=[3]") {
 		t.Fatalf("first interrupted OCR err=%v", err)
 	}
 	if len(progress.pages) != 4 {
 		t.Fatalf("durable completed pages=%v", progress.pages)
 	}
-	prepared, err := processor.PrepareResumable(context.Background(), source, progress)
+	if progress.invocations[3].Status != knowledge.OCRPageInvocationStatusFailed {
+		t.Fatalf("explicit rejection became unknown: %+v", progress.invocations[3])
+	}
+	failedID := progress.invocations[3].InvocationID
+	prepared, err := processor.PrepareResumable(ctx, source, progress)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if calls != 6 {
 		t.Fatalf("VLM calls=%d, want 5 initial attempts + only failed page retry", calls)
+	}
+	if progress.invocations[3].InvocationID != failedID || progress.invocations[3].Status != knowledge.OCRPageInvocationStatusSucceeded {
+		t.Fatalf("retry replaced the failed invocation: %+v", progress.invocations[3])
 	}
 	if prepared.PageCount != 5 || len(progress.pages) != 5 {
 		t.Fatalf("resumed page_count=%d checkpoints=%d", prepared.PageCount, len(progress.pages))

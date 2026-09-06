@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 
@@ -13,28 +14,54 @@ import (
 
 type durableOCRProgressProbe struct {
 	*memoryIngestPageProgress
-	invocation *knowledge.OCRPageInvocation
-	result     knowledge.OCRPageInvocationResult
-	failCommit bool
+	invocation  *knowledge.OCRPageInvocation
+	invocations map[int]*knowledge.OCRPageInvocation
+	result      knowledge.OCRPageInvocationResult
+	failCommit  bool
 }
 
 func (p *durableOCRProgressProbe) ClaimOCRPageInvocationContext(
 	_ context.Context, claim knowledge.OCRPageInvocationClaim,
 ) (knowledge.OCRPageInvocation, error) {
-	if p.invocation != nil {
+	if p.invocations == nil {
+		p.invocations = make(map[int]*knowledge.OCRPageInvocation)
+	}
+	if existing := p.invocations[claim.PageNumber]; existing != nil {
+		p.invocation = existing
+		if existing.Status == knowledge.OCRPageInvocationStatusFailed {
+			existing.Status = knowledge.OCRPageInvocationStatusRunning
+			resumed := *existing
+			resumed.Fresh = true
+			return resumed, nil
+		}
 		stored := *p.invocation
 		stored.Fresh = false
 		return stored, nil
 	}
 	invocation := knowledge.OCRPageInvocation{
-		InvocationID: "ocr-integration-1", JobID: "job-1", PageNumber: claim.PageNumber,
+		InvocationID: fmt.Sprintf("ocr-integration-%d", claim.PageNumber), JobID: "job-1", PageNumber: claim.PageNumber,
 		PagesTotal: claim.PagesTotal, SourceDigest: claim.SourceDigest,
 		RequestDigest: claim.RequestDigest, Provider: claim.Provider, Model: claim.Model,
 		Operation: knowledge.OCRRouteOperationPDFPage,
 		Status:    knowledge.OCRPageInvocationStatusRunning, Fresh: true,
 	}
 	p.invocation = &invocation
+	p.invocations[claim.PageNumber] = p.invocation
 	return invocation, nil
+}
+
+func (p *durableOCRProgressProbe) MarkOCRPageInvocationOutcomeUnknownContext(
+	_ context.Context, invocation knowledge.OCRPageInvocation, _ string,
+) error {
+	p.invocations[invocation.PageNumber].Status = knowledge.OCRPageInvocationStatusOutcomeUnknown
+	return nil
+}
+
+func (p *durableOCRProgressProbe) MarkOCRPageInvocationFailedContext(
+	_ context.Context, invocation knowledge.OCRPageInvocation, _ string,
+) error {
+	p.invocations[invocation.PageNumber].Status = knowledge.OCRPageInvocationStatusFailed
+	return nil
 }
 
 func (p *durableOCRProgressProbe) SaveOCRPageInvocationContext(

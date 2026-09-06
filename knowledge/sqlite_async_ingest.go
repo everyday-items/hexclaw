@@ -458,6 +458,18 @@ func queueFailedTextRetryTx(
 	if err != nil {
 		return err
 	}
+	// replacement Job 不能绕过同一源代次已经发出的未知 OCR 调用。
+	var unresolvedOCR int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM kb_ingest_page_invocations i
+		JOIN kb_knowledge_jobs j ON j.job_id=i.job_id
+		WHERE j.owner_id=? AND j.corpus_uid=? AND j.document_id=? AND j.document_generation=?
+		  AND j.kind='ingest' AND i.source_digest=? AND i.status IN ('running','outcome_unknown')`,
+		ownerID, corpusUID, documentID, generation, digest).Scan(&unresolvedOCR); err != nil {
+		return err
+	}
+	if unresolvedOCR > 0 {
+		return ErrDocumentRetryNotAllowed
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE kb_documents
 		SET status='processing',error_message='',updated_at=?
 		WHERE id=? AND corpus_uid=? AND deleted=0 AND status='failed'`,

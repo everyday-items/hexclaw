@@ -1506,6 +1506,16 @@ func (r *SQLiteSemanticIndexRepository) ClaimNextJobForCorpus(
 	if err != nil {
 		return KnowledgeJob{}, false, err
 	}
+	// 旧租约的调用已开始但没有完成事实，恢复只能停在对账状态。
+	if _, err := tx.ExecContext(ctx, `UPDATE kb_embedding_batch_manifests
+		SET state='outcome_unknown',next_attempt_at=NULL,
+		 last_error=CASE WHEN last_error='' THEN
+		  'embedding batch ' || batch_id || ' outcome unknown after lease ' || lease_epoch || ' expired'
+		  ELSE last_error END,updated_at=?
+		WHERE job_id=? AND state='in_flight' AND lease_epoch<?`,
+		nowMillis, job.JobID, job.LeaseEpoch); err != nil {
+		return KnowledgeJob{}, false, err
+	}
 	if job.TargetRevisionID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE kb_index_revisions SET lease_epoch=?
 			WHERE revision_id=? AND corpus_uid=? AND publish_state='staged'`,
@@ -2214,15 +2224,15 @@ func (r *SQLiteSemanticIndexRepository) CreateEmbeddingBatchManifest(
 	// deterministic batch identity must resume that manifest under the newly
 	// claimed lease instead of colliding with its client_request_key.
 	var existing EmbeddingBatchManifest
-	var existingState string
+	var existingState, existingError string
 	err = tx.QueryRowContext(ctx, `SELECT batch_id,job_id,revision_id,profile_config_hash,
-		chunk_ids_digest,payload_digest,client_request_key,state,attempts,provider_request_id,lease_epoch
+		chunk_ids_digest,payload_digest,client_request_key,state,attempts,provider_request_id,lease_epoch,last_error
 		FROM kb_embedding_batch_manifests
 		WHERE job_id=? AND revision_id=? AND chunk_ids_digest=? AND payload_digest=?`,
 		job.JobID, plan.RevisionID, manifest.ChunkIDsDigest, manifest.PayloadDigest).Scan(
 		&existing.BatchID, &existing.JobID, &existing.RevisionID, &existing.ProfileConfigHash,
 		&existing.ChunkIDsDigest, &existing.PayloadDigest, &existing.ClientRequestKey,
-		&existingState, &existing.Attempts, &existing.ProviderRequestID, &existing.LeaseEpoch,
+		&existingState, &existing.Attempts, &existing.ProviderRequestID, &existing.LeaseEpoch, &existingError,
 	)
 	if err == nil {
 		if existing.ClientRequestKey != manifest.ClientRequestKey ||
@@ -2236,6 +2246,10 @@ func (r *SQLiteSemanticIndexRepository) CreateEmbeddingBatchManifest(
 				return EmbeddingBatchManifest{}, err
 			}
 			return existing, nil
+		}
+		if existing.State == EmbeddingBatchOutcomeUnknown {
+			return EmbeddingBatchManifest{}, fmt.Errorf("%w: batch %s: %s",
+				ErrEmbeddingBatchOutcomeUnknown, existing.BatchID, existingError)
 		}
 		if existing.State != EmbeddingBatchPrepared && existing.State != EmbeddingBatchRetryWait {
 			return EmbeddingBatchManifest{}, fmt.Errorf("knowledge: embedding batch %s is not resumable", existing.BatchID)

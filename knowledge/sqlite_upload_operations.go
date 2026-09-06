@@ -114,6 +114,29 @@ func (r *SQLiteSemanticIndexRepository) beginUploadOperationOnce(
 	if storedFingerprint != "" && storedFingerprint != fingerprint {
 		return UploadOperationProjection{}, false, ErrIdempotencyConflict
 	}
+	// 尚未绑定文档或任务的确定上传失败可由同一请求身份重新接收；
+	// 只有条件更新成功的请求取得读取资格，正在接收及已绑定任务保持原重放语义。
+	if rows == 0 && storedFingerprint == fingerprint &&
+		projection.State == UploadOperationFailed && projection.Error == "upload_failed" &&
+		projection.DocumentID == "" && projection.JobID == "" {
+		result, err = tx.ExecContext(ctx, `UPDATE kb_upload_operations
+			SET state='receiving',last_error='',updated_at=?
+			WHERE operation_id=? AND owner_id=? AND corpus_uid=? AND idempotency_key=?
+			  AND request_fingerprint=? AND state='failed' AND last_error='upload_failed'
+			  AND document_id IS NULL AND job_id IS NULL`,
+			now, projection.OperationID, ownerID, state.corpusUID, idempotencyKey, fingerprint)
+		if err != nil {
+			return UploadOperationProjection{}, false, fmt.Errorf("knowledge: resume unbound upload operation: %w", err)
+		}
+		rows, err = result.RowsAffected()
+		if err != nil {
+			return UploadOperationProjection{}, false, err
+		}
+		projection, _, err = loadUploadOperationByKeyTx(ctx, tx, ownerID, state.corpusUID, idempotencyKey)
+		if err != nil {
+			return UploadOperationProjection{}, false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return UploadOperationProjection{}, false, err
 	}

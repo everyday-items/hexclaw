@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,8 +20,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hexagon-codes/ai-core/llm"
+	"github.com/hexagon-codes/ai-core/transport"
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 type documentExtractionResult struct {
@@ -346,8 +350,17 @@ func extractPDFForAsyncIngestWithProgress(
 	sourceDigest string,
 	progress knowledge.IngestPageProgress,
 	governors ...*resourcegov.Governor,
-) (documentExtractionResult, error) {
-	var result documentExtractionResult
+) (result documentExtractionResult, extractionErr error) {
+	startedAt := time.Now()
+	extractionLog := logger.FromContext(ctx)
+	extractionLog.Info("[knowledge] PDF extraction started", "source_digest", sourceDigest,
+		"max_pages", limits.MaxPages, "page_timeout_ms", limits.PageTimeout.Milliseconds(),
+		"total_timeout_ms", limits.TotalTimeout.Milliseconds())
+	defer func() {
+		extractionLog.Info("[knowledge] PDF extraction finished", "source_digest", sourceDigest,
+			"elapsed_ms", time.Since(startedAt).Milliseconds(), "pages_total", result.PageCount,
+			"text_bytes", len(result.Text), "warnings", result.Warnings, "error", extractionErr)
+	}()
 	if err := validateAsyncPDFLimits(limits); err != nil {
 		return result, err
 	}
@@ -358,6 +371,9 @@ func extractPDFForAsyncIngestWithProgress(
 	if err != nil {
 		return result, err
 	}
+	extractionLog.Info("[knowledge] PDF inspection completed", "source_digest", sourceDigest,
+		"elapsed_ms", time.Since(startedAt).Milliseconds(), "pages_total", info.PageCount,
+		"encrypted", info.Encrypted)
 	result.PageCount = info.PageCount
 	if info.Encrypted {
 		return result, fmt.Errorf("%w: encrypted PDF is not supported", knowledge.ErrInvalidDocumentUpload)
@@ -403,12 +419,18 @@ func extractPDFForAsyncIngestWithProgress(
 		pages   []string
 		warning string
 	}
+	textStartedAt := time.Now()
+	extractionLog.Info("[knowledge] PDF text extraction started", "source_digest", sourceDigest,
+		"pages_total", info.PageCount, "completed_pages", len(completed), "max_text_bytes", limits.MaxTextBytes)
 	textLayer, err := runGovernedCPU(ctx, governor, func() (textLayerResult, error) {
 		pages, warning, extractErr := extractPDFTextPagesFromPath(
 			ctx, path, info.PageCount, limits.MaxTextBytes,
 		)
 		return textLayerResult{pages: pages, warning: warning}, extractErr
 	})
+	extractionLog.Info("[knowledge] PDF text extraction finished", "source_digest", sourceDigest,
+		"elapsed_ms", time.Since(textStartedAt).Milliseconds(), "pages", len(textLayer.pages),
+		"warning", textLayer.warning, "error", err)
 	if err != nil {
 		return result, err
 	}
@@ -460,6 +482,12 @@ func extractPDFForAsyncIngestWithProgress(
 			return result, err
 		}
 	}
+	routeSnapshot, hasRouteSnapshot := knowledge.VisionRouteSnapshotFromContext(ctx)
+	extractionLog.Info("[knowledge] PDF extraction plan ready", "source_digest", sourceDigest,
+		"pages_total", info.PageCount, "completed_pages", len(completed), "visual_pages", visualPages,
+		"segments", len(segments), "has_route_snapshot", hasRouteSnapshot,
+		"provider", routeSnapshot.ProviderName, "model", routeSnapshot.Model,
+		"capabilities", routeSnapshot.Capabilities, "has_captioner", kb != nil && kb.HasCaptioner())
 	if snapshot, ok := knowledge.VisionRouteSnapshotFromContext(ctx); ok &&
 		len(visualPages) > 0 && !snapshot.HasCapability("vision") {
 		return result, knowledge.NewVisionModelRequiredError(snapshot, visualPages)
@@ -496,6 +524,9 @@ func extractPDFForAsyncIngestWithProgress(
 			end++
 		}
 		firstPage, lastPage := visualPages[start], visualPages[end-1]
+		renderStartedAt := time.Now()
+		extractionLog.Info("[knowledge] PDF render started", "source_digest", sourceDigest,
+			"page_from", firstPage, "page_to", lastPage, "dpi", limits.DPI)
 		renderBudget := time.Duration(lastPage-firstPage+1) * limits.PageTimeout
 		renderCtx, cancelRender := context.WithTimeout(totalCtx, renderBudget)
 		rendered, renderErr := runGovernedCPU(renderCtx, governor, func() ([]renderedPDFPage, error) {
@@ -504,6 +535,9 @@ func extractPDFForAsyncIngestWithProgress(
 			)
 		})
 		cancelRender()
+		extractionLog.Info("[knowledge] PDF render finished", "source_digest", sourceDigest,
+			"page_from", firstPage, "page_to", lastPage,
+			"elapsed_ms", time.Since(renderStartedAt).Milliseconds(), "error", renderErr)
 		if renderErr != nil {
 			if ctx.Err() != nil {
 				return result, ctx.Err()
@@ -569,6 +603,11 @@ func extractPDFForAsyncIngestWithProgress(
 						RequestDigest: requestDigest, Provider: route.ProviderName, Model: route.Model,
 					},
 				)
+				extractionLog.Info("[knowledge] OCR page invocation claimed", "source_digest", sourceDigest,
+					"job_id", invocation.JobID, "invocation_id", invocation.InvocationID,
+					"page", page, "pages_total", info.PageCount, "fresh", invocation.Fresh,
+					"status", invocation.Status, "provider", route.ProviderName, "model", route.Model,
+					"error", captionErr)
 				if errors.Is(captionErr, knowledge.ErrOCRPageInvocationLedgerUnavailable) {
 					invocationSupported = false
 					captionErr = nil
@@ -584,27 +623,107 @@ func extractPDFForAsyncIngestWithProgress(
 				}
 			}
 			if !invocationSupported || invocation.Fresh {
+				pageStartedAt := time.Now()
 				pageCtx, cancelPage := context.WithTimeout(totalCtx, limits.PageTimeout)
+				pageDeadline, _ := pageCtx.Deadline()
+				extractionLog.Info("[knowledge] OCR page provider started", "source_digest", sourceDigest,
+					"job_id", invocation.JobID, "invocation_id", invocation.InvocationID,
+					"page", page, "pages_total", info.PageCount, "image_bytes", len(renderedPage.Data),
+					"provider", routeSnapshot.ProviderName, "model", routeSnapshot.Model,
+					"timeout_ms", limits.PageTimeout.Milliseconds(),
+					"deadline_unix_ms", pageDeadline.UnixMilli(), "remaining_ms", time.Until(pageDeadline).Milliseconds())
+				providerBegan := false
+				pageCtx = transport.WithOperationSafety(pageCtx, transport.OperationSafetyNonIdempotent)
+				pageCtx = transport.WithBeforeSendHookForAction(pageCtx, "complete", func(context.Context) error {
+					providerBegan = true
+					extractionLog.Info("[knowledge] OCR page HTTP attempt started", "phase", "http_begin",
+						"job_id", invocation.JobID, "invocation_id", invocation.InvocationID,
+						"page", page, "provider", routeSnapshot.ProviderName, "model", routeSnapshot.Model,
+						"accepted_evidence", "http_attempt_started",
+						"deadline_unix_ms", pageDeadline.UnixMilli(), "remaining_ms", time.Until(pageDeadline).Milliseconds())
+					return nil
+				})
 				caption, captionErr = kb.CaptionImageWithRouteReceipt(
 					pageCtx, renderedPage.Data, "image/png",
 				)
+				outcomeUnknown := providerBegan
+				httpStatus, requestID, safeCause := 0, "", ""
+				acceptedEvidence := "completed"
+				var providerErr *llm.ProviderError
+				if captionErr != nil {
+					safeCause, _ = redactProviderErrorBody(captionErr.Error())
+					if errors.As(captionErr, &providerErr) && providerErr != nil {
+						httpStatus, requestID = providerErr.StatusCode, providerErr.RequestID
+						if providerErr.Cause != nil {
+							cause, _ := redactProviderErrorBody(providerErr.Cause.Error())
+							if !strings.Contains(safeCause, cause) {
+								safeCause += ": " + cause
+							}
+						}
+						// 错误链保留结构化状态和底层原因，不携带 Provider 正文或请求预览。
+						sanitized := *providerErr
+						sanitized.Body, sanitized.RequestPreview = "", ""
+						captionErr = fmt.Errorf("knowledge: OCR transcription failed: %w", &sanitized)
+					}
+					if httpStatus > 0 {
+						outcomeUnknown = true
+						switch httpStatus {
+						case 400, 401, 403, 404, 405, 413, 415, 422, 429:
+							outcomeUnknown = false
+						}
+					} else {
+						var dnsErr *net.DNSError
+						var opErr *net.OpError
+						if errors.As(captionErr, &dnsErr) || (errors.As(captionErr, &opErr) && opErr.Op == "dial") {
+							outcomeUnknown = false
+						} else if errors.Is(captionErr, io.EOF) || errors.Is(captionErr, io.ErrUnexpectedEOF) {
+							outcomeUnknown = true
+						}
+					}
+					acceptedEvidence = "request_not_sent"
+					if outcomeUnknown {
+						acceptedEvidence = "request_outcome_unknown"
+					} else if httpStatus > 0 {
+						acceptedEvidence = "http_rejected"
+					}
+				}
+				extractionLog.Info("[knowledge] OCR page provider finished", "source_digest", sourceDigest,
+					"job_id", invocation.JobID, "invocation_id", invocation.InvocationID,
+					"page", page, "pages_total", info.PageCount,
+					"elapsed_ms", time.Since(pageStartedAt).Milliseconds(), "text_bytes", len(caption.Content),
+					"provider", routeSnapshot.ProviderName, "model", routeSnapshot.Model,
+					"route_receipt", caption.RouteReceipt, "context_error", pageCtx.Err(), "error", safeCause,
+					"phase", "caption_result", "http_attempt_started", providerBegan,
+					"http_status", httpStatus, "provider_request_id", requestID, "accepted_evidence", acceptedEvidence,
+					"deadline_unix_ms", pageDeadline.UnixMilli(), "remaining_ms", time.Until(pageDeadline).Milliseconds())
 				cancelPage()
 				if captionErr != nil {
 					if invocationSupported && invocation.Fresh {
-						if marker, ok := progress.(knowledge.OCRPageInvocationContextOutcomeMarker); ok {
-							markErr := marker.MarkOCRPageInvocationOutcomeUnknownContext(
-								ctx, invocation, captionErr.Error(),
-							)
-							if markErr != nil && !errors.Is(markErr, knowledge.ErrOCRPageInvocationLedgerUnavailable) {
-								return result, markErr
-							}
+						marker, ok := progress.(knowledge.OCRPageInvocationContextOutcomeMarker)
+						if !ok {
+							return result, knowledge.ErrOCRPageInvocationLedgerUnavailable
 						}
-						return result, knowledge.ErrOCRPageInvocationOutcomeUnknown
+						// 请求取消后仍需提交短暂的本地结果状态，不再发出模型请求。
+						markCtx, cancelMark := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+						var markErr error
+						if outcomeUnknown {
+							markErr = marker.MarkOCRPageInvocationOutcomeUnknownContext(markCtx, invocation, safeCause)
+						} else {
+							markErr = marker.MarkOCRPageInvocationFailedContext(markCtx, invocation, safeCause)
+						}
+						cancelMark()
+						if markErr != nil {
+							return result, markErr
+						}
+						if outcomeUnknown {
+							return result, fmt.Errorf("%w: page %d invocation %s: %s (%w)",
+								knowledge.ErrOCRPageInvocationOutcomeUnknown, page, invocation.InvocationID, safeCause, captionErr)
+						}
 					}
 					if ctx.Err() != nil {
 						return result, ctx.Err()
 					}
-					failed[page] = "OCR/VLM failed: " + captionErr.Error()
+					failed[page] = "OCR/VLM failed: " + safeCause
 					continue
 				}
 			}

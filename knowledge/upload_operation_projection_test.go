@@ -43,6 +43,19 @@ func (r *gatedUploadReader) Read(p []byte) (int, error) {
 
 func TestKnowledgeUploadOperationProjectionHasStableIntentAndExactDurableStates(t *testing.T) {
 	db, service, ctx := newAsyncIngestHarness(t)
+	_, failedErr := service.CreateDocument(ctx, "desktop-user", "default", CreateDocumentInput{
+		IdempotencyKey: "upload-intent-stable-v1", Filename: "六上数学.txt",
+		MediaType: "text/plain", SizeBytes: int64(len("durable knowledge bytes")),
+		Body: strings.NewReader(""), AgentID: "mingming", LearnerID: "learner-1",
+	})
+	if !errors.Is(failedErr, ErrInvalidDocumentUpload) {
+		t.Fatalf("empty upload error=%v, want invalid upload", failedErr)
+	}
+	failed, err := service.ListUploadOperationsForCorpus(ctx, "desktop-user", "default")
+	if err != nil || len(failed) != 1 || failed[0].State != UploadOperationFailed ||
+		failed[0].Error != "upload_failed" || failed[0].DocumentID != "" || failed[0].JobID != "" {
+		t.Fatalf("unbound failed upload=%+v err=%v", failed, err)
+	}
 	reader := &gatedUploadReader{
 		started: make(chan struct{}), release: make(chan struct{}),
 		reader: strings.NewReader("durable knowledge bytes"),
@@ -60,7 +73,13 @@ func TestKnowledgeUploadOperationProjectionHasStableIntentAndExactDurableStates(
 		})
 		resultCh <- result{accepted: accepted, err: err}
 	}()
-	<-reader.started
+	select {
+	case <-reader.started:
+	case stopped := <-resultCh:
+		t.Fatalf("same-key failed upload did not resume receiving: %v", stopped.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("same-key failed upload did not start reading")
+	}
 
 	assertOne := func(want UploadOperationState) UploadOperationProjection {
 		t.Helper()
@@ -81,6 +100,10 @@ func TestKnowledgeUploadOperationProjectionHasStableIntentAndExactDurableStates(
 	}
 
 	receiving := assertOne(UploadOperationReceiving)
+	if receiving.OperationID != failed[0].OperationID || receiving.Error != "" ||
+		receiving.CreatedAt != failed[0].CreatedAt {
+		t.Fatalf("failed upload recovery changed stable intent: before=%+v after=%+v", failed[0], receiving)
+	}
 	if receiving.OperationID == "" || receiving.DisplayName != "六上数学.txt" ||
 		receiving.DocumentID != "" || receiving.JobID != "" ||
 		receiving.ContentDigest != "" || receiving.Stage != "receiving" || receiving.Terminal {
@@ -213,6 +236,17 @@ func TestKnowledgeUploadOperationProjectionHasStableIntentAndExactDurableStates(
 func TestConcurrentUploadReplayCannotTerminateCreatorIntent(t *testing.T) {
 	_, service, ctx := newAsyncIngestHarness(t)
 	body := "creator request owns these bytes"
+	_, failedErr := service.CreateDocument(ctx, "desktop-user", "default", CreateDocumentInput{
+		IdempotencyKey: "concurrent-upload-owner-v1", Filename: "owner.txt",
+		MediaType: "text/plain", SizeBytes: int64(len(body)), Body: strings.NewReader(""),
+	})
+	if !errors.Is(failedErr, ErrInvalidDocumentUpload) {
+		t.Fatalf("empty upload error=%v, want invalid upload", failedErr)
+	}
+	failed, err := service.ListUploadOperationsForCorpus(ctx, "desktop-user", "default")
+	if err != nil || len(failed) != 1 || failed[0].State != UploadOperationFailed {
+		t.Fatalf("unbound failed upload=%+v err=%v", failed, err)
+	}
 	creatorReader := &gatedUploadReader{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
@@ -233,7 +267,13 @@ func TestConcurrentUploadReplayCannotTerminateCreatorIntent(t *testing.T) {
 		})
 		creatorResult <- createResult{accepted: accepted, err: err}
 	}()
-	<-creatorReader.started
+	select {
+	case <-creatorReader.started:
+	case stopped := <-creatorResult:
+		t.Fatalf("same-key failed upload did not resume receiving: %v", stopped.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("same-key failed upload did not start reading")
+	}
 
 	replayReader := &failingUploadReader{err: context.Canceled}
 	_, replayErr := service.CreateDocument(ctx, "desktop-user", "default", CreateDocumentInput{
@@ -252,7 +292,7 @@ func TestConcurrentUploadReplayCannotTerminateCreatorIntent(t *testing.T) {
 
 	close(creatorReader.release)
 	created := <-creatorResult
-	if created.err != nil || created.accepted.OperationID == "" ||
+	if created.err != nil || created.accepted.OperationID != failed[0].OperationID ||
 		created.accepted.DocumentID == "" || created.accepted.JobID == "" {
 		t.Fatalf("healthy intent creator was fenced by replay: accepted=%+v err=%v", created.accepted, created.err)
 	}

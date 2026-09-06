@@ -105,7 +105,14 @@ func (p workerIngestPageProgress) LoadCompletedPages(
 }
 
 func (p workerIngestPageProgress) CommitPage(ctx context.Context, page IngestPageCheckpoint) error {
-	return p.repository.SaveIngestPageCheckpoint(ctx, p.lease(), p.now(), page)
+	startedAt := time.Now()
+	lease := p.lease()
+	err := p.repository.SaveIngestPageCheckpoint(ctx, lease, p.now(), page)
+	logger.Info("[knowledge] ingest page checkpoint finished", "job_id", lease.JobID,
+		"document_id", p.source.DocumentID, "source_digest", page.SourceDigest,
+		"page", page.PageNumber, "pages_total", page.PagesTotal, "mode", page.ExtractionMode,
+		"text_bytes", len(page.Content), "elapsed_ms", time.Since(startedAt).Milliseconds(), "error", err)
+	return err
 }
 
 func (p workerIngestPageProgress) SaveSegmentPlan(
@@ -176,6 +183,28 @@ func (p workerIngestPageProgress) MarkOCRPageInvocationOutcomeUnknownContext(
 	lastError string,
 ) error {
 	return p.MarkOCRPageInvocationOutcomeUnknown(ctx, p.lease(), p.now(), invocation, lastError)
+}
+
+func (p workerIngestPageProgress) MarkOCRPageInvocationFailed(
+	ctx context.Context,
+	_lease JobLease,
+	_now time.Time,
+	invocation OCRPageInvocation,
+	lastError string,
+) error {
+	marker, ok := p.invocations.(OCRPageInvocationOutcomeMarker)
+	if !ok {
+		return ErrOCRPageInvocationLedgerUnavailable
+	}
+	return marker.MarkOCRPageInvocationFailed(ctx, p.lease(), p.now(), invocation, lastError)
+}
+
+func (p workerIngestPageProgress) MarkOCRPageInvocationFailedContext(
+	ctx context.Context,
+	invocation OCRPageInvocation,
+	lastError string,
+) error {
+	return p.MarkOCRPageInvocationFailed(ctx, p.lease(), p.now(), invocation, lastError)
 }
 
 type SemanticIndexWorkerConfig struct {
@@ -682,10 +711,21 @@ func (w *SemanticIndexWorker) executeClaimed(ctx context.Context, job KnowledgeJ
 		progressLogMu.Lock()
 		activeBatchID = manifest.BatchID
 		progressLogMu.Unlock()
+		batchStartedAt := time.Now()
+		logger.Info("[knowledge] embedding batch started", "job_id", job.JobID,
+			"document_id", job.DocumentID, "revision_id", plan.RevisionID, "batch_id", manifest.BatchID,
+			"batch_state", manifest.State, "batch_chunks", len(texts),
+			"provider", plan.Snapshot.Profile.ProviderID, "model", plan.Snapshot.Profile.ModelName,
+			"timeout_ms", embeddingTimeout.Milliseconds())
 		vectors, providerBegan, err := w.invokeEmbeddingBatch(
 			ctx, lease, manifest, executor, texts, embeddingTimeout,
 			plan.Snapshot.Profile.Location == ProviderLocationLocal,
 		)
+		logger.Info("[knowledge] embedding batch finished", "job_id", job.JobID,
+			"document_id", job.DocumentID, "revision_id", plan.RevisionID, "batch_id", manifest.BatchID,
+			"provider", plan.Snapshot.Profile.ProviderID, "model", plan.Snapshot.Profile.ModelName,
+			"elapsed_ms", time.Since(batchStartedAt).Milliseconds(), "vectors", len(vectors),
+			"provider_began", providerBegan, "error", err)
 		if err != nil {
 			if providerBegan && isEmbeddingBatchOutcomeUnknown(err) {
 				transitionCtx, cancelTransition := semanticWorkerTransitionContext(ctx)
@@ -825,6 +865,13 @@ func (w *SemanticIndexWorker) invokeEmbeddingBatch(
 	timeout time.Duration,
 	local bool,
 ) (vectors [][]float32, providerBegan bool, err error) {
+	startedAt := time.Now()
+	phase := "readiness"
+	defer func() {
+		logger.Info("[knowledge] embedding invocation finished", "job_id", lease.JobID,
+			"batch_id", manifest.BatchID, "phase", phase, "local", local,
+			"provider_began", providerBegan, "elapsed_ms", time.Since(startedAt).Milliseconds(), "error", err)
+	}()
 	// Readiness may perform its own physical probe. Complete that call before
 	// creating the provider prelease, whose single borrow belongs exclusively to
 	// the real embedding request after the durable Begin boundary.
@@ -837,6 +884,12 @@ func (w *SemanticIndexWorker) invokeEmbeddingBatch(
 			return nil, false, ErrEmbeddingUnavailable
 		}
 	}
+	logger.Info("[knowledge] embedding readiness completed", "job_id", lease.JobID,
+		"batch_id", manifest.BatchID, "local", local, "elapsed_ms", time.Since(startedAt).Milliseconds())
+	phase = "admission"
+	admissionStartedAt := time.Now()
+	logger.Info("[knowledge] embedding admission started", "job_id", lease.JobID,
+		"batch_id", manifest.BatchID, "local", local)
 	var (
 		permit         *resourcegov.Permit
 		inferenceLease *localinfer.Lease
@@ -864,6 +917,9 @@ func (w *SemanticIndexWorker) invokeEmbeddingBatch(
 		}
 		defer permit.Release()
 	}
+	logger.Info("[knowledge] embedding admission completed", "job_id", lease.JobID,
+		"batch_id", manifest.BatchID, "local", local, "elapsed_ms", time.Since(admissionStartedAt).Milliseconds())
+	phase = "durable_begin"
 	// Admission can consume most of a lease, while cloud calls intentionally
 	// bypass local admission. Both paths must refresh the same durable fence
 	// after manifest preparation and immediately before BeginEmbeddingBatch.
@@ -880,7 +936,14 @@ func (w *SemanticIndexWorker) invokeEmbeddingBatch(
 	)
 	embedCtx, cancelEmbed := context.WithTimeout(embedRequestCtx, timeout)
 	defer cancelEmbed()
+	phase = "provider"
+	providerStartedAt := time.Now()
+	logger.Info("[knowledge] embedding provider started", "job_id", lease.JobID,
+		"batch_id", manifest.BatchID, "chunks", len(texts), "timeout_ms", timeout.Milliseconds())
 	vectors, err = executor.EmbedForPurpose(embedCtx, EmbeddingPurposeDocument, texts)
+	logger.Info("[knowledge] embedding provider finished", "job_id", lease.JobID,
+		"batch_id", manifest.BatchID, "elapsed_ms", time.Since(providerStartedAt).Milliseconds(),
+		"vectors", len(vectors), "context_error", embedCtx.Err(), "error", err)
 	return vectors, providerBegan, err
 }
 
@@ -932,7 +995,11 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 		"stage", JobStageExtracting,
 	)
 
+	prepareStartedAt := time.Now()
 	prepared, err := w.prepareIngestWithHeartbeat(ctx, lease, source)
+	logger.Info("[knowledge] ingest preparation finished", "job_id", job.JobID,
+		"document_id", job.DocumentID, "source_digest", source.SHA256,
+		"elapsed_ms", time.Since(prepareStartedAt).Milliseconds(), "pages_total", prepared.PageCount, "error", err)
 	if err != nil {
 		return err
 	}
@@ -966,7 +1033,12 @@ func (w *SemanticIndexWorker) executeIngest(ctx context.Context, job KnowledgeJo
 	if err := w.renewLease(ctx, lease); err != nil {
 		return err
 	}
-	return repository.CompleteIngestDocument(ctx, *lease, w.now(), prepared)
+	commitStartedAt := time.Now()
+	err = repository.CompleteIngestDocument(ctx, *lease, w.now(), prepared)
+	logger.Info("[knowledge] ingest publication finished", "job_id", job.JobID,
+		"document_id", job.DocumentID, "pages_total", pages,
+		"elapsed_ms", time.Since(commitStartedAt).Milliseconds(), "error", err)
+	return err
 }
 
 func (w *SemanticIndexWorker) prepareIngestWithHeartbeat(

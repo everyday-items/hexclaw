@@ -67,6 +67,12 @@ func TestBug20260703P24_TemperatureMigrationRebuildsColumn(t *testing.T) {
 	db := openLegacySchemaDB(t)
 	store := NewSQLiteStore(db)
 	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER agent_metadata_observer
+		AFTER UPDATE OF metadata ON agents BEGIN
+			UPDATE agent_rules SET priority=priority+1 WHERE agent_name=NEW.name;
+		END`); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Init(ctx); err != nil {
 		t.Fatalf("Init（含迁移）失败: %v", err)
 	}
@@ -102,6 +108,13 @@ func TestBug20260703P24_TemperatureMigrationRebuildsColumn(t *testing.T) {
 	rules, err := store.LoadRules(ctx)
 	if err != nil || len(rules) != 1 {
 		t.Fatalf("迁移后规则应完好: err=%v rules=%d", err, len(rules))
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE agents SET metadata='{}' WHERE name='warm-agent'`); err != nil {
+		t.Fatal(err)
+	}
+	rules, err = store.LoadRules(ctx)
+	if err != nil || len(rules) != 1 || rules[0].Priority != 1 {
+		t.Fatalf("table rebuild lost the original metadata trigger: rules=%+v err=%v", rules, err)
 	}
 	if err := store.DeleteAgent(ctx, "warm-agent"); err != nil {
 		t.Fatalf("DeleteAgent: %v", err)

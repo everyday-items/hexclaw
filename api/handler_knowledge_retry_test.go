@@ -120,6 +120,17 @@ func TestKnowledgeDocumentRetryMapsConflictReuploadAndMissing(t *testing.T) {
 			if rec.Code != test.want || payload["code"] != test.code {
 				t.Fatalf("status=%d payload=%v", rec.Code, payload)
 			}
+			if errors.Is(test.err, knowledge.ErrDocumentRetryRequiresReupload) {
+				upload := httptest.NewRecorder()
+				writeDocumentIngestError(upload, test.err)
+				var uploadPayload map[string]string
+				if err := json.NewDecoder(upload.Body).Decode(&uploadPayload); err != nil {
+					t.Fatal(err)
+				}
+				if upload.Code != test.want || uploadPayload["code"] != test.code {
+					t.Fatalf("upload status=%d payload=%v", upload.Code, uploadPayload)
+				}
+			}
 		})
 	}
 }

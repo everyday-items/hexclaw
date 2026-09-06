@@ -11,7 +11,7 @@ import (
 	"unicode"
 )
 
-var writtenFinalAnswerRe = regexp.MustCompile(`(?:答案?|答)[^0-9+\-]*([+\-]?[0-9]+(?:\.[0-9]+)?(?:/[0-9]+)?)`)
+var writtenFinalAnswerRe = regexp.MustCompile(`(?:答案?|答)[^0-9+\-(]*([+\-]?[0-9(][0-9.+\-*/×÷() \t]*)`)
 var answerLatexFractionRe = regexp.MustCompile(`\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}`)
 var answerLatexCompactFractionRe = regexp.MustCompile(`\\frac\s*([0-9])\s*([0-9])`)
 var answerLatexTextRe = regexp.MustCompile(`\\text\s*\{([^{}]*)\}`)
@@ -26,6 +26,8 @@ var answerSpacedMixedFractionRe = regexp.MustCompile(`([0-9]+)\s+([0-9]+/[0-9]+)
 var itemNumberPrefixRe = regexp.MustCompile(`^[0-9]{1,3}\s*(?:[、)）]|[.．]\s)\s*`)
 var mixedNumberAnswerRe = regexp.MustCompile(`^([+\-]?)([0-9]+)(?:\s+|又)([0-9]+)\s*/\s*([0-9]+)$`)
 var simplestFractionRequestRe = regexp.MustCompile(`^计算[ \t]*(.+?)[ \t]*[，,][ \t]*并把结果化成最简分数[。.]?$`)
+var standaloneArithmeticRequestRe = regexp.MustCompile(`^计算：[ \t]*([0-9.+*/() \t-]+?)[ \t]*(?:。|=[ \t]*\?)$`)
+var separatedArithmeticNumberRe = regexp.MustCompile(`[0-9.][ \t]+[0-9.]`)
 
 // solveTrivialArithmetic 对“只含数字、四则运算、括号，等号右侧为空/问号”的一步算式做
 // 本机精确求值。它刻意不接受变量、函数、单位或自然语言，避免把方程/应用题误判成纯计算。
@@ -79,6 +81,13 @@ func normalizeTrivialArithmetic(problem string) (expr, display string, ok bool) 
 	)
 	s = replacer.Replace(s)
 	s = itemNumberPrefixRe.ReplaceAllString(s, "")
+	// 完整单行包装允许算符旁空白，但不能将分隔数字或题号拼入算式。
+	if matches := standaloneArithmeticRequestRe.FindStringSubmatch(s); len(matches) == 2 {
+		if separatedArithmeticNumberRe.MatchString(matches[1]) {
+			return "", "", false
+		}
+		s = matches[1]
+	}
 	if i := strings.IndexByte(s, '='); i >= 0 {
 		// 只接受“表达式=”或“表达式=?”；已有等式/方程不是纯求值题。
 		rhs := strings.TrimSpace(s[i+1:])
@@ -148,7 +157,7 @@ func arithmeticAnswerValue(answer string) (string, bool) {
 		}
 	}
 	// 有完整演算时最后一行不一定是纯算式，例如“24÷3×8=64 答这个数是64”。只在出现明确
-	// “答/答案”标记时提取其后的首个纯数值；单位与其他文字不参与数值相等性比较。
+	// “答/答案”标记时提取其后的完整算式并精确求值；单位与其他文字不参与数值相等性比较。
 	if matches := writtenFinalAnswerRe.FindAllStringSubmatch(s, -1); len(matches) > 0 {
 		candidate := matches[len(matches)-1][1]
 		if _, value, ok := solveTrivialArithmetic(candidate); ok {

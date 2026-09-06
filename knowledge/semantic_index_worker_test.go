@@ -375,6 +375,11 @@ func TestSemanticIndexWorkerRestartSkipsCommittedBatch(t *testing.T) {
 	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM kb_revision_vectors`).Scan(&vectors); err != nil || vectors != 1 {
 		t.Fatalf("first committed checkpoint vectors=%d err=%v, want 1", vectors, err)
 	}
+	// 恢复时只有旧租约的调用开始事实，没有 Provider 完成结果。
+	if _, err := h.db.ExecContext(h.ctx, `UPDATE kb_embedding_batch_manifests
+		SET state='in_flight',next_attempt_at=NULL,last_error='' WHERE state='retry_wait'`); err != nil {
+		t.Fatal(err)
+	}
 
 	now = now.Add(30 * time.Second)
 	restartedExecutor := &scriptedWorkerExecutor{dimension: 3}
@@ -382,14 +387,23 @@ func TestSemanticIndexWorkerRestartSkipsCommittedBatch(t *testing.T) {
 		executors: map[string]ProfileEmbeddingExecutor{"profile-a": restartedExecutor},
 	}, workerConfig(&now, "worker-after-restart", 1))
 	processed, err = restarted.RunOnce(h.ctx)
-	if err != nil || !processed {
-		t.Fatalf("restart RunOnce: processed=%v err=%v", processed, err)
+	if !errors.Is(err, ErrEmbeddingBatchOutcomeUnknown) || !processed {
+		t.Fatalf("restart must park stale in-flight batch once: processed=%v err=%v", processed, err)
 	}
-	if want := [][]string{{"beta chunk"}, {"gamma chunk"}}; !reflect.DeepEqual(restartedExecutor.batches, want) {
-		t.Fatalf("restart provider batches = %#v, want only uncommitted %#v", restartedExecutor.batches, want)
+	if len(restartedExecutor.batches) != 0 {
+		t.Fatalf("restart resent unknown batch: %#v", restartedExecutor.batches)
 	}
-	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM kb_revision_vectors`).Scan(&vectors); err != nil || vectors != 3 {
-		t.Fatalf("restart final vectors=%d err=%v, want 3", vectors, err)
+	if err := h.db.QueryRowContext(h.ctx, `SELECT COUNT(*) FROM kb_revision_vectors`).Scan(&vectors); err != nil || vectors != 1 {
+		t.Fatalf("restart changed committed vectors=%d err=%v, want 1", vectors, err)
+	}
+	var state, lastError string
+	if err := h.db.QueryRowContext(h.ctx, `SELECT state,last_error FROM kb_embedding_batch_manifests
+		WHERE state<>'succeeded'`).Scan(&state, &lastError); err != nil ||
+		state != string(EmbeddingBatchOutcomeUnknown) || !strings.Contains(lastError, "lease") {
+		t.Fatalf("stale batch outcome=%q cause=%q err=%v", state, lastError, err)
+	}
+	if processed, err := restarted.RunOnce(h.ctx); processed || err != nil {
+		t.Fatalf("stale unknown batch entered another retry: processed=%v err=%v", processed, err)
 	}
 }
 

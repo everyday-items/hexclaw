@@ -8,12 +8,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/hexagon-codes/hexclaw/knowledge"
 	"github.com/hexagon-codes/hexclaw/resourcegov"
+	"github.com/hexagon-codes/toolkit/util/logger"
 )
 
 const (
@@ -82,6 +84,8 @@ func (p *knowledgeDocumentIngestProcessor) prepare(
 	if err := validateAsyncIngestMemoryBudget(source); err != nil {
 		return knowledge.PreparedIngestDocument{}, err
 	}
+	ctx = logger.ContextWithLogger(ctx,
+		logger.NewWithHandler(slog.Default().Handler()).With("document_id", source.DocumentID))
 	ctx = resourcegov.WithPriority(ctx, resourcegov.PriorityBackground)
 	pageCount := int64(1)
 	warnings := []string{}

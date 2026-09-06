@@ -257,14 +257,16 @@ type OCRPageInvocationContextProgress interface {
 	SaveOCRPageInvocationContext(context.Context, OCRPageInvocation, OCRPageInvocationResult) error
 }
 
-// OCRPageInvocationOutcomeMarker 在 Provider 未返回可验证结果时把调用停在
-// outcome_unknown，恢复路径只能先对账，不能直接再次调用。
+// OCRPageInvocationOutcomeMarker 分别记录明确失败与结果未知；只有 failed
+// 可以重试，outcome_unknown 必须先对账，不能直接再次调用。
 type OCRPageInvocationOutcomeMarker interface {
 	MarkOCRPageInvocationOutcomeUnknown(context.Context, JobLease, time.Time, OCRPageInvocation, string) error
+	MarkOCRPageInvocationFailed(context.Context, JobLease, time.Time, OCRPageInvocation, string) error
 }
 
 type OCRPageInvocationContextOutcomeMarker interface {
 	MarkOCRPageInvocationOutcomeUnknownContext(context.Context, OCRPageInvocation, string) error
+	MarkOCRPageInvocationFailedContext(context.Context, OCRPageInvocation, string) error
 }
 
 const (

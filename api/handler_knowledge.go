@@ -343,6 +343,8 @@ func writeDocumentIngestError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "code": "knowledge_document_invalid"})
 	case errors.Is(err, knowledge.ErrIdempotencyConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "knowledge_idempotency_conflict"})
+	case errors.Is(err, knowledge.ErrDocumentRetryRequiresReupload):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "knowledge_document_retry_requires_reupload"})
 	case errors.Is(err, knowledge.ErrDocumentIngestUnavailable):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "knowledge document ingest unavailable", "code": "knowledge_ingest_unavailable"})
 	default:

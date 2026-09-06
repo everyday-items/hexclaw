@@ -61,7 +61,7 @@ route_receipt_json,lease_epoch,created_at,updated_at
 FROM kb_ingest_page_invocations`
 
 // ClaimOCRPageInvocation 在逐页 VLM 调用前声明不可变身份。首次声明返回 Fresh=true；
-// 之后同一身份只返回原记录，调用方必须复用 succeeded 结果或停在恢复/对账状态。
+// 明确 failed 可在同一身份内重新声明；succeeded 只复用，未知调用只对账。
 func (r *SQLiteSemanticIndexRepository) ClaimOCRPageInvocation(
 	ctx context.Context,
 	lease JobLease,
@@ -94,6 +94,20 @@ func (r *SQLiteSemanticIndexRepository) ClaimOCRPageInvocation(
 		if invocation.Provider != claim.Provider || invocation.Model != claim.Model ||
 			invocation.Operation != OCRRouteOperationPDFPage {
 			return OCRPageInvocation{}, fmt.Errorf("%w: OCR invocation route identity changed", ErrInvalidDocumentUpload)
+		}
+		if invocation.Status == OCRPageInvocationStatusFailed {
+			res, err := tx.ExecContext(ctx, `UPDATE kb_ingest_page_invocations
+				SET status='running',lease_epoch=?,updated_at=?
+				WHERE invocation_id=? AND job_id=? AND status='failed'`,
+				lease.Epoch, now.UTC().UnixMilli(), invocation.InvocationID, job.JobID)
+			if err != nil {
+				return OCRPageInvocation{}, err
+			}
+			if changed, _ := res.RowsAffected(); changed != 1 {
+				return OCRPageInvocation{}, ErrJobFenced
+			}
+			invocation.Status, invocation.LeaseEpoch = OCRPageInvocationStatusRunning, lease.Epoch
+			invocation.UpdatedAt, invocation.Fresh = now.UTC(), true
 		}
 		if err := tx.Commit(); err != nil {
 			return OCRPageInvocation{}, err
@@ -207,7 +221,7 @@ func (r *SQLiteSemanticIndexRepository) MarkOCRPageInvocationOutcomeUnknown(
 	lease JobLease,
 	now time.Time,
 	invocation OCRPageInvocation,
-	_ string,
+	lastError string,
 ) error {
 	if strings.TrimSpace(invocation.InvocationID) == "" || strings.TrimSpace(invocation.JobID) == "" {
 		return fmt.Errorf("%w: invalid OCR page invocation identity", ErrInvalidDocumentUpload)
@@ -245,6 +259,59 @@ func (r *SQLiteSemanticIndexRepository) MarkOCRPageInvocationOutcomeUnknown(
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return ErrJobFenced
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE kb_knowledge_jobs SET last_error=?,updated_at=?
+		WHERE job_id=? AND lease_epoch=?`,
+		fmt.Sprintf("%s: page %d invocation %s: %s", ErrOCRPageInvocationOutcomeUnknown,
+			stored.PageNumber, stored.InvocationID, lastError), now.UTC().UnixMilli(), job.JobID, lease.Epoch); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkOCRPageInvocationFailed 只接纳当前租约已确认的失败；不改变成功或未知结果。
+func (r *SQLiteSemanticIndexRepository) MarkOCRPageInvocationFailed(
+	ctx context.Context,
+	lease JobLease,
+	now time.Time,
+	invocation OCRPageInvocation,
+	lastError string,
+) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	job, err := loadLiveJob(ctx, tx, lease, now)
+	if err != nil {
+		return err
+	}
+	if job.JobID != invocation.JobID || strings.TrimSpace(invocation.InvocationID) == "" {
+		return ErrJobFenced
+	}
+	stored, err := scanOCRPageInvocation(tx.QueryRowContext(ctx, ocrPageInvocationSelect+
+		` WHERE invocation_id=? AND job_id=?`, invocation.InvocationID, job.JobID))
+	if err != nil {
+		return err
+	}
+	if stored.Status == OCRPageInvocationStatusFailed {
+		return tx.Commit()
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE kb_ingest_page_invocations
+		SET status='failed',updated_at=?
+		WHERE invocation_id=? AND job_id=? AND lease_epoch=? AND status='running'`,
+		now.UTC().UnixMilli(), stored.InvocationID, job.JobID, lease.Epoch)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return ErrJobFenced
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE kb_knowledge_jobs SET last_error=?,updated_at=?
+		WHERE job_id=? AND lease_epoch=?`,
+		fmt.Sprintf("knowledge: OCR page %d invocation %s failed: %s", stored.PageNumber,
+			stored.InvocationID, lastError), now.UTC().UnixMilli(), job.JobID, lease.Epoch); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

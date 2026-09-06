@@ -154,8 +154,36 @@ func (s *SQLiteStore) migrateAgentsTemperatureNullable(ctx context.Context) {
 	}
 	defer func() { _, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`) }()
 
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		logger.Warn("temperature 迁移: 开启事务失败", "error", err)
+		return
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), `ROLLBACK`) }()
+	// 表重建会删除附属触发器；在同一事务中保存并恢复原定义。
+	rows, err := conn.QueryContext(ctx, `SELECT sql FROM sqlite_master
+		WHERE type='trigger' AND tbl_name='agents' AND sql IS NOT NULL ORDER BY name`)
+	if err != nil {
+		logger.Warn("temperature 迁移: 读取原触发器失败", "error", err)
+		return
+	}
+	var triggers []string
+	for rows.Next() {
+		var definition string
+		if err := rows.Scan(&definition); err != nil {
+			_ = rows.Close()
+			logger.Warn("temperature 迁移: 读取触发器定义失败", "error", err)
+			return
+		}
+		triggers = append(triggers, definition)
+	}
+	rowsErr := rows.Err()
+	closeErr := rows.Close()
+	if rowsErr != nil || closeErr != nil {
+		logger.Warn("temperature 迁移: 完成触发器读取失败", "error", rowsErr, "close_error", closeErr)
+		return
+	}
+
 	stmts := []string{
-		`BEGIN IMMEDIATE`,
 		`CREATE TABLE agents_mig_tempnull (
 			name         TEXT PRIMARY KEY,
 			display_name TEXT NOT NULL DEFAULT '',
@@ -181,12 +209,12 @@ func (s *SQLiteStore) migrateAgentsTemperatureNullable(ctx context.Context) {
 		 FROM agents`,
 		`DROP TABLE agents`,
 		`ALTER TABLE agents_mig_tempnull RENAME TO agents`,
-		`COMMIT`,
 	}
+	stmts = append(stmts, triggers...)
+	stmts = append(stmts, `COMMIT`)
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			logger.Warn("temperature 迁移失败（保持旧列语义）", "error", err, "stmt", stmt)
-			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 			return
 		}
 	}

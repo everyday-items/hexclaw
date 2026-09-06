@@ -12,12 +12,12 @@ func TestSolveTrivialArithmetic(t *testing.T) {
 		problem string
 		answer  string
 	}{
-		{"4.5×2=", "9"},
+		{"计算：36 × 3 = ？", "108"},
 		{"10×0.01=?", "0.1"},
 		{"4÷0.5", "8"},
 		{"(2+3)×4", "20"},
-		{"1/3 + 1/6", "0.5"},
-		{"-1.5+2", "0.5"},
+		{"计算：0.6＋1/4。", "0.85"},
+		{"计算：-1.5 + 2。", "0.5"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.problem, func(t *testing.T) {
@@ -28,18 +28,21 @@ func TestSolveTrivialArithmetic(t *testing.T) {
 			if !strings.Contains(worked, "答案："+tt.answer) {
 				t.Fatalf("worked solution missing answer: %q", worked)
 			}
+			if !strings.Contains(worked, "按四则运算规则计算：") || !strings.Contains(worked, " = "+tt.answer) {
+				t.Fatalf("worked solution missing calculation: %q", worked)
+			}
 		})
 	}
 }
 
 func TestSolveTrivialArithmeticRejectsNonArithmetic(t *testing.T) {
 	for _, problem := range []string{
-		"小明有 4 个苹果，又买 2 个，一共有多少？",
-		"x+2=3",
-		"2^3",
-		"1÷0",
+		"计算：小明有 4 个苹果，又买 2 个，一共有多少？。",
+		"计算：1 2 + 3 = ？",
+		"计算：1. 2+3；2. 4+5。",
+		"计算：1÷0。",
 		"2+2=4",
-		"",
+		"计算：0.6米＋1/4米。",
 	} {
 		t.Run(problem, func(t *testing.T) {
 			if _, _, ok := solveTrivialArithmetic(problem); ok {

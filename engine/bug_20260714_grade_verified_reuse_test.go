@@ -86,6 +86,19 @@ func TestGradeVerifiedArithmeticTreatsMixedNumberAsWholePlusProperFraction(t *te
 			if got := res.Metadata["grade_correct"]; got != tt.wantCorrect {
 				t.Fatalf("grade_correct=%q, want %q; metadata=%#v", got, tt.wantCorrect, res.Metadata)
 			}
+			if tt.name == "space separated mixed number" {
+				student := `8\times\frac{1}{4}\times\frac{4}{5}=2\times\frac{4}{5}=\frac{8}{5}=1\frac{3}{5}；\quad 答：是1\frac{3}{5}。`
+				if value, ok := arithmeticAnswerValue(student); !ok || value != "1.6" {
+					t.Errorf("complete mixed-number answer value=%q,%v; want 1.6,true", value, ok)
+				}
+				res, err = s.GradeVerified(context.Background(), "8的1/4的4/5是多少？", "答案：1.6", student)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if calls != 0 || res.Metadata["grade_correct"] != "true" || res.Metadata["grade_final_answer_correct"] != "true" {
+					t.Errorf("complete mixed-number work must remain locally correct: calls=%d metadata=%#v", calls, res.Metadata)
+				}
+			}
 		})
 	}
 }

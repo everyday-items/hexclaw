@@ -70,6 +70,11 @@ func splitLinearEquation(problem string) (left, right string, ok bool) {
 	if s == "" || len(s) > 256 {
 		return "", "", false
 	}
+	// 只剥离完整单题的固定题头和成对数学包装，方程内容仍经过原语法与代回验证。
+	s = strings.TrimSpace(strings.TrimPrefix(s, "解方程："))
+	if strings.HasPrefix(s, `\[`) && strings.HasSuffix(s, `\]`) {
+		s = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(s, `\[`), `\]`))
+	}
 	s = strings.NewReplacer(
 		"×", "*", "÷", "/", "＋", "+", "－", "-", "−", "-",
 		"（", "(", "）", ")", "＝", "=",
