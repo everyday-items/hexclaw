@@ -756,13 +756,17 @@ func (o *GradingOrchestrator) ConfirmAndRun(ctx context.Context, jobID string, c
 	run.questions = candidate.questions
 	run.anchored = candidate.anchored
 	if awaitingItemSource {
+		mode := PhotoModeGrade
+		if candidate.req.TaskIntent == PhotoTaskBlankWorksheet {
+			mode = PhotoModeSolve
+		}
 		for _, q := range candidate.questions {
 			q = NormalizeRecognizedQuestion(q)
 			if recognizedQuestionRequiresGuardianConfirmation(q, candidate.req.TaskIntent) {
 				continue
 			}
 			if _, itemErr := o.assessDurablePhotoItem(
-				ctx, o.deps, job, run.req, PhotoModeGrade, q,
+				ctx, o.deps, job, run.req, mode, q,
 			); itemErr != nil {
 				l.Unlock()
 				return GradingJobView{}, itemErr

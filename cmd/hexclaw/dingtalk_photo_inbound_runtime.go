@@ -74,9 +74,11 @@ type k12DingtalkPhotoReplyIdentityPort interface {
 }
 
 type k12DingtalkPhotoInboundRuntimeConfig struct {
-	BaseContext       context.Context
-	Router            *agentrouter.Dispatcher
-	Check             func(context.Context, *adapter.Message) error
+	BaseContext context.Context
+	Router      *agentrouter.Dispatcher
+	Check       func(context.Context, *adapter.Message) error
+	// BindDirect 在适配器事件进入 ACK 前，把 direct sender 提升为耐久 K12 物理目标绑定。
+	BindDirect        func(context.Context, *adapter.Message) error
 	ResolveInstanceID func(string, string) (string, error)
 	Inbound           k12InboundPhotoCoordinatorPort
 	ImageTasks        k12InboundPhotoImageTaskPort
@@ -96,6 +98,7 @@ type k12DingtalkPhotoInboundRuntime struct {
 	baseCtx           context.Context
 	router            *agentrouter.Dispatcher
 	check             func(context.Context, *adapter.Message) error
+	bindDirect        func(context.Context, *adapter.Message) error
 	resolveInstanceID func(string, string) (string, error)
 	inbound           k12InboundPhotoCoordinatorPort
 	imageTasks        k12InboundPhotoImageTaskPort
@@ -134,6 +137,7 @@ func newK12DingtalkPhotoInboundRuntime(
 	}
 	runtime := &k12DingtalkPhotoInboundRuntime{
 		baseCtx: baseCtx, router: config.Router, check: config.Check,
+		bindDirect:        config.BindDirect,
 		resolveInstanceID: config.ResolveInstanceID,
 		inbound:           config.Inbound, imageTasks: config.ImageTasks,
 		practiceSets: config.PracticeSets, practiceReturns: config.PracticeReturns,
@@ -245,6 +249,18 @@ func (r *k12DingtalkPhotoInboundRuntime) AdmitInboundPhoto(
 		if err := r.check(ctx, msg); err != nil {
 			return false, err
 		}
+	}
+	if r.bindDirect != nil {
+		if err := r.bindDirect(ctx, msg); err != nil {
+			return false, fmt.Errorf("bind DingTalk direct K12 target: %w", err)
+		}
+		// 绑定会把实例级 catchall 提升为发送者精确规则。
+		// 重新路由，使耐久入站回执冻结具体 binding ID。
+		rebound := routeK12DingtalkPhotoTutor(msg, r.router)
+		if rebound == nil || rebound.Rule == nil || strings.TrimSpace(rebound.Rule.ChatID) == "" {
+			return false, fmt.Errorf("DingTalk direct K12 target binding did not produce an exact route")
+		}
+		routed = rebound
 	}
 	provider, model, exactRoute := normalizeK12DingtalkInboundPhotoRoute(
 		routed.AgentConfig.Provider, routed.AgentConfig.Model,

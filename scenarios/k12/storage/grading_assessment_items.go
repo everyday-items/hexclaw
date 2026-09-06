@@ -19,12 +19,14 @@ import (
 var ErrGradingAssessmentItemConflict = errors.New("grading assessment item immutable receipt conflict")
 
 // GradingAssessmentEffects is deliberately typed and closed. It cannot run
-// arbitrary SQL. A new receipt may either record one wrong-item Mistake (which
-// also appends its typed Outbox event) or CAS one existing Mistake review, never
-// both. An idempotent receipt replay executes neither effect again.
+// arbitrary SQL. A new receipt may either record one wrong-item Mistake, CAS
+// one existing Mistake review, or retract the unique source-correction
+// projection, never more than one effect. An idempotent receipt replay
+// executes neither effect again.
 type GradingAssessmentEffects struct {
-	Mistake *GradingMistakeEffect
-	Review  *GradingReviewEffect
+	Mistake          *GradingMistakeEffect
+	Review           *GradingReviewEffect
+	SourceCorrection bool
 }
 
 type GradingMistakeEffect struct {
@@ -97,8 +99,18 @@ func gradingAssessmentEventID(item k12.GradingAssessmentItem, effectKind string)
 }
 
 func validateGradingAssessmentEffects(effects GradingAssessmentEffects) error {
-	if effects.Mistake != nil && effects.Review != nil {
-		return fmt.Errorf("k12storage: grading assessment Mistake and Review effects are mutually exclusive")
+	effectCount := 0
+	if effects.Mistake != nil {
+		effectCount++
+	}
+	if effects.Review != nil {
+		effectCount++
+	}
+	if effects.SourceCorrection {
+		effectCount++
+	}
+	if effectCount > 1 {
+		return fmt.Errorf("k12storage: grading assessment effects are mutually exclusive")
 	}
 	if effects.Review != nil {
 		if strings.TrimSpace(effects.Review.RecordID) == "" || effects.Review.ExpectedVersion < 0 ||
@@ -118,7 +130,7 @@ func validateGradingAssessmentEffectsForStatus(
 	}
 	switch status {
 	case k12.GradingAssessmentWrong:
-		if effects.Review != nil {
+		if effects.Review != nil || effects.SourceCorrection {
 			return fmt.Errorf("k12storage: wrong assessment cannot advance review state")
 		}
 	case k12.GradingAssessmentCorrect:
@@ -126,7 +138,7 @@ func validateGradingAssessmentEffectsForStatus(
 			return fmt.Errorf("k12storage: correct assessment cannot create a mistake")
 		}
 	default:
-		if effects.Mistake != nil || effects.Review != nil {
+		if effects.Mistake != nil || effects.Review != nil || effects.SourceCorrection {
 			return fmt.Errorf("k12storage: assessment status %s cannot project mistake/review effects", status)
 		}
 	}
@@ -148,7 +160,9 @@ func (s *Store) validateAssessmentInvocationRef(ctx context.Context, item k12.Gr
 		operationAllowed = operationAllowed || invocation.Operation == operation
 	}
 	if invocation.JobID != item.JobID || invocation.ProblemID != item.ProblemID ||
-		invocation.AttemptID != item.AttemptID || !operationAllowed ||
+		invocation.AttemptID != item.AttemptID ||
+		invocation.InputRevision != item.InputRevision || invocation.InputDigest != item.InputDigest ||
+		!operationAllowed ||
 		invocation.Status != k12.ModelInvocationSucceeded {
 		return fmt.Errorf("%w: assessment source invocation %s does not match committed item",
 			ErrGradingAssessmentItemConflict, invocationID)
@@ -445,6 +459,8 @@ func (s *Store) CommitGradingAssessmentItem(ctx context.Context, item k12.Gradin
 		}
 	} else if effects.Review != nil {
 		effectErr = s.commitAssessmentReviewTx(ctx, tx, item.AgentName, *effects.Review)
+	} else if effects.SourceCorrection {
+		effectErr = s.commitAssessmentSourceCorrectionTx(ctx, tx, item)
 	}
 	if effectErr != nil {
 		return k12.GradingAssessmentItem{}, false, effectErr
@@ -613,6 +629,104 @@ func (s *Store) commitAssessmentReviewTx(ctx context.Context, tx *sql.Tx, agentN
 		return records.ErrVersionConflict
 	}
 	return nil
+}
+
+// commitAssessmentSourceCorrectionTx 只撤回当前纠错提交明确关联的唯一旧错误投影。
+// 候选缺失或不唯一时保持学习记录不变，避免按题干或跨作业猜测匹配。
+func (s *Store) commitAssessmentSourceCorrectionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	item k12.GradingAssessmentItem,
+) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT assessment.projection_record_id
+		FROM k12_grading_assessment_items AS assessment
+		JOIN k12_mistakes AS mistake
+		  ON mistake.agent_name=assessment.agent_name
+		 AND mistake.record_id=assessment.projection_record_id
+		WHERE assessment.agent_name=?
+		  AND assessment.job_id=?
+		  AND assessment.problem_id=?
+		  AND assessment.input_revision<?
+		  AND assessment.current_disposition=?
+		  AND assessment.status=?
+		  AND assessment.projection_created=1
+		  AND assessment.projection_record_id!=''
+		  AND mistake.status IN (?,?)
+		ORDER BY assessment.input_revision`,
+		item.AgentName, item.JobID, item.ProblemID, item.InputRevision,
+		k12.GradingAssessmentDispositionSuperseded, k12.GradingAssessmentWrong,
+		k12.StatusNew, k12.StatusExplained,
+	)
+	if err != nil {
+		return fmt.Errorf("k12storage: query source correction mistake candidates: %w", err)
+	}
+	defer rows.Close()
+	var candidateIDs []string
+	for rows.Next() {
+		var recordID string
+		if err := rows.Scan(&recordID); err != nil {
+			return fmt.Errorf("k12storage: scan source correction mistake candidate: %w", err)
+		}
+		candidateIDs = append(candidateIDs, recordID)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("k12storage: read source correction mistake candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("k12storage: close source correction mistake candidates: %w", err)
+	}
+	if len(candidateIDs) != 1 {
+		return nil
+	}
+
+	recordsFound, err := s.queryRecordsVia(ctx, tx, mistakeMapper{},
+		`WHERE agent_name=? AND record_id=?`, item.AgentName, candidateIDs[0])
+	if err != nil {
+		return err
+	}
+	if len(recordsFound) != 1 {
+		return nil
+	}
+	current := recordsFound[0]
+	if current.Status != k12.StatusNew && current.Status != k12.StatusExplained {
+		return nil
+	}
+	fields, err := k12.ParseMistakeFields(current.Fields)
+	if err != nil {
+		return fmt.Errorf("k12storage: parse source correction mistake fields: %w", err)
+	}
+	now := nowUnix()
+	commandID := fmt.Sprintf("k12-source-correction:%s:%s:%d",
+		item.JobID, item.ProblemID, item.InputRevision)
+	fields.ArchivedReason = k12.MistakeArchivedReasonSourceCorrection
+	fields.ArchivedAt = now
+	fields.ArchiveCommandID = commandID
+	fields.ArchivedFromStatus = current.Status
+	fields.ArchivedFromDueAt = cloneInt64Pointer(current.DueAt)
+	fields.ArchivedFromSpotCheckState = fields.SpotCheckState
+	fields.LastArchive = &k12.MistakeArchiveSnapshot{
+		Reason:             fields.ArchivedReason,
+		ArchivedAt:         fields.ArchivedAt,
+		ArchiveCommandID:   fields.ArchiveCommandID,
+		FromStatus:         fields.ArchivedFromStatus,
+		FromDueAt:          cloneInt64Pointer(fields.ArchivedFromDueAt),
+		FromSpotCheckState: fields.ArchivedFromSpotCheckState,
+	}
+	// 归档对象不再进入复习/抽查池；原抽查状态已冻结在归档快照中。
+	fields.SpotCheckState = k12.SpotCheckNone
+	return s.commitAssessmentReviewTx(ctx, tx, item.AgentName, GradingReviewEffect{
+		RecordID: current.RecordID, ExpectedVersion: current.Version,
+		NewStatus: k12.StatusArchived, Fields: fields,
+	})
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func getGradingAssessmentItemRevisionVia(

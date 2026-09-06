@@ -741,6 +741,44 @@ type k12IMBinder struct {
 	mu     sync.Mutex
 }
 
+// ensureK12DingTalkDirectBinding 把钉钉 direct 入站消息携带的真实 senderStaffId
+// 提升为 K12 的具体物理目标。连接页的 instance 级规则仍只负责默认接待路由；
+// 发送到手机继续从 agent_rules 枚举有效 direct 目标，不在发送入口增加选择器或确认。
+//
+// 该绑定只在消息已经命中 K12 TutorAgent 的显式规则时发生。默认 Agent、非 K12
+// Agent、群消息、缺少实例/会话身份的消息均不产生绑定副作用。
+func ensureK12DingTalkDirectBinding(
+	ctx context.Context,
+	msg *adapter.Message,
+	router *agentrouter.Dispatcher,
+	binder apihttp.IMBinder,
+) error {
+	if msg == nil || router == nil || binder == nil || msg.Platform != adapter.PlatformDingtalk {
+		return nil
+	}
+	if conversationType := strings.ToLower(strings.TrimSpace(msg.Metadata["conversation_type"])); conversationType != "" && conversationType != "1" && conversationType != "direct" {
+		return nil
+	}
+	instanceID := strings.TrimSpace(msg.InstanceID)
+	chatID := strings.TrimSpace(msg.ChatID)
+	if instanceID == "" || chatID == "" {
+		return nil
+	}
+	if err := (channel.Target{Platform: string(adapter.PlatformDingtalk), InstanceID: instanceID, ChatID: chatID}).EnsureDirect(); err != nil {
+		return nil
+	}
+	routed := routeK12DingtalkTutor(msg, router)
+	if routed == nil || routed.Rule == nil || routed.AgentConfig == nil {
+		return nil
+	}
+	// 已经是具体会话规则时无需再次写入；Binder 自身仍保持幂等，
+	// 这里避免每条普通消息重复触发持久化路径。
+	if strings.TrimSpace(routed.Rule.ChatID) == chatID {
+		return nil
+	}
+	return binder.Bind(ctx, string(adapter.PlatformDingtalk), instanceID, chatID, routed.AgentName)
+}
+
 func (b *k12IMBinder) Bind(ctx context.Context, platform, instanceID, chatID, agentName string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

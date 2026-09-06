@@ -81,13 +81,19 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 		}
 	}
 	for _, signal := range q.OCRSignals {
-		switch strings.ToLower(strings.TrimSpace(signal)) {
+		normalizedSignal := strings.ToLower(strings.TrimSpace(signal))
+		switch normalizedSignal {
 		case "erasure", "erasure_detected":
 			reasons[OCRRiskErasure] = struct{}{}
 		case "conflict", "evidence_conflict":
 			reasons[OCRRiskEvidenceConflict] = struct{}{}
 		case "unclear", "unclear_handwriting":
 			reasons[OCRRiskUnclearHandwriting] = struct{}{}
+		}
+		// 视觉模型偶尔违反枚举协议，直接把“遮挡/重叠但看似清晰”等观察写入信号。
+		// 这类原题证据不能被高分数覆盖；保留原始信号并降为低置信，阻止自动冻结。
+		if recognitionSignalIndicatesSourceOcclusion(normalizedSignal) {
+			reasons[OCRRiskLowConfidence] = struct{}{}
 		}
 	}
 	if evidenceTranscriptionsConflict(q.RawTranscription, q.EvidenceTranscriptions, q.AnswerRawTranscription) ||
@@ -115,6 +121,18 @@ func EvaluateOCRConfirmationRisk(q RecognizedQuestion) RecognizedQuestion {
 	}
 	q.ConfirmationRequired = len(q.ConfirmationReasons) > 0
 	return q
+}
+
+func recognitionSignalIndicatesSourceOcclusion(signal string) bool {
+	for _, marker := range []string{
+		"重叠", "遮挡", "覆盖", "被挡", "看不清", "无法辨认", "模糊", "裁切",
+		"overlap", "occlud", "obscur", "unreadable", "cropped", "cut off",
+	} {
+		if strings.Contains(signal, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func independentOCRUncertaintyReason(reason OCRRiskReason) bool {

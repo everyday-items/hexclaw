@@ -1051,6 +1051,7 @@ func (e *durableGradingPhysicalCallExecutor) ExecuteGradingPhysicalCall(
 				JobID: e.job.Record.RecordID, ProblemID: e.q.ProblemID, AttemptID: e.q.AttemptID,
 				Operation: spec.Operation, OperationAttempt: operationAttempt,
 				RequestDigest: spec.RequestDigest, RouteSnapshot: e.job.Fields.ModelSnapshot,
+				InputRevision: e.q.ConfirmedVersion, InputDigest: e.q.InputDigest,
 				CreatedAt: e.o.deps.now(), UpdatedAt: e.o.deps.now(),
 			},
 		)

@@ -1934,6 +1934,7 @@ func runServe(configFile, feishuAppID, feishuSecret, telegramToken string, deskt
 	var k12WorkFeedback *k12usecase.CreativeWorkFeedbackCoordinator
 	var k12PracticeGeneration *k12usecase.SinglePracticeGenerationCoordinator
 	var k12PracticeReturnRegrade *k12usecase.PracticeReturnRegradeCoordinator
+	var k12InboundBinder *k12IMBinder
 	k12GradingShutdown := false
 	k12ImageTasksShutdown := false
 	k12WorkFeedbackShutdown := false
@@ -2499,7 +2500,7 @@ Set source only when the material explicitly names a work, title, or another rel
 				k12Cron = k12CronRegistrar{sched: scheduler, router: agentRouter}
 			}
 			// IM 入站路由「绑定」缝：POST /api/k12/bind-im 把家长私聊会话绑到辅导实例（仅 direct）。
-			k12Binder := &k12IMBinder{router: agentRouter, store: agentStore}
+			k12InboundBinder = &k12IMBinder{router: agentRouter, store: agentStore}
 			k12Base := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.Port)
 			// 统一 GradingJob 编排器（§6.7 单一应用服务）：桌面 HTTP 入口与钉钉 IM 入口共用；
 			// §6.15 异步执行模型（进程级 ctx + 有界并发 + panic 不逃逸）+ 阶段产物落盘恢复。
@@ -2660,7 +2661,7 @@ Set source only when the material explicitly names a work, title, or another rel
 				Deps:                  k12rt.Deps,
 				ModelSnapshotResolver: k12ModelSnapshot,
 				Cron:                  k12Cron,
-				Binder:                k12Binder,
+				Binder:                k12InboundBinder,
 				BaseURL:               k12Base,
 				Grading:               k12GradingOrch,
 				ImageTasks:            k12ImageTasks,
@@ -3007,6 +3008,11 @@ Set source only when the material explicitly names a work, title, or another rel
 		if err := gw.Check(ctx, msg); err != nil {
 			return &adapter.Reply{Content: "安全检查未通过: " + err.Error()}, nil
 		}
+		if err := ensureK12DingTalkDirectBinding(ctx, msg, agentRouter, k12InboundBinder); err != nil {
+			// 目标提升是自动绑定副作用。持久化暂时不可用时仍保持家长会话可用，
+			// 同时保留结构化本地诊断，供后续重试定位。
+			logger.Warn("K12 DingTalk direct target binding failed", "error", err)
+		}
 		if k12DingtalkPhotos != nil {
 			if reply, handled, err := maybeHandleK12DingtalkRuntimeMessage(
 				ctx, msg, agentRouter, k12DingtalkPhotos,
@@ -3071,6 +3077,9 @@ Set source only when the material explicitly names a work, title, or another rel
 		k12DingtalkPhotos = newK12DingtalkPhotoInboundRuntime(
 			k12DingtalkPhotoInboundRuntimeConfig{
 				BaseContext: ctx, Router: agentRouter, Check: gw.Check,
+				BindDirect: func(bindCtx context.Context, msg *adapter.Message) error {
+					return ensureK12DingTalkDirectBinding(bindCtx, msg, agentRouter, k12InboundBinder)
+				},
 				ResolveInstanceID: instanceMgr.ResolveRunningInstanceID,
 				Inbound:           k12InboundPhotos, ImageTasks: k12ImageTasks,
 				PracticeSets: practiceReturns, PracticeReturns: practiceReturns,

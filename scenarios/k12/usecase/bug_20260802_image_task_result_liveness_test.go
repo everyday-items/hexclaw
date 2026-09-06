@@ -179,6 +179,7 @@ func TestBUG20260802ImageTaskResultReadsOnlyDurableFinalArtifact(t *testing.T) {
 			JobID: grading.resolvedJobID(), ProblemID: "problem-final-result-liveness",
 			AttemptID: "attempt-final-result-liveness", Operation: k12.GradingItemOperationGrade,
 			OperationAttempt: 1, RequestDigest: "sha256:grade-request",
+			InputRevision: 1, InputDigest: "sha256:confirmed-input",
 			RouteSnapshot: persistedJob.Fields.ModelSnapshot, CreatedAt: 1000,
 		},
 	)

@@ -795,9 +795,13 @@ func (o *GradingOrchestrator) processProblemSourceReprocess(
 	if err := o.persistRun(jobID, run); err != nil {
 		return fmt.Errorf("usecase: persist current source reprocess runtime: %w", err)
 	}
+	assessmentCtx := ctx
+	if work.Action == "correct_text" {
+		assessmentCtx = withProblemSourceCorrection(ctx)
+	}
 	for _, question := range affected {
 		if _, err := o.assessDurablePhotoItem(
-			ctx, o.deps, job, req, mode, question,
+			assessmentCtx, o.deps, job, req, mode, question,
 		); err != nil {
 			return fmt.Errorf(
 				"usecase: assess source-reprocessed problem %s: %w",

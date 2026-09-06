@@ -103,6 +103,15 @@ func TestEvaluateOCRConfirmationRisk_Table(t *testing.T) {
 			want: []OCRRiskReason{OCRRiskLowConfidence},
 		},
 		{
+			name: "explicit occlusion signal lowers an overstated confidence",
+			q: RecognizedQuestion{
+				Question: "5−1/5=", Subject: "数学",
+				RecognitionConfidence: float64Ptr(0.97),
+				OCRSignals:            []string{"题目左侧有其他印刷文字及手写痕迹重叠，但算式清晰可辨"},
+			},
+			want: []OCRRiskReason{OCRRiskLowConfidence},
+		},
+		{
 			name: "undetermined subject needs item confirmation",
 			q: RecognizedQuestion{
 				Question: "分析这道题", RecognitionConfidence: float64Ptr(0.99),

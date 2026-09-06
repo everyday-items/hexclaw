@@ -743,3 +743,68 @@ func TestCronIMDeliver_GoesThroughChannel(t *testing.T) {
 		t.Fatalf("无 chat_id 应报错, got %v", err)
 	}
 }
+
+// 连接页的 instance 级接待绑定只负责路由默认入口，
+// 首个钉钉 direct 入站消息仍应把真实 senderStaffId 收敛为 K12 的物理目标。
+// 发送到手机继续只读取 agent_rules，不新增收件人选择或确认入口。
+func TestBug20260905_010_InboundDingTalkPromotesPhysicalTarget(t *testing.T) {
+	dispatcher := agentrouter.New()
+	if err := dispatcher.Register(agentrouter.AgentConfig{
+		Name:     "tutor-a",
+		Metadata: map[string]string{"scenario": k12TutorScenario},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.AddRule(agentrouter.Rule{
+		Platform: "dingtalk", InstanceID: "dt-parent", AgentName: "tutor-a", Priority: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	binder := &recordingK12Binder{dispatcher: dispatcher}
+	msg := &adapter.Message{
+		Platform:   adapter.PlatformDingtalk,
+		InstanceID: "dt-parent",
+		UserID:     "parent-42",
+		ChatID:     "parent-42",
+		Metadata:   map[string]string{"conversation_type": "1"},
+	}
+
+	if err := ensureK12DingTalkDirectBinding(context.Background(), msg, dispatcher, binder); err != nil {
+		t.Fatal(err)
+	}
+	if len(binder.calls) != 1 || binder.calls[0] != (k12BindingCall{
+		platform: "dingtalk", instanceID: "dt-parent", chatID: "parent-42", agent: "tutor-a",
+	}) {
+		t.Fatalf("入站 direct 未透传真实物理目标：%+v", binder.calls)
+	}
+
+	// 绑定发生后再次执行必须幂等，不能为同一物理目标追加第二次绑定。
+	if err := ensureK12DingTalkDirectBinding(context.Background(), msg, dispatcher, binder); err != nil {
+		t.Fatal(err)
+	}
+	if len(binder.calls) != 1 {
+		t.Fatalf("同一 direct 目标不得重复绑定（calls=1），got %d", len(binder.calls))
+	}
+}
+
+type k12BindingCall struct {
+	platform, instanceID, chatID, agent string
+}
+
+type recordingK12Binder struct {
+	dispatcher *agentrouter.Dispatcher
+	calls      []k12BindingCall
+}
+
+func (b *recordingK12Binder) Bind(_ context.Context, platform, instanceID, chatID, agent string) error {
+	b.calls = append(b.calls, k12BindingCall{
+		platform: platform, instanceID: instanceID, chatID: chatID, agent: agent,
+	})
+	if b.dispatcher == nil {
+		return nil
+	}
+	return b.dispatcher.ReplaceRule(agentrouter.Rule{
+		Platform: platform, InstanceID: instanceID, ChatID: chatID,
+		AgentName: agent, Priority: 50,
+	})
+}

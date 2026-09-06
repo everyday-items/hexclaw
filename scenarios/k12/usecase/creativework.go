@@ -233,6 +233,12 @@ func buildStructuredWorkFeedback(workType string, version k12.CreativeWorkVersio
 	inSuggestionSection := false
 	artSection, artItem := "", 0
 	strictFeedback := (workType == k12.WorkTypeArt || workType == k12.WorkTypeWriting) && source == k12.FeedbackSourceAI
+	// 写作历史记录可能仍是旧的六段标题；新生成结果带四个固定标题时继续严格校验，
+	// 旧格式只走原兼容解析，避免读取既有作品时把可用点评误判为非法。
+	if strictFeedback && workType == k12.WorkTypeWriting &&
+		!strings.Contains(feedback, "## 可见证据") {
+		strictFeedback = false
+	}
 	artSections := make(map[string]bool, 4)
 	var affirmationLines, guidanceLines, practiceLines, experimentLines []string
 	hasGuidanceContent := false

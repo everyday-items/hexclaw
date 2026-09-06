@@ -42,24 +42,27 @@ func (o GradingItemOperation) Valid() bool {
 // GradingItemInvocation 记录一次可恢复的题目逻辑执行。本机确定性执行仍保留任务冻结路由
 // 作为恢复上下文，但只有物理调用账本可以证明真实 Provider 请求。
 type GradingItemInvocation struct {
-	InvocationID     string                `json:"item_invocation_id"`
-	AgentName        string                `json:"agent_name"`
-	JobID            string                `json:"job_id"`
-	ProblemID        string                `json:"problem_id"`
-	AttemptID        string                `json:"attempt_id"`
-	Operation        GradingItemOperation  `json:"operation"`
-	ExecutionKind    GradingExecutionKind  `json:"execution_kind"`
-	OperationAttempt int                   `json:"operation_attempt"`
-	RequestDigest    string                `json:"request_digest"`
-	RouteSnapshot    GradingModelSnapshot  `json:"route_snapshot"`
-	Status           ModelInvocationStatus `json:"status"`
-	CostReceiptID    string                `json:"cost_receipt_id,omitempty"`
-	ResultDigest     string                `json:"result_digest,omitempty"`
-	ResultJSON       string                `json:"result_json,omitempty"`
-	FailureClass     string                `json:"failure_class,omitempty"`
-	FailureCode      string                `json:"failure_code,omitempty"`
-	CreatedAt        int64                 `json:"created_at"`
-	UpdatedAt        int64                 `json:"updated_at"`
+	InvocationID     string               `json:"item_invocation_id"`
+	AgentName        string               `json:"agent_name"`
+	JobID            string               `json:"job_id"`
+	ProblemID        string               `json:"problem_id"`
+	AttemptID        string               `json:"attempt_id"`
+	Operation        GradingItemOperation `json:"operation"`
+	ExecutionKind    GradingExecutionKind `json:"execution_kind"`
+	OperationAttempt int                  `json:"operation_attempt"`
+	RequestDigest    string               `json:"request_digest"`
+	// InputRevision/InputDigest 是本次题目来源快照的成对围栏；V98 之前的历史行允许为零值。
+	InputRevision int                   `json:"input_revision"`
+	InputDigest   string                `json:"input_digest,omitempty"`
+	RouteSnapshot GradingModelSnapshot  `json:"route_snapshot"`
+	Status        ModelInvocationStatus `json:"status"`
+	CostReceiptID string                `json:"cost_receipt_id,omitempty"`
+	ResultDigest  string                `json:"result_digest,omitempty"`
+	ResultJSON    string                `json:"result_json,omitempty"`
+	FailureClass  string                `json:"failure_class,omitempty"`
+	FailureCode   string                `json:"failure_code,omitempty"`
+	CreatedAt     int64                 `json:"created_at"`
+	UpdatedAt     int64                 `json:"updated_at"`
 }
 
 func (v *GradingItemInvocation) ValidateIdentity() error {
@@ -72,6 +75,10 @@ func (v *GradingItemInvocation) ValidateIdentity() error {
 	v.ProblemID = strings.TrimSpace(v.ProblemID)
 	v.AttemptID = strings.TrimSpace(v.AttemptID)
 	v.RequestDigest = strings.TrimSpace(v.RequestDigest)
+	v.InputDigest = strings.TrimSpace(v.InputDigest)
+	if v.InputRevision < 0 || (v.InputRevision == 0) != (v.InputDigest == "") {
+		return fmt.Errorf("grading item invocation input revision and digest must be provided together")
+	}
 	v.CostReceiptID = strings.TrimSpace(v.CostReceiptID)
 	if v.ExecutionKind == "" {
 		v.ExecutionKind = GradingExecutionProvider

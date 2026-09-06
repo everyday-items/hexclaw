@@ -15,7 +15,7 @@ import (
 var ErrGradingItemInvocationConflict = errors.New("grading item invocation immutable identity conflict")
 
 const gradingItemInvocationColumns = `item_invocation_id,agent_name,job_id,problem_id,attempt_id,
-    operation,execution_kind,operation_attempt,request_digest,provider,model,route_snapshot_json,status,
+    operation,execution_kind,operation_attempt,request_digest,input_revision,input_digest,provider,model,route_snapshot_json,status,
     cost_receipt_id,result_digest,result_json,failure_class,failure_code,created_at,updated_at`
 
 func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error) {
@@ -23,6 +23,7 @@ func scanGradingItemInvocation(row rowScanner) (k12.GradingItemInvocation, error
 	var operation, executionKind, status, routeJSON string
 	err := row.Scan(&item.InvocationID, &item.AgentName, &item.JobID, &item.ProblemID, &item.AttemptID,
 		&operation, &executionKind, &item.OperationAttempt, &item.RequestDigest,
+		&item.InputRevision, &item.InputDigest,
 		&item.RouteSnapshot.Provider, &item.RouteSnapshot.Model, &routeJSON, &status,
 		&item.CostReceiptID, &item.ResultDigest, &item.ResultJSON, &item.FailureClass, &item.FailureCode,
 		&item.CreatedAt, &item.UpdatedAt)
@@ -44,6 +45,7 @@ func sameGradingItemIdentity(a, b k12.GradingItemInvocation) bool {
 		a.AttemptID == b.AttemptID && a.Operation == b.Operation &&
 		a.ExecutionKind == b.ExecutionKind &&
 		a.OperationAttempt == b.OperationAttempt && a.RequestDigest == b.RequestDigest &&
+		a.InputRevision == b.InputRevision && a.InputDigest == b.InputDigest &&
 		a.RouteSnapshot == b.RouteSnapshot
 }
 
@@ -87,10 +89,11 @@ func (s *Store) PrepareGradingItemInvocation(ctx context.Context, item k12.Gradi
 		return k12.GradingItemInvocation{}, false, fmt.Errorf("k12storage: marshal grading item route: %w", err)
 	}
 	res, err := s.db.ExecContext(ctx, `INSERT INTO k12_grading_item_invocations (`+gradingItemInvocationColumns+`)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(job_id,problem_id,operation,operation_attempt) DO NOTHING`,
 		item.InvocationID, item.AgentName, item.JobID, item.ProblemID, item.AttemptID,
 		item.Operation, item.ExecutionKind, item.OperationAttempt, item.RequestDigest,
+		item.InputRevision, item.InputDigest,
 		item.RouteSnapshot.Provider, item.RouteSnapshot.Model, string(routeJSON), item.Status,
 		"", "", "", "", "", item.CreatedAt, item.UpdatedAt)
 	if err != nil {

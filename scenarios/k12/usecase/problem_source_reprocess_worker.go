@@ -32,6 +32,7 @@ var errProblemSourceReprocessQuiesced = errors.New(
 
 type problemSourceReprocessPauseFence struct{}
 type problemSourceReconciliationOnlyContextKey struct{}
+type problemSourceCorrectionContextKey struct{}
 
 func withProblemSourceReconciliationOnly(ctx context.Context) context.Context {
 	return context.WithValue(ctx, problemSourceReconciliationOnlyContextKey{}, true)
@@ -42,6 +43,19 @@ func problemSourceReconciliationOnly(ctx context.Context) bool {
 		return false
 	}
 	value, _ := ctx.Value(problemSourceReconciliationOnlyContextKey{}).(bool)
+	return value
+}
+
+// withProblemSourceCorrection 标记来源纠错重批；该标记只影响学习投影，不改变题目评估结论。
+func withProblemSourceCorrection(ctx context.Context) context.Context {
+	return context.WithValue(ctx, problemSourceCorrectionContextKey{}, true)
+}
+
+func problemSourceCorrection(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(problemSourceCorrectionContextKey{}).(bool)
 	return value
 }
 

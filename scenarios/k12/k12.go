@@ -77,7 +77,10 @@ type MistakeFields struct {
 	LastArchive                *MistakeArchiveSnapshot `json:"last_archive,omitempty"`
 }
 
-const MistakeArchivedReasonManual = "manual"
+const (
+	MistakeArchivedReasonManual           = "manual"
+	MistakeArchivedReasonSourceCorrection = "source_correction"
+)
 
 // MistakeArchiveSnapshot 保留最近一次归档/恢复的审计事实。当前归档态字段只在
 // status=archived 时非空；恢复后清空当前字段，但保留本快照用于审计与迟到命令去重。
@@ -214,7 +217,7 @@ func validateMistakeFields(fieldsJSON string) error {
 		return fmt.Errorf("entry_source 非法值 %q（photo/verified/manual/writing_confirmed）", f.EntrySource)
 	}
 	switch f.ArchivedReason {
-	case "", MistakeArchivedReasonManual:
+	case "", MistakeArchivedReasonManual, MistakeArchivedReasonSourceCorrection:
 	default:
 		return fmt.Errorf("archived_reason 非法值 %q", f.ArchivedReason)
 	}
@@ -224,7 +227,8 @@ func validateMistakeFields(fieldsJSON string) error {
 		return fmt.Errorf("archived_from_status 非法值 %q", f.ArchivedFromStatus)
 	}
 	if f.LastArchive != nil {
-		if f.LastArchive.Reason != MistakeArchivedReasonManual {
+		if f.LastArchive.Reason != MistakeArchivedReasonManual &&
+			f.LastArchive.Reason != MistakeArchivedReasonSourceCorrection {
 			return fmt.Errorf("last_archive.reason 非法值 %q", f.LastArchive.Reason)
 		}
 		switch f.LastArchive.FromStatus {

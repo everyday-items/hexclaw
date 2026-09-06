@@ -466,6 +466,9 @@ func (d Deps) gradingAssessmentEffects(
 			},
 		}}, nil
 	case k12.GradingAssessmentCorrect:
+		if problemSourceCorrection(ctx) {
+			return k12storage.GradingAssessmentEffects{SourceCorrection: true}, nil
+		}
 		if d.Records == nil || strings.TrimSpace(req.Problem) == "" {
 			return k12storage.GradingAssessmentEffects{}, nil
 		}

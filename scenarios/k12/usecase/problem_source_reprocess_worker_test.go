@@ -1147,7 +1147,7 @@ func TestGradingOrchestratorProblemSourceReprocessCorrectTextAssessesOnlyAffecte
 	grader := &itemResumeGrader{calls: map[string]int{}}
 	o := newItemResumeOrchestrator(t, t.TempDir(), []RecognizedQuestion{
 		{
-			Question: "old affected", Subject: "数学",
+			Question: "corrected affected", Subject: "数学",
 			StudentAnswer: "2", AnswerState: AnswerStatePresent,
 		},
 		{
@@ -1159,6 +1159,35 @@ func TestGradingOrchestratorProblemSourceReprocessCorrectTextAssessesOnlyAffecte
 	run, job := confirmItemResumeJobWithoutRun(t, o, jobID)
 	affected := run.questions[0]
 	unaffected := run.questions[1]
+	grader.outcomes = map[string]GradeOutcome{
+		affected.Question: {
+			Verdict: VerdictDisagree, WrongStep: "旧输入首步", ErrorCause: "旧输入误判",
+		},
+	}
+	if _, err := o.assessDurablePhotoItem(
+		context.Background(), o.deps, job, run.req, PhotoModeGrade, affected,
+	); err != nil {
+		t.Fatalf("seed superseded wrong assessment: %v", err)
+	}
+	grader.outcomes = nil
+	seededMistakes, err := o.deps.Records.ListByScope(
+		context.Background(), job.Record.AgentName, k12.CollectionMistakes, "",
+	)
+	if err != nil || len(seededMistakes) != 1 || seededMistakes[0].Status != k12.StatusNew {
+		t.Fatalf("seeded source mistake=%+v err=%v", seededMistakes, err)
+	}
+	if _, err := o.deps.Records.DB().Exec(`UPDATE k12_grading_assessment_items
+		SET current_disposition='superseded'
+		WHERE agent_name=? AND job_id=? AND problem_id=? AND current_disposition='current'`,
+		job.Record.AgentName, jobID, affected.ProblemID); err != nil {
+		t.Fatalf("mark original wrong assessment superseded: %v", err)
+	}
+	solver.mu.Lock()
+	solver.calls = map[string]int{}
+	solver.mu.Unlock()
+	grader.mu.Lock()
+	grader.calls = map[string]int{}
+	grader.mu.Unlock()
 	unresolved := k12.GradingItemInvocation{
 		InvocationID: "source-worker-unaffected-unknown", AgentName: job.Record.AgentName,
 		JobID: jobID, ProblemID: unaffected.ProblemID, AttemptID: unaffected.AttemptID,
@@ -1175,7 +1204,7 @@ func TestGradingOrchestratorProblemSourceReprocessCorrectTextAssessesOnlyAffecte
 	if _, err := o.deps.Records.MarkGradingItemInvocationOutcomeUnknown(context.Background(), job.Record.AgentName, unresolved.InvocationID, "provider", "timeout"); err != nil {
 		t.Fatal(err)
 	}
-	job, err := o.deps.saveGradingJob(context.Background(), job, k12.GradingStageFailedRetryable)
+	job, err = o.deps.saveGradingJob(context.Background(), job, k12.GradingStageFailedRetryable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1210,6 +1239,19 @@ func TestGradingOrchestratorProblemSourceReprocessCorrectTextAssessesOnlyAffecte
 	}
 	if err := o.ProcessProblemSourceReprocess(context.Background(), work); err != nil {
 		t.Fatalf("process corrected immutable input: %v", err)
+	}
+	seededMistakes, err = o.deps.Records.ListByScope(
+		context.Background(), job.Record.AgentName, k12.CollectionMistakes, "",
+	)
+	if err != nil || len(seededMistakes) != 1 {
+		t.Fatalf("source correction changed mistake cardinality: mistakes=%+v err=%v", seededMistakes, err)
+	}
+	correctedFields, parseErr := k12.ParseMistakeFields(seededMistakes[0].Fields)
+	if parseErr != nil || seededMistakes[0].Status != k12.StatusArchived ||
+		correctedFields.ArchivedReason != "source_correction" ||
+		correctedFields.ReviewStage != 0 || correctedFields.LastRetriedAt != 0 {
+		t.Fatalf("source correction must retract its unique mistake without retry evidence: record=%+v fields=%+v err=%v",
+			seededMistakes[0], correctedFields, parseErr)
 	}
 	if solver.callCount("corrected affected") != 1 || grader.callCount("corrected affected") != 1 {
 		t.Fatalf(

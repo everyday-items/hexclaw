@@ -782,6 +782,7 @@ func executeGradingItemOperationWithKind[T any](
 			JobID: job.Record.RecordID, ProblemID: q.ProblemID, AttemptID: q.AttemptID,
 			Operation: operation, ExecutionKind: executionKind,
 			OperationAttempt: currentAttempt, RequestDigest: requestDigest,
+			InputRevision: q.ConfirmedVersion, InputDigest: q.InputDigest,
 			RouteSnapshot: job.Fields.ModelSnapshot, CreatedAt: o.deps.now(), UpdatedAt: o.deps.now(),
 		})
 		if err != nil {
@@ -941,6 +942,7 @@ func validateGradingItemInvocationIdentity(
 	if invocation.AgentName != job.Record.AgentName || invocation.JobID != job.Record.RecordID ||
 		invocation.ProblemID != q.ProblemID || invocation.AttemptID != q.AttemptID ||
 		invocation.RequestDigest != requestDigest || invocation.ExecutionKind != executionKind ||
+		invocation.InputRevision != q.ConfirmedVersion || invocation.InputDigest != q.InputDigest ||
 		gotRoute.Provider != wantRoute.Provider ||
 		gotRoute.Model != wantRoute.Model || gotRoute.Route != wantRoute.Route {
 		return fmt.Errorf("%w: invocation=%s immutable identity drift", ErrModelInvocationRequiresReconciliation, invocation.InvocationID)

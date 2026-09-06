@@ -36,6 +36,7 @@ func itemInvocation(jobID string, attempt k12.Attempt, operation k12.GradingItem
 		InvocationID: fmt.Sprintf("item-inv-%s-%d", operation, n),
 		AgentName:    "mingming", JobID: jobID, ProblemID: attempt.ProblemID, AttemptID: attempt.AttemptID,
 		Operation: operation, OperationAttempt: n, RequestDigest: "sha256:req-" + string(operation),
+		InputRevision: attempt.ConfirmedVersion, InputDigest: attempt.InputDigest,
 		RouteSnapshot: k12.GradingModelSnapshot{Provider: "proxy", Model: "gpt", Route: "proxy/gpt"},
 		CreatedAt:     100,
 	}
@@ -52,6 +53,18 @@ func TestGradingItemInvocationPrepareRejectsDigestRouteOperationAndOwnerDrift(t 
 	replay, created, err := store.PrepareGradingItemInvocation(context.Background(), want)
 	if err != nil || created || replay.InvocationID != first.InvocationID {
 		t.Fatalf("exact replay invocation=%+v created=%v err=%v", replay, created, err)
+	}
+	var storedInputRevision int
+	var storedInputDigest string
+	if err := store.DB().QueryRow(`SELECT input_revision,input_digest
+		FROM k12_grading_item_invocations WHERE item_invocation_id=?`, first.InvocationID).
+		Scan(&storedInputRevision, &storedInputDigest); err != nil {
+		t.Fatalf("grading item invocation must persist input revision/digest: %v", err)
+	}
+	wantInputDigest := "sha256:input-" + attempt.ProblemID + "-v1"
+	if storedInputRevision != 1 || storedInputDigest != wantInputDigest {
+		t.Fatalf("persisted input binding=(%d,%q), want (1,%q)",
+			storedInputRevision, storedInputDigest, wantInputDigest)
 	}
 
 	changedDigest := want
